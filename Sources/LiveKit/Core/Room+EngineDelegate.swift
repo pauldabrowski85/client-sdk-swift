@@ -287,7 +287,11 @@ extension Room {
         }
     }
 
-    func room(didReceiveRpcRequest request: Livekit_RpcRequest, from participantIdentity: String) {
+    func room(
+        didReceiveRpcRequest request: Livekit_RpcRequest,
+        from participantIdentity: String,
+        participantSid: Participant.Sid?
+    ) {
         let callerIdentity = Participant.Identity(from: participantIdentity)
         let requestId = request.id
         let method = request.method
@@ -297,6 +301,7 @@ extension Room {
 
         Task.discarding { [rpcServer] in
             await rpcServer.handleIncomingRequest(callerIdentity: callerIdentity,
+                                                  callerParticipantSid: participantSid,
                                                   requestId: requestId,
                                                   method: method,
                                                   payload: payload,

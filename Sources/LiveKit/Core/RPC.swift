@@ -144,6 +144,11 @@ public struct RpcInvocationData {
     /// The identity of the RemoteParticipant who initiated the RPC call
     public let callerIdentity: Participant.Identity
 
+    /// Server-authenticated SID of the participant connection that published
+    /// the request. This can be `nil` when the transport does not provide
+    /// publisher provenance.
+    public let callerParticipantSid: Participant.Sid?
+
     /// The data sent by the caller (as a string)
     public let payload: String
 

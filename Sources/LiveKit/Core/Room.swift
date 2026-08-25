@@ -823,9 +823,21 @@ extension Room: DataChannelDelegate {
         case let .transcription(packet): room(didReceiveTranscriptionPacket: packet)
         case let .rpcResponse(response): room(didReceiveRpcResponse: response)
         case let .rpcAck(ack): room(didReceiveRpcAck: ack)
-        case let .rpcRequest(request): room(didReceiveRpcRequest: request, from: dataPacket.participantIdentity)
+        case let .rpcRequest(request):
+            room(
+                didReceiveRpcRequest: request,
+                from: dataPacket.participantIdentity,
+                participantSid: dataPacket.participantSid.isEmpty
+                    ? nil
+                    : Participant.Sid(from: dataPacket.participantSid)
+            )
         case let .streamHeader(header):
-            incomingStreamManager.handle(.header(header, dataPacket.participantIdentity, encryptionType))
+            incomingStreamManager.handle(.header(
+                header,
+                dataPacket.participantIdentity,
+                dataPacket.participantSid.isEmpty ? nil : Participant.Sid(from: dataPacket.participantSid),
+                encryptionType
+            ))
         case let .streamChunk(chunk):
             incomingStreamManager.handle(.chunk(chunk, encryptionType))
         case let .streamTrailer(trailer):
