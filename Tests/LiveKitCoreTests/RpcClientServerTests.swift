@@ -515,6 +515,101 @@ struct RpcServerTests {
         }
     }
 
+    /// A packet admitted for participant A must retain A's server-issued SID
+    /// even if participant B with the same identity is already canonical when
+    /// the detached RPC handler runs.
+    @Test func v1InvocationRetainsPacketPublisherSidAcrossIdentityReplacement() async throws {
+        let room = Room()
+        await room.rpcServer.attach(to: room)
+        room.publisherDataChannel = MockDataChannelPair { _ in }
+
+        let identity = Participant.Identity(from: "same-agent")
+        let originalSid = Participant.Sid(from: "PA_original")
+        let replacementSid = Participant.Sid(from: "PA_replacement")
+        let replacementInfo = Livekit_ParticipantInfo.with {
+            $0.identity = identity.stringValue
+            $0.sid = replacementSid.stringValue
+        }
+        let replacement = RemoteParticipant(
+            info: replacementInfo,
+            room: room,
+            connectionState: .connected
+        )
+        room._state.mutate { $0.remoteParticipants[identity] = replacement }
+
+        let invoked = AsyncCompleter<Void>(
+            label: "v1 provenance handler",
+            defaultTimeout: 1
+        )
+        try await room.registerRpcMethod("provenance-v1") { data in
+            #expect(data.callerIdentity == identity)
+            #expect(data.callerParticipantSid == originalSid)
+            #expect(data.callerParticipantSid != replacement.sid)
+            invoked.resume(returning: ())
+            return "ok"
+        }
+
+        let packet = Livekit_DataPacket.with {
+            $0.participantIdentity = identity.stringValue
+            $0.participantSid = originalSid.stringValue
+            $0.rpcRequest = Livekit_RpcRequest.with {
+                $0.id = "v1-provenance"
+                $0.method = "provenance-v1"
+                $0.responseTimeoutMs = 8_000
+                $0.version = 1
+            }
+        }
+        room.dataChannel(
+            MockDataChannelPair { _ in },
+            didReceiveDataPacket: packet
+        )
+        try await invoked.wait(timeout: 1)
+    }
+
+    /// The v2 stream path must forward the immutable publisher SID from
+    /// `TextStreamInfo`, never recover a SID from the current participant map.
+    @Test func v2InvocationRetainsHeaderPublisherSidAcrossIdentityReplacement() async throws {
+        let room = Room()
+        await room.rpcServer.attach(to: room)
+        room.publisherDataChannel = MockDataChannelPair { _ in }
+
+        let identity = Participant.Identity(from: "same-agent")
+        let originalSid = Participant.Sid(from: "PA_original")
+        let replacementSid = Participant.Sid(from: "PA_replacement")
+        let replacementInfo = Livekit_ParticipantInfo.with {
+            $0.identity = identity.stringValue
+            $0.sid = replacementSid.stringValue
+        }
+        let replacement = RemoteParticipant(
+            info: replacementInfo,
+            room: room,
+            connectionState: .connected
+        )
+        room._state.mutate { $0.remoteParticipants[identity] = replacement }
+
+        try await confirmation("Handler receives header publisher SID") { invoked in
+            try await room.registerRpcMethod("provenance-v2") { data in
+                #expect(data.callerIdentity == identity)
+                #expect(data.callerParticipantSid == originalSid)
+                #expect(data.callerParticipantSid != replacement.sid)
+                invoked()
+                return "ok"
+            }
+
+            let reader = RpcTestSupport.makeRequestReader(
+                requestId: "v2-provenance",
+                method: "provenance-v2",
+                payload: "",
+                timeoutMs: 8_000,
+                publisherParticipantSid: originalSid
+            )
+            await room.rpcServer.handleIncomingRequestStream(
+                reader: reader,
+                callerIdentity: identity
+            )
+        }
+    }
+
     @Test(.spec("https://github.com/livekit/client-sdk-js/blob/92c72f06/RPC_SPEC.md?plain=1#L324"))
     func rpcErrorHandling() async throws {
         try await TestEnvironment.withRoom { room in
@@ -916,6 +1011,7 @@ private enum RpcTestSupport {
         payload: String,
         timeoutMs: UInt32?,
         version: String? = RPC_STREAM_VERSION,
+        publisherParticipantSid: Participant.Sid? = nil,
     ) -> TextStreamReader {
         var attributes: [String: String] = [:]
         if let requestId { attributes[RpcStreamAttribute.requestId] = requestId }
@@ -934,6 +1030,7 @@ private enum RpcTestSupport {
             replyToStreamID: nil,
             attachedStreamIDs: [],
             generated: false,
+            publisherParticipantSid: publisherParticipantSid,
         )
         let source = StreamReaderSource { continuation in
             if let data = payload.data(using: .utf8) { continuation.yield(data) }

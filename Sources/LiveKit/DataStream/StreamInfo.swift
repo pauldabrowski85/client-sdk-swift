@@ -60,6 +60,11 @@ public final class TextStreamInfo: NSObject, StreamInfo {
     public let replyToStreamID: String?
     public let attachedStreamIDs: [String]
     public let generated: Bool
+    /// Server-generated SID of the participant that published the data packet.
+    /// Unlike `Participant.Identity`, this value changes when a same-identity
+    /// participant is replaced and can therefore bind a stream to its sender
+    /// epoch without consulting mutable room state.
+    public let publisherParticipantSid: Participant.Sid?
 
     init(
         id: String,
@@ -73,6 +78,7 @@ public final class TextStreamInfo: NSObject, StreamInfo {
         replyToStreamID: String?,
         attachedStreamIDs: [String],
         generated: Bool,
+        publisherParticipantSid: Participant.Sid? = nil,
     ) {
         self.id = id
         self.topic = topic
@@ -85,6 +91,7 @@ public final class TextStreamInfo: NSObject, StreamInfo {
         self.replyToStreamID = replyToStreamID
         self.attachedStreamIDs = attachedStreamIDs
         self.generated = generated
+        self.publisherParticipantSid = publisherParticipantSid
     }
 }
 

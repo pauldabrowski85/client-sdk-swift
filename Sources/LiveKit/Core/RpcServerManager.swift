@@ -60,6 +60,7 @@ actor RpcServerManager: Loggable {
     /// get a v2 data-stream response (uncapped), legacy callers get a v1 packet.
     /// Errors always use a v1 packet per spec.
     func handleIncomingRequest(callerIdentity: Participant.Identity,
+                               callerParticipantSid: Participant.Sid? = nil,
                                requestId: String,
                                method: String,
                                payload: String,
@@ -88,6 +89,7 @@ actor RpcServerManager: Loggable {
         }
 
         let result = await dispatchToHandler(callerIdentity: callerIdentity,
+                                             callerParticipantSid: callerParticipantSid,
                                              requestId: requestId,
                                              method: method,
                                              payload: payload,
@@ -180,6 +182,7 @@ actor RpcServerManager: Loggable {
         }
 
         let result = await dispatchToHandler(callerIdentity: callerIdentity,
+                                             callerParticipantSid: reader.info.publisherParticipantSid,
                                              requestId: requestId,
                                              method: method,
                                              payload: payload,
@@ -207,6 +210,7 @@ actor RpcServerManager: Loggable {
     /// Size-checking the response is the responsibility of the publisher: the v1 wire has
     /// a 15 KB cap (enforced in `publishResponse`), the v2 stream wire is unbounded.
     private func dispatchToHandler(callerIdentity: Participant.Identity,
+                                   callerParticipantSid: Participant.Sid?,
                                    requestId: String,
                                    method: String,
                                    payload: String,
@@ -219,6 +223,7 @@ actor RpcServerManager: Loggable {
         do {
             let response = try await handler(RpcInvocationData(requestId: requestId,
                                                                callerIdentity: callerIdentity,
+                                                               callerParticipantSid: callerParticipantSid,
                                                                payload: payload,
                                                                responseTimeout: responseTimeout))
             return .success(response)

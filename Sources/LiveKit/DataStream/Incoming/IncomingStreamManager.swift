@@ -53,7 +53,7 @@ actor IncomingStreamManager: Loggable {
 
     /// Events are processed in a serial (FIFO) order
     enum StreamEvent {
-        case header(Livekit_DataStream.Header, String, EncryptionType)
+        case header(Livekit_DataStream.Header, String, Participant.Sid?, EncryptionType)
         case chunk(Livekit_DataStream.Chunk, EncryptionType)
         case trailer(Livekit_DataStream.Trailer, EncryptionType)
     }
@@ -82,8 +82,13 @@ actor IncomingStreamManager: Loggable {
 
     private func process(_ event: StreamEvent) {
         switch event {
-        case let .header(header, identityString, encryptionType):
-            handle(header: header, from: identityString, encryptionType: encryptionType)
+        case let .header(header, identityString, participantSid, encryptionType):
+            handle(
+                header: header,
+                from: identityString,
+                participantSid: participantSid,
+                encryptionType: encryptionType
+            )
         case let .chunk(chunk, encryptionType):
             handle(chunk: chunk, encryptionType: encryptionType)
         case let .trailer(trailer, encryptionType):
@@ -140,10 +145,19 @@ actor IncomingStreamManager: Loggable {
     // MARK: - Packet processing
 
     /// Handles a data stream header.
-    private func handle(header: Livekit_DataStream.Header, from identityString: String, encryptionType: EncryptionType) {
+    private func handle(
+        header: Livekit_DataStream.Header,
+        from identityString: String,
+        participantSid: Participant.Sid?,
+        encryptionType: EncryptionType
+    ) {
         let identity = Participant.Identity(from: identityString)
 
-        guard let streamInfo = Self.streamInfo(from: header, encryptionType: encryptionType) else {
+        guard let streamInfo = Self.streamInfo(
+            from: header,
+            participantSid: participantSid,
+            encryptionType: encryptionType
+        ) else {
             return
         }
         openStream(with: streamInfo, from: identity)
@@ -363,10 +377,19 @@ public typealias TextStreamHandler = @Sendable (TextStreamReader, Participant.Id
 // MARK: - From protocol types
 
 extension IncomingStreamManager {
-    static func streamInfo(from header: Livekit_DataStream.Header, encryptionType: EncryptionType) -> StreamInfo? {
+    static func streamInfo(
+        from header: Livekit_DataStream.Header,
+        participantSid: Participant.Sid?,
+        encryptionType: EncryptionType
+    ) -> StreamInfo? {
         switch header.contentHeader {
         case let .byteHeader(byteHeader): ByteStreamInfo(header, byteHeader, encryptionType)
-        case let .textHeader(textHeader): TextStreamInfo(header, textHeader, encryptionType)
+        case let .textHeader(textHeader): TextStreamInfo(
+            header,
+            textHeader,
+            participantSid,
+            encryptionType
+        )
         default: nil
         }
     }
@@ -396,6 +419,7 @@ extension TextStreamInfo {
     convenience init(
         _ header: Livekit_DataStream.Header,
         _ textHeader: Livekit_DataStream.TextHeader,
+        _ publisherParticipantSid: Participant.Sid?,
         _ encryptionType: EncryptionType,
     ) {
         self.init(
@@ -411,6 +435,7 @@ extension TextStreamInfo {
             replyToStreamID: !textHeader.replyToStreamID.isEmpty ? textHeader.replyToStreamID : nil,
             attachedStreamIDs: textHeader.attachedStreamIds,
             generated: textHeader.generated,
+            publisherParticipantSid: publisherParticipantSid,
         )
     }
 }
