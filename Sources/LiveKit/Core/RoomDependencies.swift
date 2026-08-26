@@ -71,7 +71,7 @@ final class JoinDependencies: Sendable {
     let connection: ConnectionDependencies
     let transport: TransportMode
 
-    private init(connection: ConnectionDependencies, transport: TransportMode) {
+    init(connection: ConnectionDependencies, transport: TransportMode) {
         self.connection = connection
         self.transport = transport
     }

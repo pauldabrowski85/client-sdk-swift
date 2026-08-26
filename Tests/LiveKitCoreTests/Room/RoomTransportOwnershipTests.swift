@@ -567,6 +567,84 @@ struct RoomTransportOwnershipTests {
             _ = try publication.admitSubscription()
         }
     }
+
+    @Test func staleRetirementCompletionCannotReleaseNewerRetainedTrack() async throws {
+        try await withTransportFixture { fixture in
+            fixture.installOriginalAsCurrent()
+            let publication = try #require(
+                fixture.original.trackPublications[fixture.trackSid] as? RemoteTrackPublication
+            )
+
+            let retiredA = RemoteAudioTrack(
+                name: "retired-a",
+                source: .microphone,
+                track: fixture.rtcTrack,
+                reportStatistics: false
+            )
+            publication._state.mutate { state in
+                state.failedRemoteRevocationTracks[ObjectIdentifier(retiredA)] = retiredA
+                state.subscriptionAdmission.revocationNeedsRetry = true
+            }
+            let generationA = fixture.room.retainFailedRemoteTrackRetirement(publication)
+            #expect(fixture.room.failedRemoteTrackRetirementCount == 1)
+
+            publication._state.mutate { state in
+                state.failedRemoteRevocationTracks[ObjectIdentifier(retiredA)] = nil
+            }
+            let releaseProofPassed = TestMediaGate()
+            let allowReleaseRemoval = DispatchSemaphore(value: 0)
+            let releaseTask = Task.detached {
+                fixture.room.releaseFailedRemoteTrackRetirement(
+                    publication,
+                    generation: generationA,
+                    beforeRemoval: {
+                        Task { await releaseProofPassed.open() }
+                        allowReleaseRemoval.wait()
+                    }
+                )
+            }
+            await releaseProofPassed.wait()
+
+            let replacementRTCTrack = RTC.peerConnectionFactory.audioTrack(
+                with: RTC.createAudioSource(nil),
+                trackId: "TR_retirement_b"
+            )
+            let stopEntered = TestMediaGate()
+            let allowFailedStop = TestMediaGate()
+            let retiredB = GatedFailOnceRemoteAudioTrack(
+                name: "retired-b",
+                source: .microphone,
+                track: replacementRTCTrack,
+                reportStatistics: false,
+                stopEntered: stopEntered,
+                allowFailedStop: allowFailedStop
+            )
+            retiredB._state.mutate { $0.trackState = .started }
+            let insertionAttempted = TestMediaGate()
+            let insertionTask = Task.detached {
+                await insertionAttempted.open()
+                try await publication.removeStaleTrack(retiredB)
+            }
+            await insertionAttempted.wait()
+            #expect(publication._state.failedRemoteRevocationTracks[ObjectIdentifier(retiredB)] == nil)
+
+            allowReleaseRemoval.signal()
+            await releaseTask.value
+            await stopEntered.wait()
+
+            #expect(fixture.room.failedRemoteTrackRetirementCount == 1)
+            #expect(retiredB.trackState == .started)
+            await allowFailedStop.open()
+            await #expect(throws: LiveKitError.self) {
+                try await insertionTask.value
+            }
+
+            try await fixture.room.stopFailedRemoteTrackRetirements()
+
+            #expect(retiredB.trackState == .stopped)
+            #expect(fixture.room.failedRemoteTrackRetirementCount == 0)
+        }
+    }
 }
 
 private final class GatedStopRemoteAudioTrack: RemoteAudioTrack, @unchecked Sendable {
@@ -608,6 +686,41 @@ private final class FailOnceRemoteAudioTrack: RemoteAudioTrack, @unchecked Senda
         if attempt == 1 {
             throw LiveKitError(.invalidState, message: "injected remote stop failure")
         }
+    }
+}
+
+private final class GatedFailOnceRemoteAudioTrack: RemoteAudioTrack, @unchecked Sendable {
+    private let stopAttempts = StateSync(0)
+    private let stopEntered: TestMediaGate
+    private let allowFailedStop: TestMediaGate
+
+    init(
+        name: String,
+        source: Track.Source,
+        track: LKRTCMediaStreamTrack,
+        reportStatistics: Bool,
+        stopEntered: TestMediaGate,
+        allowFailedStop: TestMediaGate
+    ) {
+        self.stopEntered = stopEntered
+        self.allowFailedStop = allowFailedStop
+        super.init(
+            name: name,
+            source: source,
+            track: track,
+            reportStatistics: reportStatistics
+        )
+    }
+
+    override func stopCapture() async throws {
+        let attempt = stopAttempts.mutate { attempts -> Int in
+            attempts += 1
+            return attempts
+        }
+        guard attempt == 1 else { return }
+        await stopEntered.open()
+        await allowFailedStop.wait()
+        throw LiveKitError(.invalidState, message: "injected gated retirement failure")
     }
 }
 
@@ -706,6 +819,8 @@ private actor TestMediaGate {
 
 private struct TransportOwnershipFixture {
     let room: Room
+    let staleJoin: JoinDependencies
+    let currentJoin: JoinDependencies
     let staleSubscriber: Transport
     let currentPublisher: Transport
     let currentSubscriber: Transport
@@ -722,10 +837,7 @@ private struct TransportOwnershipFixture {
             $0.connectionState = .reconnecting
             $0.isReconnectingWithMode = .full
             $0.remoteParticipants[participantIdentity] = original
-            $0.transport = .subscriberPrimary(
-                publisher: currentPublisher,
-                subscriber: staleSubscriber
-            )
+            $0.stage = .connected(staleJoin)
         }
     }
 
@@ -734,10 +846,7 @@ private struct TransportOwnershipFixture {
             $0.connectionState = .connected
             $0.isReconnectingWithMode = nil
             $0.remoteParticipants[participantIdentity] = replacement
-            $0.transport = .subscriberPrimary(
-                publisher: currentPublisher,
-                subscriber: currentSubscriber
-            )
+            $0.stage = .connected(currentJoin)
         }
     }
 }
@@ -756,24 +865,28 @@ private func withTransportFixture(
     _ body: (TransportOwnershipFixture) async throws -> Void
 ) async throws {
     let room = Room()
-    let staleSubscriber = try Transport(
-        config: .liveKitDefault(),
-        target: .subscriber,
-        primary: true,
-        delegate: room
+    let connection = ConnectionDependencies(
+        room: room,
+        roomOptions: room._state.roomOptions
     )
-    let currentPublisher = try Transport(
-        config: .liveKitDefault(),
-        target: .publisher,
-        primary: false,
-        delegate: room
+    let joinResponse = Livekit_JoinResponse.with { $0.subscriberPrimary = true }
+    let staleJoin = try await JoinDependencies.make(
+        room: room,
+        connection: connection,
+        joinResponse: joinResponse,
+        rtcConfiguration: .liveKitDefault(),
+        singlePeerConnection: false
     )
-    let currentSubscriber = try Transport(
-        config: .liveKitDefault(),
-        target: .subscriber,
-        primary: true,
-        delegate: room
+    let currentJoin = try await JoinDependencies.make(
+        room: room,
+        connection: connection,
+        joinResponse: joinResponse,
+        rtcConfiguration: .liveKitDefault(),
+        singlePeerConnection: false
     )
+    let staleSubscriber = try #require(staleJoin.transport.subscriber)
+    let currentPublisher = try #require(currentJoin.transport.publisher)
+    let currentSubscriber = try #require(currentJoin.transport.subscriber)
 
     do {
         let participantSid = "PA_reused"
@@ -810,10 +923,7 @@ private func withTransportFixture(
         room._state.mutate {
             $0.connectionState = .connected
             $0.remoteParticipants[Participant.Identity(from: participantIdentity)] = replacement
-            $0.transport = .subscriberPrimary(
-                publisher: currentPublisher,
-                subscriber: currentSubscriber
-            )
+            $0.stage = .connected(currentJoin)
         }
 
         let audioSource = RTC.createAudioSource(nil)
@@ -832,6 +942,8 @@ private func withTransportFixture(
         #expect(ObjectIdentifier(original) != ObjectIdentifier(replacement))
         try await body(TransportOwnershipFixture(
             room: room,
+            staleJoin: staleJoin,
+            currentJoin: currentJoin,
             staleSubscriber: staleSubscriber,
             currentPublisher: currentPublisher,
             currentSubscriber: currentSubscriber,
@@ -844,13 +956,11 @@ private func withTransportFixture(
             stream: stream
         ))
     } catch {
-        await staleSubscriber.close()
-        await currentPublisher.close()
-        await currentSubscriber.close()
+        await staleJoin.transport.close()
+        await currentJoin.transport.close()
         throw error
     }
 
-    await staleSubscriber.close()
-    await currentPublisher.close()
-    await currentSubscriber.close()
+    await staleJoin.transport.close()
+    await currentJoin.transport.close()
 }

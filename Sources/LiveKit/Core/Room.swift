@@ -177,6 +177,91 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
     let rpcServer = RpcServerManager()
 
     private let _dataPacketReceiveGeneration = StateSync<UInt64>(0)
+    private struct FailedRemoteTrackRetirement: @unchecked Sendable {
+        let publication: RemoteTrackPublication
+        let generation: UInt64
+    }
+
+    private let failedRemoteTrackRetirements = StateSync<[ObjectIdentifier: FailedRemoteTrackRetirement]>([:])
+
+    /// Retries every exact remote-track retirement that could not previously
+    /// prove ADM/track shutdown. Failed publications remain strongly retained
+    /// by the Room until this barrier succeeds, including across participant
+    /// state reset during disconnect or full reconnect.
+    @nonobjc
+    public func stopFailedRemoteTrackRetirements() async throws {
+        let retirements = failedRemoteTrackRetirements.copy()
+        var firstError: Error?
+        for retirement in retirements.values {
+            do {
+                try await retirement.publication.stopRetainedRemoteTracks()
+            } catch {
+                if firstError == nil { firstError = error }
+            }
+        }
+        if let firstError { throw firstError }
+    }
+
+    @discardableResult
+    func retainFailedRemoteTrackRetirement(_ publication: RemoteTrackPublication) -> UInt64 {
+        admitFailedRemoteTrackRetirement(publication) { state in
+            (state.failedRemoteTrackRetirementGeneration &+ 1, true)
+        }
+    }
+
+    func admitFailedRemoteTrackRetirement<Result>(
+        _ publication: RemoteTrackPublication,
+        _ mutation: (inout TrackPublication.State) throws -> (Result, Bool)
+    ) rethrows -> Result {
+        try failedRemoteTrackRetirements.mutate { retained in
+            let outcome = try publication._state.mutate { state -> (Result, Bool, UInt64, Bool) in
+                let (result, admittedWork) = try mutation(&state)
+                if admittedWork {
+                    state.failedRemoteTrackRetirementGeneration &+= 1
+                }
+                let requiresRetirement = !state.failedRemoteRevocationTracks.isEmpty ||
+                    state.remoteAudioPlayoutOwnerNeedsRelease ||
+                    state.remoteAudioLegacyDemandOwnerNeedsRelease
+                return (
+                    result,
+                    admittedWork,
+                    state.failedRemoteTrackRetirementGeneration,
+                    requiresRetirement
+                )
+            }
+            if outcome.1, outcome.3 {
+                retained[ObjectIdentifier(publication)] = FailedRemoteTrackRetirement(
+                    publication: publication,
+                    generation: outcome.2
+                )
+            }
+            return outcome.0
+        }
+    }
+
+    func releaseFailedRemoteTrackRetirement(
+        _ publication: RemoteTrackPublication,
+        generation: UInt64,
+        beforeRemoval: () -> Void = {}
+    ) {
+        failedRemoteTrackRetirements.mutate { retained in
+            let identifier = ObjectIdentifier(publication)
+            guard let current = retained[identifier],
+                  current.publication === publication,
+                  current.generation == generation,
+                  publication._state.read({ state in
+                      state.failedRemoteTrackRetirementGeneration == generation &&
+                          state.failedRemoteRevocationTracks.isEmpty &&
+                          !state.remoteAudioPlayoutOwnerNeedsRelease &&
+                          !state.remoteAudioLegacyDemandOwnerNeedsRelease
+                  })
+            else { return }
+            beforeRemoval()
+            retained[identifier] = nil
+        }
+    }
+
+    var failedRemoteTrackRetirementCount: Int { failedRemoteTrackRetirements.copy().count }
 
     // MARK: - State
 
@@ -773,6 +858,12 @@ extension Room {
             }
 
             await group.waitForAll()
+        }
+
+        do {
+            try await stopFailedRemoteTrackRetirements()
+        } catch {
+            log("Failed to confirm remote-track retirement during teardown: \(error)", .error)
         }
 
         _state.mutate {

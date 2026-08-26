@@ -249,7 +249,7 @@ public class Track: NSObject, @unchecked Sendable, Loggable {
     /// exact RTC track, and commits `.started` in one synchronous critical
     /// section with its ownership state.
     func startRemote(
-        activating: @escaping @Sendable (Track) -> Bool
+        activating: @escaping @Sendable (Track) async throws -> Bool
     ) async throws {
         guard self is RemoteTrack else {
             throw LiveKitError(.invalidState, message: "Protected activation is only valid for remote tracks")
@@ -260,7 +260,7 @@ public class Track: NSObject, @unchecked Sendable, Loggable {
                 log("Already started", .warning)
                 return
             }
-            guard activating(self) else {
+            guard try await activating(self) else {
                 throw LiveKitError(.invalidState, message: "Remote-track subscription admission was revoked")
             }
         }

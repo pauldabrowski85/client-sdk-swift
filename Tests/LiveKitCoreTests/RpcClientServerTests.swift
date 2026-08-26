@@ -1409,18 +1409,18 @@ struct RpcStreamResourceLimitTests {
         requestId: String,
         declaredLength: UInt64?
     ) -> Livekit_DataStream.Header {
-        var header = Livekit_DataStream.Header()
-        header.streamID = id
-        header.topic = RpcStreamTopic.request
-        if let declaredLength { header.totalLength = declaredLength }
-        header.attributes = [
-            RpcStreamAttribute.requestId: requestId,
-            RpcStreamAttribute.method: "bounded",
-            RpcStreamAttribute.timeoutMs: "1000",
-            RpcStreamAttribute.version: RPC_STREAM_VERSION,
-        ]
-        header.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
-        return header
+        Livekit_DataStream.Header.with {
+            $0.streamID = id
+            $0.topic = RpcStreamTopic.request
+            if let declaredLength { $0.totalLength = declaredLength }
+            $0.attributes = [
+                RpcStreamAttribute.requestId: requestId,
+                RpcStreamAttribute.method: "bounded",
+                RpcStreamAttribute.timeoutMs: "1000",
+                RpcStreamAttribute.version: RPC_STREAM_VERSION,
+            ]
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
     }
 
     private func responseHeader(
@@ -1428,13 +1428,13 @@ struct RpcStreamResourceLimitTests {
         requestId: String,
         declaredLength: UInt64?
     ) -> Livekit_DataStream.Header {
-        var header = Livekit_DataStream.Header()
-        header.streamID = id
-        header.topic = RpcStreamTopic.response
-        if let declaredLength { header.totalLength = declaredLength }
-        header.attributes = [RpcStreamAttribute.requestId: requestId]
-        header.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
-        return header
+        Livekit_DataStream.Header.with {
+            $0.streamID = id
+            $0.topic = RpcStreamTopic.response
+            if let declaredLength { $0.totalLength = declaredLength }
+            $0.attributes = [RpcStreamAttribute.requestId: requestId]
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
     }
 
     private func chunk(id: String, count: Int) -> Livekit_DataStream.Chunk {

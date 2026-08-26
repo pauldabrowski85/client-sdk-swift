@@ -138,15 +138,17 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
 
             let streamID = UUID().uuidString
 
-            var header = Livekit_DataStream.Header()
-            header.streamID = streamID
-            header.topic = topicName
-            header.contentHeader = .byteHeader(Livekit_DataStream.ByteHeader())
+            let header = Livekit_DataStream.Header.with {
+                $0.streamID = streamID
+                $0.topic = topicName
+                $0.contentHeader = .byteHeader(Livekit_DataStream.ByteHeader())
+            }
             manager.handle(.header(header, participant.stringValue, nil, 0, .none))
 
-            var trailer = Livekit_DataStream.Trailer()
-            trailer.streamID = streamID
-            trailer.reason = closureReason
+            let trailer = Livekit_DataStream.Trailer.with {
+                $0.streamID = streamID
+                $0.reason = closureReason
+            }
             manager.handle(.trailer(trailer, participant.stringValue, nil, 0, .none))
 
             // Handler processes asynchronously — give it time to complete
@@ -174,22 +176,25 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
 
             let streamID = UUID().uuidString
 
-            var header = Livekit_DataStream.Header()
-            header.streamID = streamID
-            header.topic = topicName
-            header.contentHeader = .byteHeader(Livekit_DataStream.ByteHeader())
-            header.totalLength = UInt64(testPayload.count + 10) // expect more bytes
+            let header = Livekit_DataStream.Header.with {
+                $0.streamID = streamID
+                $0.topic = topicName
+                $0.contentHeader = .byteHeader(Livekit_DataStream.ByteHeader())
+                $0.totalLength = UInt64(testPayload.count + 10) // expect more bytes
+            }
             manager.handle(.header(header, participant.stringValue, nil, 0, .none))
 
-            var chunk = Livekit_DataStream.Chunk()
-            chunk.streamID = streamID
-            chunk.chunkIndex = 0
-            chunk.content = Data(testPayload)
+            let chunk = Livekit_DataStream.Chunk.with {
+                $0.streamID = streamID
+                $0.chunkIndex = 0
+                $0.content = Data(testPayload)
+            }
             manager.handle(.chunk(chunk, participant.stringValue, nil, 0, .none))
 
-            var trailer = Livekit_DataStream.Trailer()
-            trailer.streamID = streamID
-            trailer.reason = ""
+            let trailer = Livekit_DataStream.Trailer.with {
+                $0.streamID = streamID
+                $0.reason = ""
+            }
             manager.handle(.trailer(trailer, participant.stringValue, nil, 0, .none))
 
             await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
@@ -220,20 +225,22 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
                 }
             }
 
-            var header = Livekit_DataStream.Header()
-            header.streamID = "test-stream-id"
-            header.topic = topic
-            header.mimeType = "application/octet-stream"
-            header.timestamp = Int64(Date().timeIntervalSince1970 * 1000)
-            header.contentHeader = .byteHeader(.with {
-                $0.name = "test-file.bin"
-            })
+            let header = Livekit_DataStream.Header.with {
+                $0.streamID = "test-stream-id"
+                $0.topic = topic
+                $0.mimeType = "application/octet-stream"
+                $0.timestamp = Int64(Date().timeIntervalSince1970 * 1000)
+                $0.contentHeader = .byteHeader(.with {
+                    $0.name = "test-file.bin"
+                })
+            }
             manager.handle(.header(header, "test-participant", nil, 0, .gcm))
 
-            var chunk = Livekit_DataStream.Chunk()
-            chunk.streamID = "test-stream-id"
-            chunk.chunkIndex = 0
-            chunk.content = Data("test data".utf8)
+            let chunk = Livekit_DataStream.Chunk.with {
+                $0.streamID = "test-stream-id"
+                $0.chunkIndex = 0
+                $0.content = Data("test data".utf8)
+            }
             manager.handle(.chunk(chunk, "test-participant", nil, 0, .none))
 
             await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
@@ -259,11 +266,12 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
             Issue.record("Oversized declared stream reached its handler")
         }
 
-        var header = Livekit_DataStream.Header()
-        header.streamID = "declared-oversize"
-        header.topic = topicName
-        header.totalLength = 5
-        header.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        let header = Livekit_DataStream.Header.with {
+            $0.streamID = "declared-oversize"
+            $0.topic = topicName
+            $0.totalLength = 5
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
         manager.handle(.header(header, participant.stringValue, nil, 0, .none))
         await waitForRejection(rejected)
 
@@ -287,18 +295,20 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
             Issue.record("Unrepresentable byte stream reached its handler")
         }
 
-        var textHeader = Livekit_DataStream.Header()
-        textHeader.streamID = "text-uint64-max"
-        textHeader.topic = topicName
-        textHeader.totalLength = UInt64.max
-        textHeader.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        let textHeader = Livekit_DataStream.Header.with {
+            $0.streamID = "text-uint64-max"
+            $0.topic = topicName
+            $0.totalLength = UInt64.max
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
         manager.handle(.header(textHeader, participant.stringValue, nil, 0, .none))
 
-        var byteHeader = Livekit_DataStream.Header()
-        byteHeader.streamID = "byte-uint64-max"
-        byteHeader.topic = byteTopic
-        byteHeader.totalLength = UInt64.max
-        byteHeader.contentHeader = .byteHeader(Livekit_DataStream.ByteHeader())
+        let byteHeader = Livekit_DataStream.Header.with {
+            $0.streamID = "byte-uint64-max"
+            $0.topic = byteTopic
+            $0.totalLength = UInt64.max
+            $0.contentHeader = .byteHeader(Livekit_DataStream.ByteHeader())
+        }
         manager.handle(.header(byteHeader, participant.stringValue, nil, 0, .none))
 
         let deadline = Date().addingTimeInterval(10)
@@ -389,16 +399,18 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
             }
         }
 
-        var header = Livekit_DataStream.Header()
-        header.streamID = "authenticated-chunk"
-        header.topic = topicName
-        header.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        let header = Livekit_DataStream.Header.with {
+            $0.streamID = "authenticated-chunk"
+            $0.topic = topicName
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
         manager.handle(.header(header, participant.stringValue, publisherSid, 0, .none))
         await waitForOpenStreams(1)
 
-        var chunk = Livekit_DataStream.Chunk()
-        chunk.streamID = header.streamID
-        chunk.content = Data("forged".utf8)
+        let chunk = Livekit_DataStream.Chunk.with {
+            $0.streamID = header.streamID
+            $0.content = Data("forged".utf8)
+        }
         manager.handle(.chunk(
             chunk,
             "other-participant",
@@ -429,15 +441,17 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
             }
         }
 
-        var header = Livekit_DataStream.Header()
-        header.streamID = "authenticated-trailer"
-        header.topic = topicName
-        header.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        let header = Livekit_DataStream.Header.with {
+            $0.streamID = "authenticated-trailer"
+            $0.topic = topicName
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
         manager.handle(.header(header, participant.stringValue, publisherSid, 0, .none))
         await waitForOpenStreams(1)
 
-        var trailer = Livekit_DataStream.Trailer()
-        trailer.streamID = header.streamID
+        let trailer = Livekit_DataStream.Trailer.with {
+            $0.streamID = header.streamID
+        }
         manager.handle(.trailer(
             trailer,
             "other-participant",
@@ -489,10 +503,11 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
         ) { _, _ in }
 
         for index in 0 ..< 1_000 {
-            var header = Livekit_DataStream.Header()
-            header.streamID = "flood-\(index)"
-            header.topic = topicName
-            header.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+            let header = Livekit_DataStream.Header.with {
+                $0.streamID = "flood-\(index)"
+                $0.topic = topicName
+                $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+            }
             manager.handle(.header(header, participant.stringValue, nil, 0, .none))
         }
 
@@ -514,20 +529,22 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
         }
 
         for index in 0 ..< 1_000 {
-            var header = Livekit_DataStream.Header()
-            header.streamID = "old-overflow-\(index)"
-            header.topic = topicName
-            header.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+            let header = Livekit_DataStream.Header.with {
+                $0.streamID = "old-overflow-\(index)"
+                $0.topic = topicName
+                $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+            }
             manager.handle(.header(header, participant.stringValue, nil, 0, .none))
         }
         #expect(manager.hasIngressOverflowed)
         let oldToken = manager.ingressOverflowTokenForTests
 
         await manager.reset(to: 1)
-        var newHeader = Livekit_DataStream.Header()
-        newHeader.streamID = "new-generation"
-        newHeader.topic = topicName
-        newHeader.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        let newHeader = Livekit_DataStream.Header.with {
+            $0.streamID = "new-generation"
+            $0.topic = topicName
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
         manager.handle(.header(newHeader, participant.stringValue, nil, 1, .none))
         let deadline = Date().addingTimeInterval(10)
         while await manager.openStreamCount != 1, Date() < deadline {
@@ -565,10 +582,11 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
             }
         }
 
-        var staleHeader = Livekit_DataStream.Header()
-        staleHeader.streamID = "admitted-before-reset"
-        staleHeader.topic = topicName
-        staleHeader.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        let staleHeader = Livekit_DataStream.Header.with {
+            $0.streamID = "admitted-before-reset"
+            $0.topic = topicName
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
         let staleHandle = Task.detached {
             manager.handle(.header(staleHeader, self.participant.stringValue, nil, 0, .none))
         }
@@ -595,10 +613,11 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
         await resetTask.value
         #expect(resetCompleted.copy())
 
-        var currentHeader = Livekit_DataStream.Header()
-        currentHeader.streamID = "current-after-reset"
-        currentHeader.topic = topicName
-        currentHeader.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        let currentHeader = Livekit_DataStream.Header.with {
+            $0.streamID = "current-after-reset"
+            $0.topic = topicName
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
         manager.handle(.header(currentHeader, participant.stringValue, nil, 1, .none))
 
         let deadline = Date().addingTimeInterval(10)
@@ -620,10 +639,11 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
         )
 
         for index in 0 ..< 1_000 {
-            var header = Livekit_DataStream.Header()
-            header.streamID = "unknown-overflow-\(index)"
-            header.topic = "unregistered-\(index)"
-            header.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+            let header = Livekit_DataStream.Header.with {
+                $0.streamID = "unknown-overflow-\(index)"
+                $0.topic = "unregistered-\(index)"
+                $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+            }
             manager.handle(.header(header, participant.stringValue, nil, 0, .none))
         }
 
@@ -635,10 +655,11 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
     @Test func unknownTopicDiagnosticRetentionIsBoundedAndClearedOnGenerationReset() async {
         let manager = IncomingStreamManager(eventBufferCapacity: 256)
         for index in 0 ..< 128 {
-            var header = Livekit_DataStream.Header()
-            header.streamID = "unknown-stream-\(index)"
-            header.topic = "attacker-topic-\(index)"
-            header.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+            let header = Livekit_DataStream.Header.with {
+                $0.streamID = "unknown-stream-\(index)"
+                $0.topic = "attacker-topic-\(index)"
+                $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+            }
             manager.handle(.header(header, participant.stringValue, nil, 0, .none))
         }
 
@@ -657,23 +678,26 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
     private func sendByteStream(chunks: [Data]) async {
         let streamID = UUID().uuidString
 
-        var header = Livekit_DataStream.Header()
-        header.streamID = streamID
-        header.topic = topicName
-        header.contentHeader = .byteHeader(Livekit_DataStream.ByteHeader())
+        let header = Livekit_DataStream.Header.with {
+            $0.streamID = streamID
+            $0.topic = topicName
+            $0.contentHeader = .byteHeader(Livekit_DataStream.ByteHeader())
+        }
         manager.handle(.header(header, participant.stringValue, nil, 0, .none))
 
         for (index, chunkData) in chunks.enumerated() {
-            var chunk = Livekit_DataStream.Chunk()
-            chunk.streamID = streamID
-            chunk.chunkIndex = UInt64(index)
-            chunk.content = chunkData
+            let chunk = Livekit_DataStream.Chunk.with {
+                $0.streamID = streamID
+                $0.chunkIndex = UInt64(index)
+                $0.content = chunkData
+            }
             manager.handle(.chunk(chunk, participant.stringValue, nil, 0, .none))
         }
 
-        var trailer = Livekit_DataStream.Trailer()
-        trailer.streamID = streamID
-        trailer.reason = ""
+        let trailer = Livekit_DataStream.Trailer.with {
+            $0.streamID = streamID
+            $0.reason = ""
+        }
         manager.handle(.trailer(trailer, participant.stringValue, nil, 0, .none))
 
         // Handler processes asynchronously — give it time to complete
@@ -693,11 +717,12 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
         dataPacketReceiveGeneration: UInt64 = 0,
         settle: Bool = true
     ) async {
-        var header = Livekit_DataStream.Header()
-        header.streamID = streamID
-        header.topic = topicName
-        header.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
-        if let totalLength { header.totalLength = totalLength }
+        let header = Livekit_DataStream.Header.with {
+            $0.streamID = streamID
+            $0.topic = topicName
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+            if let totalLength { $0.totalLength = totalLength }
+        }
         manager.handle(.header(
             header,
             participant.stringValue,
@@ -708,10 +733,11 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
 
         if let chunks {
             for (index, chunkData) in chunks.enumerated() {
-                var chunk = Livekit_DataStream.Chunk()
-                chunk.streamID = streamID
-                chunk.chunkIndex = UInt64(index)
-                chunk.content = Data(chunkData.utf8)
+                let chunk = Livekit_DataStream.Chunk.with {
+                    $0.streamID = streamID
+                    $0.chunkIndex = UInt64(index)
+                    $0.content = Data(chunkData.utf8)
+                }
                 manager.handle(.chunk(
                     chunk,
                     participant.stringValue,
@@ -721,10 +747,11 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
                 ))
             }
         } else if let rawPayload {
-            var chunk = Livekit_DataStream.Chunk()
-            chunk.streamID = streamID
-            chunk.chunkIndex = 0
-            chunk.content = rawPayload
+            let chunk = Livekit_DataStream.Chunk.with {
+                $0.streamID = streamID
+                $0.chunkIndex = 0
+                $0.content = rawPayload
+            }
             manager.handle(.chunk(
                 chunk,
                 participant.stringValue,
@@ -734,9 +761,10 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
             ))
         }
 
-        var trailer = Livekit_DataStream.Trailer()
-        trailer.streamID = streamID
-        trailer.reason = ""
+        let trailer = Livekit_DataStream.Trailer.with {
+            $0.streamID = streamID
+            $0.reason = ""
+        }
         manager.handle(.trailer(
             trailer,
             participant.stringValue,
@@ -811,10 +839,11 @@ extension IncomingStreamManagerTests {
         publisherParticipantSid: Participant.Sid? = nil,
         dataPacketReceiveGeneration: UInt64 = 0
     ) async {
-        var header = Livekit_DataStream.Header()
-        header.streamID = streamID
-        header.topic = topicName
-        header.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        let header = Livekit_DataStream.Header.with {
+            $0.streamID = streamID
+            $0.topic = topicName
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
         manager.handle(.header(
             header,
             participant.stringValue,
@@ -830,9 +859,10 @@ extension IncomingStreamManagerTests {
         publisherParticipantSid: Participant.Sid? = nil,
         dataPacketReceiveGeneration: UInt64 = 0
     ) async {
-        var chunk = Livekit_DataStream.Chunk()
-        chunk.streamID = streamID
-        chunk.content = Data(content.utf8)
+        let chunk = Livekit_DataStream.Chunk.with {
+            $0.streamID = streamID
+            $0.content = Data(content.utf8)
+        }
         manager.handle(.chunk(
             chunk,
             participant.stringValue,
@@ -847,8 +877,9 @@ extension IncomingStreamManagerTests {
         publisherParticipantSid: Participant.Sid? = nil,
         dataPacketReceiveGeneration: UInt64 = 0
     ) async {
-        var trailer = Livekit_DataStream.Trailer()
-        trailer.streamID = streamID
+        let trailer = Livekit_DataStream.Trailer.with {
+            $0.streamID = streamID
+        }
         manager.handle(.trailer(
             trailer,
             participant.stringValue,

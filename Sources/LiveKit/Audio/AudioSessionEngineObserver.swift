@@ -64,6 +64,15 @@ public class AudioSessionEngineObserver: AudioEngineObserver, Loggable, @uncheck
         set { _state.mutate { $0.isSpeakerOutputPreferred = newValue } }
     }
 
+    /// The exact session configuration implied by the currently installed
+    /// playout and recording requirements, or `nil` when neither is active.
+    /// This value is derived under the same lock that serializes requirement
+    /// transitions, so downstream observers do not need to sample the mutable
+    /// process-wide `AVAudioSession` to learn the SDK-owned target state.
+    public var effectiveSessionConfiguration: AudioSessionConfiguration? {
+        _state.read { Self.sessionConfiguration(for: $0) }
+    }
+
     struct State {
         var next: (any AudioEngineObserver)?
 
@@ -80,6 +89,7 @@ public class AudioSessionEngineObserver: AudioEngineObserver, Loggable, @uncheck
     }
 
     let _state = StateSync(State())
+    private let configurationApplier: (@Sendable (_ oldState: State, _ newState: State) throws -> Void)?
 
     private let sessionRequirementId = UUID()
 
@@ -88,7 +98,14 @@ public class AudioSessionEngineObserver: AudioEngineObserver, Loggable, @uncheck
         set { _state.mutate { $0.next = newValue } }
     }
 
-    public init() {
+    public convenience init() {
+        self.init(configurationApplier: nil)
+    }
+
+    init(
+        configurationApplier: (@Sendable (_ oldState: State, _ newState: State) throws -> Void)?
+    ) {
+        self.configurationApplier = configurationApplier
         _state.onDidMutate = { [weak self] new, old in
             guard let self,
                   new.isSpeakerOutputPreferred != old.isSpeakerOutputPreferred ||
@@ -144,6 +161,9 @@ public class AudioSessionEngineObserver: AudioEngineObserver, Loggable, @uncheck
             let oldState = $0
             block(&$0.sessionRequirements)
             guard $0.sessionRequirements != oldState.sessionRequirements else { return }
+            guard $0.isPlayoutEnabled != oldState.isPlayoutEnabled ||
+                $0.isRecordingEnabled != oldState.isRecordingEnabled
+            else { return }
             do {
                 try configureIfNeeded(oldState: oldState, newState: $0)
             } catch {
@@ -157,6 +177,11 @@ public class AudioSessionEngineObserver: AudioEngineObserver, Loggable, @uncheck
 
     private func configureIfNeeded(oldState: State, newState: State) throws {
         guard newState.isAutomaticConfigurationEnabled else { return }
+
+        if let configurationApplier {
+            try configurationApplier(oldState, newState)
+            return
+        }
 
         // Deprecated: `customConfigureAudioSessionFunc` overrides the default configuration.
         // This path does not support error propagation since the legacy func returns Void.
@@ -188,19 +213,12 @@ public class AudioSessionEngineObserver: AudioEngineObserver, Loggable, @uncheck
             } else {
                 log("AudioSession deactivation skipped...")
             }
-        } else if newState.isRecordingEnabled || newState.isPlayoutEnabled {
+        } else if let config = Self.sessionConfiguration(for: newState) {
             // Configure and activate the session with the appropriate category.
             // Chat modes engage iOS's call-tuned speaker gain and are only kept
             // when Apple voice processing provides its compensating loudness
             // stage. With software processing, the media-tuned presets keep
             // remote audio at media playback loudness.
-            let playAndRecord: AudioSessionConfiguration = if newState.isPlatformVoiceProcessingExpected {
-                newState.isSpeakerOutputPreferred ? .playAndRecordSpeaker : .playAndRecordReceiver
-            } else {
-                newState.isSpeakerOutputPreferred ? .playAndRecordSpeakerMedia : .playAndRecordReceiverMedia
-            }
-            let config: AudioSessionConfiguration = newState.isRecordingEnabled ? playAndRecord : .playback
-
             do {
                 log("AudioSession configuring category to: \(config.category)")
                 try session.setCategory(config.category, mode: config.mode, options: config.categoryOptions)
@@ -232,6 +250,15 @@ public class AudioSessionEngineObserver: AudioEngineObserver, Loggable, @uncheck
         }
     }
 
+    private static func sessionConfiguration(for state: State) -> AudioSessionConfiguration? {
+        guard state.isRecordingEnabled || state.isPlayoutEnabled else { return nil }
+        guard state.isRecordingEnabled else { return .playback }
+        if state.isPlatformVoiceProcessingExpected {
+            return state.isSpeakerOutputPreferred ? .playAndRecordSpeaker : .playAndRecordReceiver
+        }
+        return state.isSpeakerOutputPreferred ? .playAndRecordSpeakerMedia : .playAndRecordReceiverMedia
+    }
+
     // MARK: - AudioEngineObserver
 
     public func engineWillEnable(_ engine: AVAudioEngine, isPlayoutEnabled: Bool, isRecordingEnabled: Bool) -> Int {
@@ -250,10 +277,8 @@ public class AudioSessionEngineObserver: AudioEngineObserver, Loggable, @uncheck
     }
 
     public func engineDidDisable(_ engine: AVAudioEngine, isPlayoutEnabled: Bool, isRecordingEnabled: Bool) -> Int {
-        let nextResult = _state.next?.engineDidDisable(engine, isPlayoutEnabled: isPlayoutEnabled, isRecordingEnabled: isRecordingEnabled) ?? 0
-
         if engine.isInManualRenderingMode {
-            return nextResult
+            return _state.next?.engineDidDisable(engine, isPlayoutEnabled: isPlayoutEnabled, isRecordingEnabled: isRecordingEnabled) ?? 0
         }
 
         let requirement = SessionRequirement(isPlayoutEnabled: isPlayoutEnabled, isRecordingEnabled: isRecordingEnabled)
@@ -262,7 +287,7 @@ public class AudioSessionEngineObserver: AudioEngineObserver, Loggable, @uncheck
         } catch {
             return kAudioEngineErrorFailedToConfigureAudioSession
         }
-        return nextResult
+        return _state.next?.engineDidDisable(engine, isPlayoutEnabled: isPlayoutEnabled, isRecordingEnabled: isRecordingEnabled) ?? 0
     }
 }
 
