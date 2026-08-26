@@ -17,11 +17,14 @@
 /// Resource limits applied before an incoming stream reaches its handler.
 public struct IncomingStreamLimits: Equatable, Sendable {
     /// Compatibility defaults keep total stream length unrestricted while
-    /// bounding retained chunk and descriptor counts.
+    /// bounding retained chunk, descriptor, and dispatched-handler counts.
     public static let `default` = IncomingStreamLimits()
 
     public let maxStreamBytes: Int?
+    /// Maximum streams whose descriptor is open or whose dispatched handler has
+    /// not returned. A stream remains counted until both resources are retired.
     public let maxConcurrentStreams: Int
+    /// Per exact participant connection form of `maxConcurrentStreams`.
     public let maxConcurrentStreamsPerParticipantConnection: Int?
     public let maxBufferedChunks: Int
 

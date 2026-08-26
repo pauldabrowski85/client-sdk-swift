@@ -147,6 +147,7 @@ enum RpcStreamLimits {
     static let incomingResponse = IncomingStreamLimits(
         maxStreamBytes: maximumPayloadBytes,
         maxConcurrentStreams: RpcInvocationLimits.maximumInFlight,
+        maxConcurrentStreamsPerParticipantConnection: RpcInvocationLimits.maximumInFlightPerConnection,
         maxBufferedChunks: 128
     )
 }
@@ -200,6 +201,169 @@ public struct RpcInvocationData: Sendable {
 struct PendingRpcResponse {
     let participantConnection: RpcParticipantConnection
     let completer: AsyncCompleter<String>
+    let responseDeadlineContinuousTimeNanoseconds: UInt64
+    let publicationGate: RpcPublicationGate
+    let publicationController: RpcPublicationController
+    var responseStreamReader: TextStreamReader?
+}
+
+private struct RpcPublicationTerminated: Error {}
+
+final class RpcPublicationController: @unchecked Sendable {
+    private struct State {
+        var isRevoked = false
+        var phaseIsResolved = false
+        var task: Task<Void, Never>?
+        var streamCancellation: OutgoingStreamCancellation?
+    }
+
+    private let state = StateSync(State())
+    private let phaseCompleter: AsyncCompleter<Void>
+
+    init(timeout: TimeInterval) {
+        phaseCompleter = AsyncCompleter(
+            label: "rpc-request-publication",
+            defaultTimeout: timeout
+        )
+    }
+
+    func install(task: Task<Void, Never>) {
+        let shouldCancel = state.mutate { state in
+            guard !state.isRevoked, !state.phaseIsResolved else { return true }
+            state.task = task
+            return false
+        }
+        if shouldCancel { task.cancel() }
+    }
+
+    func register(streamCancellation: OutgoingStreamCancellation) -> Bool {
+        state.mutate { state in
+            guard !state.isRevoked, !state.phaseIsResolved else { return false }
+            state.streamCancellation = streamCancellation
+            return true
+        }
+    }
+
+    func publicationSucceeded() {
+        resolvePublication(with: .success(()))
+    }
+
+    func publicationFailed(_ error: Error) {
+        resolvePublication(with: .failure(error))
+    }
+
+    func wait(timeout: TimeInterval) async throws {
+        try await phaseCompleter.wait(timeout: timeout)
+    }
+
+    func revoke() {
+        let task = state.mutate { state -> Task<Void, Never>? in
+            state.isRevoked = true
+            defer { state.task = nil }
+            return state.task
+        }
+        task?.cancel()
+    }
+
+    func cancelAndWaitForStreamCleanup() async {
+        let cancellationState = state.mutate { state -> (
+            task: Task<Void, Never>?,
+            streamCancellation: OutgoingStreamCancellation?
+        ) in
+            state.isRevoked = true
+            defer { state.task = nil }
+            return (state.task, state.streamCancellation)
+        }
+        cancellationState.task?.cancel()
+        if let cancellation = cancellationState.streamCancellation {
+            await cancellation.cancel()
+        }
+
+        let shouldResume = state.mutate { state in
+            guard !state.phaseIsResolved else { return false }
+            state.phaseIsResolved = true
+            state.streamCancellation = nil
+            return true
+        }
+        if shouldResume {
+            phaseCompleter.resume(throwing: RpcPublicationTerminated())
+        }
+    }
+
+    private func resolvePublication(with result: Result<Void, Error>) {
+        let shouldResume = state.mutate { state in
+            guard !state.isRevoked, !state.phaseIsResolved else { return false }
+            state.phaseIsResolved = true
+            state.task = nil
+            state.streamCancellation = nil
+            return true
+        }
+        if shouldResume {
+            phaseCompleter.resume(with: result)
+        }
+    }
+}
+
+final class RpcPublicationGate: @unchecked Sendable {
+    private let revoked = StateSync(false)
+    private let responseDeadlineContinuousTimeNanoseconds: UInt64
+    private let nowNanoseconds: @Sendable () -> UInt64
+    private let additionalAdmission: DataChannelSendAdmission
+
+    init(
+        responseDeadlineContinuousTimeNanoseconds: UInt64,
+        nowNanoseconds: @escaping @Sendable () -> UInt64,
+        additionalAdmission: DataChannelSendAdmission
+    ) {
+        self.responseDeadlineContinuousTimeNanoseconds = responseDeadlineContinuousTimeNanoseconds
+        self.nowNanoseconds = nowNanoseconds
+        self.additionalAdmission = additionalAdmission
+    }
+
+    var sendAdmission: DataChannelSendAdmission {
+        DataChannelSendAdmission(
+            preflight: { [weak self] in
+                guard let self else {
+                    return LiveKitError(.cancelled, message: "RPC publication gate was released")
+                }
+                return self.rejectionError()
+            },
+            attempt: { [weak self] send in
+                guard let self else {
+                    return .rejected(LiveKitError(.cancelled, message: "RPC publication gate was released"))
+                }
+                return revoked.mutate { revoked in
+                    guard !revoked,
+                          nowNanoseconds() < responseDeadlineContinuousTimeNanoseconds
+                    else {
+                        return .rejected(LiveKitError(
+                            .cancelled,
+                            message: "RPC publication deadline or destination admission was revoked"
+                        ))
+                    }
+                    return additionalAdmission.attempt(send)
+                }
+            }
+        )
+    }
+
+    func revoke() {
+        revoked.mutate { $0 = true }
+    }
+
+    private func rejectionError() -> Error? {
+        revoked.read { revoked in
+            guard !revoked,
+                  nowNanoseconds() < responseDeadlineContinuousTimeNanoseconds
+            else {
+                return LiveKitError(
+                    .cancelled,
+                    message: "RPC publication deadline or destination admission was revoked"
+                )
+            }
+            return additionalAdmission.preflight()
+        }
+    }
 }
 
 struct RpcParticipantConnection: @unchecked Sendable {
@@ -259,5 +423,28 @@ struct RpcParticipantConnection: @unchecked Sendable {
                 current.sid == sid &&
                 current.dataPacketReceiveGeneration == dataPacketReceiveGeneration
         }
+    }
+
+    func sendAdmission(in room: Room) -> DataChannelSendAdmission {
+        DataChannelSendAdmission(
+            preflight: { [weak room] in
+                guard let room, self.isCurrent(in: room) else {
+                    return LiveKitError(
+                        .cancelled,
+                        message: "RPC participant connection was replaced"
+                    )
+                }
+                return nil
+            },
+            attempt: { [weak room] send in
+                guard let room else {
+                    return .rejected(LiveKitError(
+                        .cancelled,
+                        message: "RPC participant room was released"
+                    ))
+                }
+                return room.attemptRpcPublication(for: self, send)
+            }
+        )
     }
 }

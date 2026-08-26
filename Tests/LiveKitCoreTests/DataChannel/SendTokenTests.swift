@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+import Foundation
 @testable import LiveKit
 import Testing
 
@@ -47,5 +48,54 @@ struct SendTokenTests {
                 _ = token
             }
         } throws: { ($0 as? LiveKitError)?.type == .cancelled }
+    }
+
+    @Test func cancellationAfterEarlierCheckRejectsFinalRawSend() async {
+        let channel = FakeSendChannel()
+
+        await #expect {
+            try await withCheckedThrowingContinuation { continuation in
+                let token = SendToken(continuation)
+                let write = ReadyWrite(
+                    payload: Data([1]),
+                    sequence: 0,
+                    submissionToken: token,
+                    settlesSubmission: true
+                )
+
+                #expect(!token.isSettled)
+                token.settle(with: .failure(LiveKitError(.cancelled)))
+
+                let attempt = write.attempt(on: channel)
+                guard case .rejected = attempt else {
+                    Issue.record("Expected cancellation to reject the final raw send attempt")
+                    return
+                }
+                #expect(channel.sent.isEmpty)
+            }
+        } throws: { ($0 as? LiveKitError)?.type == .cancelled }
+    }
+
+    @Test func finalRawSendWinningFirstSettlesSuccessAtomically() async throws {
+        let channel = FakeSendChannel()
+
+        try await withCheckedThrowingContinuation { continuation in
+            let token = SendToken(continuation)
+            let write = ReadyWrite(
+                payload: Data([1]),
+                sequence: 0,
+                submissionToken: token,
+                settlesSubmission: true
+            )
+
+            let attempt = write.attempt(on: channel)
+            guard case .sent = attempt else {
+                Issue.record("Expected the final raw send attempt to succeed")
+                return
+            }
+            token.settle(with: .failure(LiveKitError(.cancelled)))
+        }
+
+        #expect(channel.sent == [Data([1])])
     }
 }

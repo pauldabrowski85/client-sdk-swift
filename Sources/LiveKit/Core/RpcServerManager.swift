@@ -52,19 +52,26 @@ private struct RpcCallerConnectionToken: Sendable {
     }
 }
 
-private struct RpcInvocationOwner: Hashable, Sendable {
+private struct RpcWorkOwner: Hashable, Sendable {
     let identity: Participant.Identity
-    let sid: Participant.Sid
+    let sid: Participant.Sid?
     let dataPacketReceiveGeneration: UInt64
-    let participantObjectIdentifier: ObjectIdentifier
 
     init(_ connection: RpcParticipantConnection) {
         identity = connection.identity
         sid = connection.sid
         dataPacketReceiveGeneration = connection.dataPacketReceiveGeneration
-        participantObjectIdentifier = ObjectIdentifier(connection.participant)
     }
 
+    init(
+        identity: Participant.Identity,
+        sid: Participant.Sid?,
+        dataPacketReceiveGeneration: UInt64
+    ) {
+        self.identity = identity
+        self.sid = sid
+        self.dataPacketReceiveGeneration = dataPacketReceiveGeneration
+    }
 }
 
 private struct RpcInvocationClock: Sendable {
@@ -85,8 +92,14 @@ private struct RpcInvocationClock: Sendable {
     )
 }
 
-private final class RpcInvocationLease: @unchecked Sendable {
-    private let released = StateSync(false)
+final class RpcInvocationLease: @unchecked Sendable {
+    private struct State {
+        var handlerFinished = false
+        var publicationFinished = false
+        var released = false
+    }
+
+    private let state = StateSync(State())
     private let onRelease: @Sendable () -> Void
 
     init(onRelease: @escaping @Sendable () -> Void) {
@@ -94,9 +107,31 @@ private final class RpcInvocationLease: @unchecked Sendable {
     }
 
     func release() {
-        let shouldRelease = released.mutate { released in
-            guard !released else { return false }
-            released = true
+        let shouldRelease = state.mutate { state in
+            guard !state.released else { return false }
+            state.released = true
+            return true
+        }
+        if shouldRelease { onRelease() }
+    }
+
+    func handlerDidFinish() {
+        let shouldRelease = state.mutate { state in
+            guard !state.released else { return false }
+            state.handlerFinished = true
+            guard state.publicationFinished else { return false }
+            state.released = true
+            return true
+        }
+        if shouldRelease { onRelease() }
+    }
+
+    func publicationDidFinish() {
+        let shouldRelease = state.mutate { state in
+            guard !state.released else { return false }
+            state.publicationFinished = true
+            guard state.handlerFinished else { return false }
+            state.released = true
             return true
         }
         if shouldRelease { onRelease() }
@@ -107,6 +142,144 @@ private final class RpcInvocationLease: @unchecked Sendable {
     }
 }
 
+private final class RpcInvocationAdmission: @unchecked Sendable {
+    private let owners = StateSync<[UUID: RpcWorkOwner]>([:])
+
+    var count: Int { owners.read(\.count) }
+
+    func admit(_ owner: RpcWorkOwner) -> RpcInvocationLease? {
+        let id = UUID()
+        let admitted = owners.mutate { owners in
+            guard owners.count < RpcInvocationLimits.maximumInFlight else { return false }
+            let ownerCount = owners.values.lazy.filter { $0 == owner }.count
+            let identityCount = owners.values.lazy.filter { $0.identity == owner.identity }.count
+            guard ownerCount < RpcInvocationLimits.maximumInFlightPerConnection,
+                  identityCount < RpcInvocationLimits.maximumInFlightPerConnection
+            else { return false }
+            owners[id] = owner
+            return true
+        }
+        guard admitted else { return nil }
+        return RpcInvocationLease { [weak self] in
+            self?.owners.mutate { $0.removeValue(forKey: id) }
+        }
+    }
+}
+
+private final class RpcControlPublicationGate: @unchecked Sendable {
+    private let revoked = StateSync(false)
+
+    var isAdmitted: Bool { !revoked.copy() && !Task.isCancelled }
+
+    func sendAdmission(
+        additionalAdmission: DataChannelSendAdmission
+    ) -> DataChannelSendAdmission {
+        DataChannelSendAdmission(
+            preflight: { [weak self] in
+                guard let self, !revoked.copy() else {
+                    return LiveKitError(.cancelled, message: "RPC control publication was revoked")
+                }
+                return additionalAdmission.preflight()
+            },
+            attempt: { [weak self] send in
+                guard let self else {
+                    return .rejected(LiveKitError(.cancelled, message: "RPC control publication was released"))
+                }
+                return revoked.mutate { revoked in
+                    guard !revoked else {
+                        return .rejected(LiveKitError(
+                            .cancelled,
+                            message: "RPC control publication was revoked"
+                        ))
+                    }
+                    return additionalAdmission.attempt(send)
+                }
+            }
+        )
+    }
+
+    func revoke() {
+        revoked.mutate { $0 = true }
+    }
+}
+
+private final class RpcControlReplyQueue: @unchecked Sendable {
+    private struct Entry {
+        let owner: RpcWorkOwner
+        let gate: RpcControlPublicationGate
+        var task: Task<Void, Never>?
+    }
+
+    private struct State {
+        var entries: [UUID: Entry] = [:]
+        var droppedCount = 0
+    }
+
+    private let state = StateSync(State())
+
+    var count: Int { state.read { $0.entries.count } }
+    var droppedCount: Int { state.droppedCount }
+
+    @discardableResult
+    func submit(
+        owner: RpcWorkOwner,
+        operation: @escaping @Sendable (RpcControlPublicationGate) async -> Void
+    ) -> Bool {
+        let id = UUID()
+        let gate = RpcControlPublicationGate()
+        let admitted = state.mutate { state in
+            guard state.entries.count < RpcInvocationLimits.maximumInFlight else {
+                state.droppedCount += 1
+                return false
+            }
+            let ownerCount = state.entries.values.lazy.filter { $0.owner == owner }.count
+            let identityCount = state.entries.values.lazy.filter { $0.owner.identity == owner.identity }.count
+            guard ownerCount < RpcInvocationLimits.maximumInFlightPerConnection,
+                  identityCount < RpcInvocationLimits.maximumInFlightPerConnection
+            else {
+                state.droppedCount += 1
+                return false
+            }
+            state.entries[id] = Entry(owner: owner, gate: gate, task: nil)
+            return true
+        }
+        guard admitted else { return false }
+
+        let task = Task { [weak self] in
+            await operation(gate)
+            self?.state.mutate { $0.entries.removeValue(forKey: id) }
+        }
+        let entryStillExists = state.mutate { state in
+            guard var entry = state.entries[id] else { return false }
+            entry.task = task
+            state.entries[id] = entry
+            return true
+        }
+        if !entryStillExists {
+            gate.revoke()
+            task.cancel()
+        }
+        return true
+    }
+
+    func drain(staleTo currentGeneration: UInt64) {
+        let stale = state.read { state in
+            state.entries.values.filter { $0.owner.dataPacketReceiveGeneration != currentGeneration }
+        }
+        for entry in stale {
+            entry.gate.revoke()
+            entry.task?.cancel()
+        }
+    }
+
+    deinit {
+        for entry in state.entries.values {
+            entry.gate.revoke()
+            entry.task?.cancel()
+        }
+    }
+}
+
 /// Handler-side RPC.
 ///
 /// Owns the registered method-handler table and the wire-level handling of incoming
@@ -114,7 +287,8 @@ private final class RpcInvocationLease: @unchecked Sendable {
 /// `Room.unregisterRpcMethod` are one-line proxies that forward into this actor.
 actor RpcServerManager: Loggable {
     private weak var room: Room?
-    private var activeInvocationOwners: [UUID: RpcInvocationOwner] = [:]
+    private nonisolated let invocationAdmission = RpcInvocationAdmission()
+    private nonisolated let controlReplyQueue = RpcControlReplyQueue()
     private var afterRequestStreamRead: (@Sendable () async -> Void)?
     private var beforeHandlerPreflight: (@Sendable () async -> Void)?
     private var invocationClock = RpcInvocationClock.live
@@ -175,9 +349,56 @@ actor RpcServerManager: Loggable {
     // MARK: - Incoming dispatch
 
     // swiftlint:disable function_parameter_count
+    nonisolated func enqueueIncomingRequest(
+        callerIdentity: Participant.Identity,
+        callerParticipantSid: Participant.Sid?,
+        callerDataPacketReceiveGeneration: UInt64,
+        requestId: String,
+        method: String,
+        payload: String,
+        responseTimeout: TimeInterval,
+        receivedAtContinuousTimeNanoseconds: UInt64,
+        version: Int
+    ) {
+        let owner = RpcWorkOwner(
+            identity: callerIdentity,
+            sid: callerParticipantSid,
+            dataPacketReceiveGeneration: callerDataPacketReceiveGeneration
+        )
+        guard let invocationLease = invocationAdmission.admit(owner) else {
+            enqueueControlResponse(
+                owner: owner,
+                requestId: requestId,
+                error: .receiverOverloaded,
+                publishesAck: true
+            )
+            return
+        }
+        Task.discarding { [weak self] in
+            guard let self else {
+                invocationLease.release()
+                return
+            }
+            await self.handleIncomingRequest(
+                callerIdentity: callerIdentity,
+                callerParticipantSid: callerParticipantSid,
+                callerDataPacketReceiveGeneration: callerDataPacketReceiveGeneration,
+                requestId: requestId,
+                method: method,
+                payload: payload,
+                responseTimeout: responseTimeout,
+                receivedAtContinuousTimeNanoseconds: receivedAtContinuousTimeNanoseconds,
+                version: version,
+                preadmittedInvocationLease: invocationLease
+            )
+        }
+    }
+    // swiftlint:enable function_parameter_count
+
+    // swiftlint:disable function_parameter_count
     /// Handle an RPC request that arrived as a v1 `RpcRequest` packet. Successful
     /// responses follow the caller's advertised `clientProtocol`: v2-capable callers
-    /// get a v2 data-stream response (uncapped), legacy callers get a v1 packet.
+    /// get a v2 data-stream response (capped at 1 MiB), legacy callers get a v1 packet.
     /// Errors always use a v1 packet per spec.
     func handleIncomingRequest(callerIdentity: Participant.Identity,
                                callerParticipantSid: Participant.Sid? = nil,
@@ -187,16 +408,31 @@ actor RpcServerManager: Loggable {
                                payload: String,
                                responseTimeout: TimeInterval,
                                receivedAtContinuousTimeNanoseconds: UInt64 = RpcContinuousClock.nowNanoseconds(),
-                               version: Int) async
+                               version: Int,
+                               preadmittedInvocationLease: RpcInvocationLease? = nil) async
     {
-        guard let room = try? requireRoom() else { return }
+        guard let room = try? requireRoom() else {
+            preadmittedInvocationLease?.release()
+            return
+        }
         guard let callerConnection = RpcParticipantConnection.resolve(
             in: room,
             identity: callerIdentity,
             sid: callerParticipantSid,
             dataPacketReceiveGeneration: callerDataPacketReceiveGeneration
         ) else {
+            preadmittedInvocationLease?.release()
             log("[Rpc] Ignoring request \(requestId) with stale or missing caller provenance", .error)
+            return
+        }
+
+        guard let invocationLease = preadmittedInvocationLease ?? admitInvocation(for: callerConnection) else {
+            enqueueControlResponse(
+                for: callerConnection,
+                requestId: requestId,
+                error: .receiverOverloaded,
+                publishesAck: true
+            )
             return
         }
 
@@ -207,6 +443,7 @@ actor RpcServerManager: Loggable {
         }
 
         guard version == 1 else {
+            defer { invocationLease.release() }
             do {
                 try await publishResponse(in: room,
                                           callerConnection: callerConnection,
@@ -219,6 +456,7 @@ actor RpcServerManager: Loggable {
             return
         }
         guard payload.byteLength <= MAX_RPC_PAYLOAD_BYTES else {
+            defer { invocationLease.release() }
             do {
                 try await publishResponse(
                     in: room,
@@ -237,6 +475,7 @@ actor RpcServerManager: Loggable {
             receivedAtContinuousTimeNanoseconds: receivedAtContinuousTimeNanoseconds,
             responseTimeout: responseTimeout
         ) else {
+            defer { invocationLease.release() }
             await publishInvalidRequest(
                 in: room,
                 callerConnection: callerConnection,
@@ -244,15 +483,8 @@ actor RpcServerManager: Loggable {
             )
             return
         }
-        guard let invocationLease = admitInvocation(for: callerConnection) else {
-            await publishOverloadedRequest(
-                in: room,
-                callerConnection: callerConnection,
-                requestId: requestId
-            )
-            return
-        }
 
+        defer { invocationLease.publicationDidFinish() }
         let result = await dispatchToHandler(callerConnection: callerConnection,
                                              requestId: requestId,
                                              method: method,
@@ -308,38 +540,26 @@ actor RpcServerManager: Loggable {
         else {
             await reader.cancel()
             log("[Rpc] Incoming v2 RPC request stream for \(requestId) is missing required attributes", .error)
-            do {
-                try await publishResponse(in: room,
-                                          callerConnection: callerConnection,
-                                          requestId: requestId,
-                                          payload: nil,
-                                          error: RpcError(code: RpcError.BuiltInError.applicationError.code,
-                                                          message: "RPC data stream malformed",
-                                                          data: ""))
-            } catch {
-                log("[Rpc] Failed to publish malformed-attrs error response for \(requestId)", .error)
-            }
+            enqueueControlResponse(
+                for: callerConnection,
+                requestId: requestId,
+                error: RpcError(code: RpcError.BuiltInError.applicationError.code,
+                                message: "RPC data stream malformed",
+                                data: ""),
+                publishesAck: false
+            )
             return
         }
         let responseTimeout = TimeInterval(timeoutMs) / 1000
 
-        do {
-            try await publishAck(in: room, callerConnection: callerConnection, requestId: requestId)
-        } catch {
-            log("[Rpc] Failed to publish RPC ack for \(requestId)", .error)
-        }
-
         guard version == RPC_STREAM_VERSION else {
             await reader.cancel()
-            do {
-                try await publishResponse(in: room,
-                                          callerConnection: callerConnection,
-                                          requestId: requestId,
-                                          payload: nil,
-                                          error: RpcError.builtIn(.unsupportedVersion))
-            } catch {
-                log("[Rpc] Failed to publish RPC error response for \(requestId)", .error)
-            }
+            enqueueControlResponse(
+                for: callerConnection,
+                requestId: requestId,
+                error: .builtIn(.unsupportedVersion),
+                publishesAck: true
+            )
             return
         }
 
@@ -348,21 +568,29 @@ actor RpcServerManager: Loggable {
             responseTimeout: responseTimeout
         ) else {
             await reader.cancel()
-            await publishInvalidRequest(
-                in: room,
-                callerConnection: callerConnection,
-                requestId: requestId
+            enqueueControlResponse(
+                for: callerConnection,
+                requestId: requestId,
+                error: .builtIn(.applicationError),
+                publishesAck: true
             )
             return
         }
         guard let invocationLease = admitInvocation(for: callerConnection) else {
             await reader.cancel()
-            await publishOverloadedRequest(
-                in: room,
-                callerConnection: callerConnection,
-                requestId: requestId
+            enqueueControlResponse(
+                for: callerConnection,
+                requestId: requestId,
+                error: .receiverOverloaded,
+                publishesAck: true
             )
             return
+        }
+
+        do {
+            try await publishAck(in: room, callerConnection: callerConnection, requestId: requestId)
+        } catch {
+            log("[Rpc] Failed to publish RPC ack for \(requestId)", .error)
         }
 
         let payload: String
@@ -372,7 +600,7 @@ actor RpcServerManager: Loggable {
                 responseDeadlineContinuousTimeNanoseconds: responseDeadlineContinuousTimeNanoseconds
             )
         } catch {
-            invocationLease.release()
+            defer { invocationLease.release() }
             log("[Rpc] Failed to read v2 RPC request payload for \(requestId): \(error)", .error)
             let rpcError: RpcError = if error is RpcInvocationDeadlineExceeded {
                 .builtIn(.responseTimeout)
@@ -401,7 +629,7 @@ actor RpcServerManager: Loggable {
             return
         }
         guard invocationClock.nowNanoseconds() < responseDeadlineContinuousTimeNanoseconds else {
-            invocationLease.release()
+            defer { invocationLease.release() }
             do {
                 try await publishResponse(
                     in: room,
@@ -415,6 +643,7 @@ actor RpcServerManager: Loggable {
             }
             return
         }
+        defer { invocationLease.publicationDidFinish() }
         let result = await dispatchToHandler(callerConnection: callerConnection,
                                              requestId: requestId,
                                              method: method,
@@ -431,19 +660,11 @@ actor RpcServerManager: Loggable {
         }
     }
 
-    func handleIncomingRequestStreamRejection(_ rejection: IncomingStreamRejection) async {
-        guard let requestId = rejection.attributes[RpcStreamAttribute.requestId],
-              let room = try? requireRoom()
-        else {
-            log("[Rpc] Rejected v2 request stream is missing request id", .error)
+    nonisolated func enqueueIncomingRequestStreamRejection(_ rejection: IncomingStreamRejection) {
+        guard let requestId = rejection.attributes[RpcStreamAttribute.requestId] else {
+            Self.log("[Rpc] Rejected v2 request stream is missing request id", .error)
             return
         }
-        guard let callerConnection = RpcParticipantConnection.resolve(
-            in: room,
-            identity: rejection.participantIdentity,
-            sid: rejection.publisherParticipantSid,
-            dataPacketReceiveGeneration: rejection.dataPacketReceiveGeneration
-        ) else { return }
         let error: RpcError = switch rejection.error {
         case .streamSizeExceeded, .invalidDeclaredLength:
             .builtIn(.requestPayloadTooLarge)
@@ -452,24 +673,29 @@ actor RpcServerManager: Loggable {
         default:
             .builtIn(.applicationError)
         }
-        do {
-            try await publishResponse(
-                in: room,
-                callerConnection: callerConnection,
-                requestId: requestId,
-                payload: nil,
-                error: error
-            )
-        } catch {
-            log("[Rpc] Failed to publish rejection response for \(requestId)", .error)
-        }
+        enqueueControlResponse(
+            owner: RpcWorkOwner(
+                identity: rejection.participantIdentity,
+                sid: rejection.publisherParticipantSid,
+                dataPacketReceiveGeneration: rejection.dataPacketReceiveGeneration
+            ),
+            requestId: requestId,
+            error: error,
+            publishesAck: false
+        )
     }
 
     // swiftlint:enable function_body_length
 
     // MARK: - Admission and deadlines
 
-    var activeInvocationCount: Int { activeInvocationOwners.count }
+    nonisolated var activeInvocationCount: Int { invocationAdmission.count }
+    nonisolated var activeControlReplyCount: Int { controlReplyQueue.count }
+    nonisolated var droppedControlReplyCount: Int { controlReplyQueue.droppedCount }
+
+    nonisolated func drainControlReplies(to currentGeneration: UInt64) {
+        controlReplyQueue.drain(staleTo: currentGeneration)
+    }
 
     private static func responseDeadlineContinuousTimeNanoseconds(
         receivedAtContinuousTimeNanoseconds: UInt64,
@@ -486,24 +712,84 @@ actor RpcServerManager: Loggable {
     }
 
     private func admitInvocation(for callerConnection: RpcParticipantConnection) -> RpcInvocationLease? {
-        guard activeInvocationOwners.count < RpcInvocationLimits.maximumInFlight else { return nil }
-        let owner = RpcInvocationOwner(callerConnection)
-        let ownerInvocationCount = activeInvocationOwners.values.lazy.filter { $0 == owner }.count
-        let identityInvocationCount = activeInvocationOwners.values.lazy
-            .filter { $0.identity == owner.identity }
-            .count
-        guard ownerInvocationCount < RpcInvocationLimits.maximumInFlightPerConnection,
-              identityInvocationCount < RpcInvocationLimits.maximumInFlightPerConnection
-        else { return nil }
-        let id = UUID()
-        activeInvocationOwners[id] = owner
-        return RpcInvocationLease { [weak self] in
-            Task { await self?.releaseInvocation(id) }
+        invocationAdmission.admit(RpcWorkOwner(callerConnection))
+    }
+
+    private nonisolated func enqueueControlResponse(
+        for callerConnection: RpcParticipantConnection,
+        requestId: String,
+        error: RpcError,
+        publishesAck: Bool
+    ) {
+        enqueueControlResponse(
+            owner: RpcWorkOwner(callerConnection),
+            requestId: requestId,
+            error: error,
+            publishesAck: publishesAck
+        )
+    }
+
+    private nonisolated func enqueueControlResponse(
+        owner: RpcWorkOwner,
+        requestId: String,
+        error: RpcError,
+        publishesAck: Bool
+    ) {
+        let submitted = controlReplyQueue.submit(owner: owner) { [weak self] gate in
+            await self?.publishControlResponse(
+                owner: owner,
+                requestId: requestId,
+                error: error,
+                publishesAck: publishesAck,
+                gate: gate
+            )
+        }
+        guard !submitted else { return }
+        let droppedCount = controlReplyQueue.droppedCount
+        if droppedCount == 1 || droppedCount.nonzeroBitCount == 1 {
+            Self.log(
+                "[Rpc] Dropped bounded control response for \(requestId); total drops = \(droppedCount)",
+                .warning
+            )
         }
     }
 
-    private func releaseInvocation(_ id: UUID) {
-        activeInvocationOwners.removeValue(forKey: id)
+    private func publishControlResponse(
+        owner: RpcWorkOwner,
+        requestId: String,
+        error: RpcError,
+        publishesAck: Bool,
+        gate: RpcControlPublicationGate
+    ) async {
+        guard gate.isAdmitted,
+              let room = try? requireRoom(),
+              let callerConnection = RpcParticipantConnection.resolve(
+                  in: room,
+                  identity: owner.identity,
+                  sid: owner.sid,
+                  dataPacketReceiveGeneration: owner.dataPacketReceiveGeneration
+              )
+        else { return }
+        do {
+            if publishesAck {
+                try await publishAck(
+                    in: room,
+                    callerConnection: callerConnection,
+                    requestId: requestId,
+                    controlGate: gate
+                )
+            }
+            try await publishResponse(
+                in: room,
+                callerConnection: callerConnection,
+                requestId: requestId,
+                payload: nil,
+                error: error,
+                controlGate: gate
+            )
+        } catch {
+            log("[Rpc] Failed to publish bounded control response for \(requestId)", .error)
+        }
     }
 
     private func publishInvalidRequest(
@@ -521,24 +807,6 @@ actor RpcServerManager: Loggable {
             )
         } catch {
             log("[Rpc] Failed to publish rejected-request response for \(requestId)", .error)
-        }
-    }
-
-    private func publishOverloadedRequest(
-        in room: Room,
-        callerConnection: RpcParticipantConnection,
-        requestId: String
-    ) async {
-        do {
-            try await publishResponse(
-                in: room,
-                callerConnection: callerConnection,
-                requestId: requestId,
-                payload: nil,
-                error: .receiverOverloaded
-            )
-        } catch {
-            log("[Rpc] Failed to publish overloaded-request response for \(requestId)", .error)
         }
     }
 
@@ -586,7 +854,7 @@ actor RpcServerManager: Loggable {
 
     /// Look up the handler for `method`, invoke it, and produce a payload-or-error result.
     /// Size-checking the response is the responsibility of the publisher: the v1 wire has
-    /// a 15 KB cap (enforced in `publishResponse`), the v2 stream wire is unbounded.
+    /// a 15 KB cap (enforced in `publishResponse`), the v2 stream wire has a 1 MiB cap.
     private func dispatchToHandler(callerConnection: RpcParticipantConnection,
                                    requestId: String,
                                    method: String,
@@ -595,16 +863,16 @@ actor RpcServerManager: Loggable {
                                    invocationLease: RpcInvocationLease) async -> DispatchResult
     {
         guard let room, callerConnection.isCurrent(in: room) else {
-            invocationLease.release()
+            invocationLease.handlerDidFinish()
             return .failure(RpcError.builtIn(.recipientDisconnected))
         }
         guard let handler = handlers[method] else {
-            invocationLease.release()
+            invocationLease.handlerDidFinish()
             return .failure(RpcError.builtIn(.unsupportedMethod))
         }
         let now = invocationClock.nowNanoseconds()
         guard responseDeadlineContinuousTimeNanoseconds > now else {
-            invocationLease.release()
+            invocationLease.handlerDidFinish()
             return .failure(RpcError.builtIn(.responseTimeout))
         }
         let remaining = TimeInterval(responseDeadlineContinuousTimeNanoseconds - now) / 1_000_000_000
@@ -630,7 +898,7 @@ actor RpcServerManager: Loggable {
         let invocationClock = invocationClock
         let beforeHandlerPreflight = beforeHandlerPreflight
         let handlerTask = Task.detached { [handler, invocationLease] in
-            defer { invocationLease.release() }
+            defer { invocationLease.handlerDidFinish() }
             if let beforeHandlerPreflight { await beforeHandlerPreflight() }
             guard !Task.isCancelled,
                   callerIsCurrent(),
@@ -681,7 +949,7 @@ actor RpcServerManager: Loggable {
     }
 
     /// Publish a handler dispatch outcome. Successful responses follow the caller's
-    /// advertised `clientProtocol`: v2-capable peers receive a v2 stream (uncapped),
+    /// advertised `clientProtocol`: v2-capable peers receive a v2 stream (capped at 1 MiB),
     /// legacy peers receive a v1 packet (capped at `MAX_RPC_PAYLOAD_BYTES`). Error
     /// responses always use a v1 packet per spec, regardless of caller transport.
     private func publishResult(_ result: DispatchResult,
@@ -729,13 +997,15 @@ actor RpcServerManager: Loggable {
     /// Publish a v1 `RpcResponse` packet. The 15 KB cap is a v1 wire-format constraint and
     /// is enforced here: if `payload` exceeds it, the packet is sent as a
     /// `responsePayloadTooLarge` error instead. v2 stream responses go through
-    /// `publishResponseStream` and have no size limit.
+    /// `publishResponseStream` and are capped at `RpcStreamLimits.maximumPayloadBytes`.
     private func publishResponse(in room: Room,
                                  callerConnection: RpcParticipantConnection,
                                  requestId: String,
                                  payload: String?,
-                                 error: RpcError?) async throws
+                                 error: RpcError?,
+                                 controlGate: RpcControlPublicationGate? = nil) async throws
     {
+        guard controlGate?.isAdmitted != false else { throw LiveKitError(.cancelled) }
         try requireCurrent(callerConnection, in: room)
         var outgoingPayload = payload
         var outgoingError = error
@@ -760,10 +1030,13 @@ actor RpcServerManager: Loggable {
 
         try requireCurrent(callerConnection, in: room)
         let sendGeneration = room.publisherDataChannel.sendGeneration
+        let connectionAdmission = callerConnection.sendAdmission(in: room)
+        let sendAdmission = controlGate?.sendAdmission(additionalAdmission: connectionAdmission) ??
+            connectionAdmission
         try await room.send(
             dataPacket: dataPacket,
             expectedDataChannelSendGeneration: sendGeneration,
-            admission: { callerConnection.isCurrent(in: room) }
+            admission: sendAdmission
         )
     }
 
@@ -780,18 +1053,18 @@ actor RpcServerManager: Loggable {
         )
         let writer = try await room.outgoingStreamManager.streamText(
             options: options,
-            admission: { callerConnection.isCurrent(in: room) }
+            admission: callerConnection.sendAdmission(in: room)
         )
-        try requireCurrent(callerConnection, in: room)
         try await writer.write(payload)
-        try requireCurrent(callerConnection, in: room)
         try await writer.close()
     }
 
     private func publishAck(in room: Room,
                             callerConnection: RpcParticipantConnection,
-                            requestId: String) async throws
+                            requestId: String,
+                            controlGate: RpcControlPublicationGate? = nil) async throws
     {
+        guard controlGate?.isAdmitted != false else { throw LiveKitError(.cancelled) }
         try requireCurrent(callerConnection, in: room)
         let dataPacket = Livekit_DataPacket.with {
             $0.destinationIdentities = [callerConnection.identity.stringValue]
@@ -802,10 +1075,13 @@ actor RpcServerManager: Loggable {
         }
 
         let sendGeneration = room.publisherDataChannel.sendGeneration
+        let connectionAdmission = callerConnection.sendAdmission(in: room)
+        let sendAdmission = controlGate?.sendAdmission(additionalAdmission: connectionAdmission) ??
+            connectionAdmission
         try await room.send(
             dataPacket: dataPacket,
             expectedDataChannelSendGeneration: sendGeneration,
-            admission: { callerConnection.isCurrent(in: room) }
+            admission: sendAdmission
         )
     }
 

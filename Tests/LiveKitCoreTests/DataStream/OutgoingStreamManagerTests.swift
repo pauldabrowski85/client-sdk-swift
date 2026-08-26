@@ -388,6 +388,236 @@ struct OutgoingStreamManagerTests {
         #expect(packetOrder.copy() == ["header", "chunk", "trailer"])
         #expect(await manager.openStreamCount == 0)
     }
+
+    @Test func cancellingQueuedWriteTerminalizesItsExactDescriptor() async throws {
+        let firstChunkEntered = OutgoingTestGate()
+        let releaseFirstChunk = OutgoingTestGate()
+        let packetOrder = StateSync<[String]>([])
+        let manager = OutgoingStreamManager { packet, _, _ in
+            switch packet.value {
+            case .streamHeader:
+                packetOrder.mutate { $0.append("header") }
+            case .streamChunk:
+                packetOrder.mutate { $0.append("chunk") }
+                if packetOrder.copy().count == 2 {
+                    await firstChunkEntered.open()
+                    await releaseFirstChunk.wait()
+                }
+            default:
+                break
+            }
+        } sendGenerationProvider: {
+            0
+        } encryptionProvider: {
+            .none
+        }
+        let streamID = "cancel-queued-write"
+        let writer = try await manager.streamText(
+            options: StreamTextOptions(topic: "cancel-queued-write", id: streamID)
+        )
+        let writeOperationCount = StateSync(0)
+        await manager.setOperationObserver { operation in
+            guard operation == .write else { return }
+            writeOperationCount.mutate { $0 += 1 }
+        }
+
+        let firstWrite = Task { try await writer.write("first") }
+        await firstChunkEntered.wait()
+        let cancelledWrite = Task { try await writer.write("cancelled") }
+        let queuedDeadline = Date().addingTimeInterval(5)
+        while writeOperationCount.copy() < 2, Date() < queuedDeadline {
+            await Task.yield()
+        }
+        #expect(writeOperationCount.copy() == 2)
+        cancelledWrite.cancel()
+
+        await waitForDescriptorCleanup(in: manager)
+        #expect(await manager.openStreamCount == 0)
+        let replacementWriter = try await manager.streamText(
+            options: StreamTextOptions(topic: "cancel-queued-write", id: streamID)
+        )
+        #expect(await replacementWriter.isOpen)
+        #expect(await manager.openStreamCount == 1)
+        await releaseFirstChunk.open()
+        await #expect(throws: CancellationError.self) {
+            try await cancelledWrite.value
+        }
+
+        _ = await firstWrite.result
+        #expect(await replacementWriter.isOpen)
+        #expect(packetOrder.copy() == ["header", "chunk", "header"])
+        try await replacementWriter.close()
+        #expect(await manager.openStreamCount == 0)
+    }
+
+    @Test func cancellingQueuedCloseTerminalizesItsExactDescriptor() async throws {
+        let firstChunkEntered = OutgoingTestGate()
+        let releaseFirstChunk = OutgoingTestGate()
+        let packetOrder = StateSync<[String]>([])
+        let manager = OutgoingStreamManager { packet, _, _ in
+            switch packet.value {
+            case .streamHeader:
+                packetOrder.mutate { $0.append("header") }
+            case .streamChunk:
+                packetOrder.mutate { $0.append("chunk") }
+                await firstChunkEntered.open()
+                await releaseFirstChunk.wait()
+            case .streamTrailer:
+                packetOrder.mutate { $0.append("trailer") }
+            default:
+                break
+            }
+        } sendGenerationProvider: {
+            0
+        } encryptionProvider: {
+            .none
+        }
+        let streamID = "cancel-queued-close"
+        let writer = try await manager.streamText(
+            options: StreamTextOptions(topic: "cancel-queued-close", id: streamID)
+        )
+        let closeQueued = StateSync(false)
+        await manager.setOperationObserver { operation in
+            if operation == .close { closeQueued.mutate { $0 = true } }
+        }
+
+        let writeTask = Task { try await writer.write("payload") }
+        await firstChunkEntered.wait()
+        let closeTask = Task { try await writer.close() }
+        let queuedDeadline = Date().addingTimeInterval(5)
+        while !closeQueued.copy(), Date() < queuedDeadline {
+            await Task.yield()
+        }
+        #expect(closeQueued.copy())
+        closeTask.cancel()
+
+        await waitForDescriptorCleanup(in: manager)
+        #expect(await manager.openStreamCount == 0)
+        let replacementWriter = try await manager.streamText(
+            options: StreamTextOptions(topic: "cancel-queued-close", id: streamID)
+        )
+        #expect(await replacementWriter.isOpen)
+        #expect(await manager.openStreamCount == 1)
+        await releaseFirstChunk.open()
+        await #expect(throws: CancellationError.self) {
+            try await closeTask.value
+        }
+        _ = await writeTask.result
+
+        #expect(await replacementWriter.isOpen)
+        #expect(packetOrder.copy() == ["header", "chunk", "header"])
+        try await replacementWriter.close()
+        #expect(await manager.openStreamCount == 0)
+    }
+
+    @Test func cancellingV2HeaderTerminalizesItsExactDescriptor() async throws {
+        let headerEntered = OutgoingTestGate()
+        let releaseHeader = OutgoingTestGate()
+        let packetOrder = StateSync<[String]>([])
+        let manager = OutgoingStreamManager { packet, _, _ in
+            guard case .streamHeader = packet.value else { return }
+            packetOrder.mutate { $0.append("header") }
+            await headerEntered.open()
+            await releaseHeader.wait()
+        } sendGenerationProvider: {
+            0
+        } encryptionProvider: {
+            .none
+        }
+
+        let openTask = Task {
+            try await manager.streamText(
+                options: StreamTextOptions(topic: "cancel-v2-header")
+            )
+        }
+        await headerEntered.wait()
+        openTask.cancel()
+
+        await waitForDescriptorCleanup(in: manager)
+        #expect(packetOrder.copy() == ["header"])
+        #expect(await manager.openStreamCount == 0)
+        await releaseHeader.open()
+        _ = await openTask.result
+    }
+
+    @Test(arguments: [0, 1, 2, 3])
+    func cancellingEveryV2PayloadChunkTerminalizesItsExactDescriptor(
+        blockedChunkIndex: Int
+    ) async throws {
+        let chunkEntered = OutgoingTestGate()
+        let releaseChunk = OutgoingTestGate()
+        let observedChunkIndices = StateSync<[UInt64]>([])
+        let manager = OutgoingStreamManager { packet, _, _ in
+            guard case let .streamChunk(chunk) = packet.value else { return }
+            observedChunkIndices.mutate { $0.append(chunk.chunkIndex) }
+            guard chunk.chunkIndex == UInt64(blockedChunkIndex) else { return }
+            await chunkEntered.open()
+            await releaseChunk.wait()
+        } sendGenerationProvider: {
+            0
+        } encryptionProvider: {
+            .none
+        }
+        let writer = try await manager.streamText(
+            options: StreamTextOptions(topic: "cancel-v2-chunk-\(blockedChunkIndex)")
+        )
+        let payload = String(repeating: "x", count: 4 * 15 * 1024)
+
+        let writeTask = Task { try await writer.write(payload) }
+        await chunkEntered.wait()
+        writeTask.cancel()
+
+        await waitForDescriptorCleanup(in: manager)
+        #expect(observedChunkIndices.copy() == (0 ... UInt64(blockedChunkIndex)).map { $0 })
+        #expect(await manager.openStreamCount == 0)
+        await releaseChunk.open()
+        _ = await writeTask.result
+    }
+
+    @Test func cancellingV2TrailerTerminalizesItsExactDescriptor() async throws {
+        let trailerEntered = OutgoingTestGate()
+        let releaseTrailer = OutgoingTestGate()
+        let packetOrder = StateSync<[String]>([])
+        let manager = OutgoingStreamManager { packet, _, _ in
+            switch packet.value {
+            case .streamHeader:
+                packetOrder.mutate { $0.append("header") }
+            case .streamChunk:
+                packetOrder.mutate { $0.append("chunk") }
+            case .streamTrailer:
+                packetOrder.mutate { $0.append("trailer") }
+                await trailerEntered.open()
+                await releaseTrailer.wait()
+            default:
+                break
+            }
+        } sendGenerationProvider: {
+            0
+        } encryptionProvider: {
+            .none
+        }
+        let writer = try await manager.streamText(
+            options: StreamTextOptions(topic: "cancel-v2-trailer")
+        )
+        try await writer.write("payload")
+
+        let closeTask = Task { try await writer.close() }
+        await trailerEntered.wait()
+        closeTask.cancel()
+
+        await waitForDescriptorCleanup(in: manager)
+        #expect(packetOrder.copy() == ["header", "chunk", "trailer"])
+        #expect(await manager.openStreamCount == 0)
+        await releaseTrailer.open()
+        _ = await closeTask.result
+    }
+
+    private func waitForDescriptorCleanup(in manager: OutgoingStreamManager) async {
+        let deadline = Date().addingTimeInterval(5)
+        while await manager.openStreamCount != 0, Date() < deadline {
+            await Task.yield()
+        }
+    }
 }
 
 private actor OutgoingTestGate {

@@ -277,8 +277,12 @@ extension Room: SignalClientDelegate {
     func signalClient(_: SignalClient, didUpdateParticipants participants: [Livekit_ParticipantInfo]) async {
         log("participants: \(participants)")
 
-        let receiveGeneration = dataPacketReceiveGeneration
-        var disconnectedParticipants = [(RemoteParticipant, Participant.Identity, Participant.Sid)]()
+        var disconnectedParticipants = [(
+            RemoteParticipant,
+            Participant.Identity,
+            Participant.Sid,
+            UInt64
+        )]()
         var newParticipants = [RemoteParticipant]()
 
         _state.mutate {
@@ -286,7 +290,13 @@ extension Room: SignalClientDelegate {
                 let identity = Participant.Identity(from: info.identity)
                 let sid = Participant.Sid(from: info.sid)
                 if let participant = $0.remoteParticipants[identity], participant.sid == sid {
-                    disconnectedParticipants.append((participant, identity, sid))
+                    disconnectedParticipants.append((
+                        participant,
+                        identity,
+                        sid,
+                        participant.dataPacketReceiveGeneration
+                    ))
+                    $0.remoteParticipants[identity] = nil
                 }
             }
 
@@ -314,8 +324,15 @@ extension Room: SignalClientDelegate {
             }
         }
 
+        for (participant, _, _, _) in disconnectedParticipants {
+            participant.invalidateAllSubscriptionAdmissionsForOwnershipLoss()
+        }
+        if !disconnectedParticipants.isEmpty {
+            await runAfterParticipantRetirementForTests()
+        }
+
         await withTaskGroup { group in
-            for (participant, identity, sid) in disconnectedParticipants {
+            for (participant, identity, sid, receiveGeneration) in disconnectedParticipants {
                 group.addTask {
                     do {
                         try await self._onParticipantDidDisconnect(

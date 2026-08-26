@@ -59,10 +59,19 @@ actor IncomingStreamManager: Loggable {
         let onStreamRejected: IncomingStreamRejectionHandler?
     }
 
+    private struct StreamOwner: Equatable {
+        let identity: Participant.Identity
+        let participantSid: Participant.Sid?
+        let dataPacketReceiveGeneration: UInt64
+    }
+
     /// Mapping between stream ID and descriptor for open streams.
     private var openStreams: [String: Descriptor] = [:]
 
     var openStreamCount: Int { openStreams.count }
+    var activeHandlerCount: Int {
+        activeHandlerOwners.values.reduce(into: 0) { $0 += $1.count }
+    }
     var failedTopicDiagnosticCount: Int { failedToOpenStreams.count }
     nonisolated var hasIngressOverflowed: Bool { ingressState.overflowGeneration != nil }
     nonisolated var ingressOverflowTokenForTests: UInt64 { ingressState.overflowToken }
@@ -82,6 +91,10 @@ actor IncomingStreamManager: Loggable {
     /// draining buffered chunks or emitting a finalization). A new stream on the
     /// topic opened after these closed, so its handler must wait for them.
     private var finishingHandlers: [String: [UUID: Task<Void, Never>]] = [:]
+    /// Every dispatched handler remains admitted until it returns, even after its
+    /// descriptor closes. This prevents a fast header/trailer flood from creating
+    /// an unbounded number of detached handler tasks.
+    private var activeHandlerOwners: [String: [UUID: StreamOwner]] = [:]
 
     /// Events are processed in a serial (FIFO) order
     enum StreamEvent {
@@ -385,10 +398,7 @@ actor IncomingStreamManager: Loggable {
             return
         }
 
-        let openStreamCountForTopic = openStreams.values.lazy
-            .filter { $0.info.topic == info.topic }
-            .count
-        guard openStreamCountForTopic < registration.limits.maxConcurrentStreams else {
+        guard inFlightStreamCount(for: info.topic) < registration.limits.maxConcurrentStreams else {
             registration.onStreamRejected?(IncomingStreamRejection(
                 streamID: info.id,
                 topic: info.topic,
@@ -403,15 +413,12 @@ actor IncomingStreamManager: Loggable {
         }
 
         if let maximumForConnection = registration.limits.maxConcurrentStreamsPerParticipantConnection {
-            let openStreamCountForConnection = openStreams.values.lazy
-                .filter {
-                    $0.info.topic == info.topic &&
-                        $0.identity == identity &&
-                        $0.participantSid == participantSid &&
-                        $0.dataPacketReceiveGeneration == dataPacketReceiveGeneration
-                }
-                .count
-            guard openStreamCountForConnection < maximumForConnection else {
+            let owner = StreamOwner(
+                identity: identity,
+                participantSid: participantSid,
+                dataPacketReceiveGeneration: dataPacketReceiveGeneration
+            )
+            guard inFlightStreamCount(for: info.topic, ownedBy: owner) < maximumForConnection else {
                 registration.onStreamRejected?(IncomingStreamRejection(
                     streamID: info.id,
                     topic: info.topic,
@@ -455,6 +462,12 @@ actor IncomingStreamManager: Loggable {
             await self?.cancelStream(with: info.id, generation: generation)
         }
 
+        activeHandlerOwners[info.topic, default: [:]][descriptor.generation] = StreamOwner(
+            identity: identity,
+            participantSid: participantSid,
+            dataPacketReceiveGeneration: dataPacketReceiveGeneration
+        )
+
         // Detached: handler lifetime is not tied to the descriptor — abnormal stream
         // conditions are signalled through `source` throwing instead.
         if orderedTopics.contains(info.topic) {
@@ -478,8 +491,15 @@ actor IncomingStreamManager: Loggable {
             }
             runningHandlers[topic, default: [:]][generation] = task
         } else {
-            Task.detachedDiscarding {
-                try await registration.handler(source, identity, cancelSource)
+            let topic = info.topic
+            let generation = descriptor.generation
+            Task.detached { [weak self] in
+                do {
+                    try await registration.handler(source, identity, cancelSource)
+                } catch {
+                    self?.log("Text stream handler for topic '\(topic)' threw: \(error)", .warning)
+                }
+                await self?.handlerCompleted(topic: topic, generation: generation)
             }
         }
     }
@@ -496,6 +516,29 @@ actor IncomingStreamManager: Loggable {
     private func handlerCompleted(topic: String, generation: UUID) {
         runningHandlers[topic]?[generation] = nil
         finishingHandlers[topic]?[generation] = nil
+        activeHandlerOwners[topic]?[generation] = nil
+    }
+
+    /// Counts the union of open descriptors and handlers that have not returned.
+    /// A stream remains in flight until both resources are gone.
+    private func inFlightStreamCount(
+        for topic: String,
+        ownedBy expectedOwner: StreamOwner? = nil
+    ) -> Int {
+        let handlers = activeHandlerOwners[topic] ?? [:]
+        var count = handlers.values.lazy.filter { owner in
+            expectedOwner == nil || owner == expectedOwner
+        }.count
+        count += openStreams.values.lazy.filter { descriptor in
+            guard descriptor.info.topic == topic,
+                  handlers[descriptor.generation] == nil
+            else { return false }
+            guard let expectedOwner else { return true }
+            return descriptor.identity == expectedOwner.identity &&
+                descriptor.participantSid == expectedOwner.participantSid &&
+                descriptor.dataPacketReceiveGeneration == expectedOwner.dataPacketReceiveGeneration
+        }.count
+        return count
     }
 
     /// Close the stream with the given id, unless it has been superseded by a

@@ -333,6 +333,26 @@ struct DropOldestContinuationTests {
             try await queued.value
         } throws: { ($0 as? LiveKitError)?.type == .invalidState }
     }
+
+    @Test func cancellationWithdrawsTheExactQueuedSubmission() async throws {
+        channel.isOpen = false
+        let cancelled = sendAsync(1)
+        try await drain.flushEvents()
+
+        cancelled.cancel()
+        await #expect {
+            try await cancelled.value
+        } throws: { ($0 as? LiveKitError)?.type == .cancelled }
+        try await drain.flushEvents()
+
+        channel.isOpen = true
+        drain.reportDrained(0)
+        try await drain.flushEvents()
+        #expect(channel.sent.isEmpty)
+
+        drain.submit(DrainFixture.frame(2))
+        try await poll(for: "the uncancelled submission to send") { channel.tags == [2] }
+    }
 }
 
 // MARK: - Buffer status

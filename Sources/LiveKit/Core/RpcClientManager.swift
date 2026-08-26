@@ -16,6 +16,24 @@
 
 import Foundation
 
+private struct RpcResponseDeadlineExceeded: Error {}
+
+private struct RpcClientClock: Sendable {
+    let nowNanoseconds: @Sendable () -> UInt64
+    let sleepUntil: @Sendable (UInt64) async throws -> Void
+
+    static let live = RpcClientClock(
+        nowNanoseconds: RpcContinuousClock.nowNanoseconds,
+        sleepUntil: { deadline in
+            while true {
+                let now = RpcContinuousClock.nowNanoseconds()
+                guard deadline > now else { return }
+                try await Task.sleep(nanoseconds: deadline - now)
+            }
+        }
+    )
+}
+
 /// Caller-side RPC.
 ///
 /// Owns the in-flight bookkeeping (pending acks and pending responses) and the wire-level
@@ -27,7 +45,7 @@ actor RpcClientManager: Loggable {
     /// `LocalParticipant.performRpc` overloads can share the same default.
     static let defaultMaxRoundTripLatency: TimeInterval = 7
 
-    /// Default timeout for receiving a response after the initial connection, in seconds.
+    /// Default timeout for the entire request-response operation, in seconds.
     static let defaultResponseTimeout: TimeInterval = 15
 
     private weak var room: Room?
@@ -35,6 +53,9 @@ actor RpcClientManager: Loggable {
     private var pendingAcks: Set<String> = Set()
     private var pendingResponses: [String: PendingRpcResponse] = [:]
     private var ackWatchdogs: [String: AnyTaskCancellable] = [:]
+    private var responseDeadlineWatchdogs: [String: AnyTaskCancellable] = [:]
+    private var clientClock = RpcClientClock.live
+    private(set) var activePublicationTaskCount = 0
 
     /// Hook fired once after the RPC request has been published but before the caller
     /// starts waiting on the completer. Receives the freshly-generated `requestId` so
@@ -48,6 +69,13 @@ actor RpcClientManager: Loggable {
 
     func setAfterPublish(_ hook: (@Sendable (String) async -> Void)?) {
         afterPublish = hook
+    }
+
+    func setClientClock(
+        nowNanoseconds: @escaping @Sendable () -> UInt64,
+        sleepUntil: @escaping @Sendable (UInt64) async throws -> Void
+    ) {
+        clientClock = RpcClientClock(nowNanoseconds: nowNanoseconds, sleepUntil: sleepUntil)
     }
 
     // MARK: - Public entry point
@@ -77,19 +105,45 @@ actor RpcClientManager: Loggable {
             throw LiveKitError(.invalidParameter, message: "RPC response timeout exceeds the wire protocol limit")
         }
         let responseTimeoutMilliseconds = UInt32(responseTimeoutMillisecondsDouble)
+        let clientClock = clientClock
+        let responseStartedAtContinuousTimeNanoseconds = clientClock.nowNanoseconds()
+        let responseTimeoutNanoseconds = UInt64((responseTimeout * 1_000_000_000).rounded(.up))
+        let responseDeadlineAddition = responseStartedAtContinuousTimeNanoseconds
+            .addingReportingOverflow(responseTimeoutNanoseconds)
+        guard !responseDeadlineAddition.overflow else {
+            throw LiveKitError(.invalidParameter, message: "RPC response timeout exceeds the local clock limit")
+        }
+        let responseDeadlineContinuousTimeNanoseconds = responseDeadlineAddition.partialValue
 
-        let room = try requireRoom()
+        let room: Room
+        do {
+            room = try requireRoom()
+        } catch {
+            throw normalizedTerminalError(
+                error,
+                responseDeadlineContinuousTimeNanoseconds: responseDeadlineContinuousTimeNanoseconds
+            )
+        }
         guard let destinationConnection = RpcParticipantConnection.resolveCurrent(
             in: room,
             identity: destinationIdentity
         ) else {
-            throw RpcError.builtIn(.recipientDisconnected)
+            throw normalizedTerminalError(
+                RpcError.builtIn(.recipientDisconnected),
+                responseDeadlineContinuousTimeNanoseconds: responseDeadlineContinuousTimeNanoseconds
+            )
         }
 
         let remoteClientProtocol = destinationConnection.participant.clientProtocol
         let useStreamTransport = remoteClientProtocol >= .v1 && Self.serverSupportsRpcV2(room.serverVersion)
 
         let requestId = UUID().uuidString
+        let publicationGate = RpcPublicationGate(
+            responseDeadlineContinuousTimeNanoseconds: responseDeadlineContinuousTimeNanoseconds,
+            nowNanoseconds: clientClock.nowNanoseconds,
+            additionalAdmission: destinationConnection.sendAdmission(in: room)
+        )
+        let publicationController = RpcPublicationController(timeout: responseTimeout)
         // Pre-register pending state synchronously on the actor *before* publishing the
         // request. Prevents a race where a fast remote can ack/respond before registration
         // completes — the response would otherwise log "received for unexpected request" and
@@ -99,29 +153,72 @@ actor RpcClientManager: Loggable {
         pendingResponses[requestId] = PendingRpcResponse(
             participantConnection: destinationConnection,
             completer: completer,
+            responseDeadlineContinuousTimeNanoseconds: responseDeadlineContinuousTimeNanoseconds,
+            publicationGate: publicationGate,
+            publicationController: publicationController,
+            responseStreamReader: nil
         )
+        responseDeadlineWatchdogs[requestId] = Task { [weak self] in
+            do {
+                try await clientClock.sleepUntil(responseDeadlineContinuousTimeNanoseconds)
+            } catch {
+                return
+            }
+            await self?.fireResponseDeadlineIfPending(requestId: requestId)
+        }.cancellable()
+
+        activePublicationTaskCount += 1
+        let publicationTask = Task { [self, weak publicationController] in
+            defer { publicationTaskDidFinish() }
+            do {
+                try requireCurrent(destinationConnection, in: room)
+                if useStreamTransport {
+                    try await publishRequestStream(in: room,
+                                                   destinationConnection: destinationConnection,
+                                                   requestId: requestId,
+                                                   method: method,
+                                                   payload: payload,
+                                                   responseTimeoutMilliseconds: responseTimeoutMilliseconds,
+                                                   publicationGate: publicationGate,
+                                                   onReservation: { [weak publicationController] cancellation in
+                                                       publicationController?.register(
+                                                           streamCancellation: cancellation
+                                                       ) ?? false
+                                                   })
+                } else {
+                    try await publishRequest(in: room,
+                                             destinationConnection: destinationConnection,
+                                             requestId: requestId,
+                                             method: method,
+                                             payload: payload,
+                                             responseTimeoutMilliseconds: responseTimeoutMilliseconds,
+                                             publicationGate: publicationGate)
+                }
+                publicationController?.publicationSucceeded()
+            } catch {
+                publicationController?.publicationFailed(error)
+            }
+        }
+        publicationController.install(task: publicationTask)
 
         do {
-            try requireCurrent(destinationConnection, in: room)
-            if useStreamTransport {
-                try await publishRequestStream(in: room,
-                                               destinationConnection: destinationConnection,
-                                               requestId: requestId,
-                                               method: method,
-                                               payload: payload,
-                                               responseTimeoutMilliseconds: responseTimeoutMilliseconds)
-            } else {
-                try await publishRequest(in: room,
-                                         destinationConnection: destinationConnection,
-                                         requestId: requestId,
-                                         method: method,
-                                         payload: payload,
-                                         responseTimeoutMilliseconds: responseTimeoutMilliseconds)
-            }
+            try await publicationController.wait(timeout: responseTimeout)
         } catch {
-            // Publish failed — clean up the registered state before re-throwing.
-            removeAllPending(requestId)
-            throw error
+            if pendingResponses[requestId] == nil {
+                return try await completer.wait(timeout: 0)
+            }
+            let terminalError = normalizedTerminalError(
+                error,
+                responseDeadlineContinuousTimeNanoseconds: responseDeadlineContinuousTimeNanoseconds
+            )
+            if let pending = removeAllPending(requestId) {
+                await pending.publicationController.cancelAndWaitForStreamCleanup()
+            }
+            throw terminalError
+        }
+
+        if pendingResponses[requestId] == nil {
+            return try await completer.wait(timeout: 0)
         }
 
         if let hook = afterPublish {
@@ -139,17 +236,24 @@ actor RpcClientManager: Loggable {
 
         defer { removeAllPending(requestId) }
         do {
-            return try await completer.wait()
+            let now = clientClock.nowNanoseconds()
+            let remaining = responseDeadlineContinuousTimeNanoseconds > now
+                ? TimeInterval(responseDeadlineContinuousTimeNanoseconds - now) / 1_000_000_000
+                : 0
+            return try await completer.wait(timeout: remaining)
         } catch {
             // AsyncCompleter signals its own `defaultTimeout` expiry with `LiveKitError(.timedOut)`.
-            // That path means "we got the ack (or the ack-watchdog hasn't fired yet) but the
-            // user-supplied `responseTimeout` elapsed without a response" → `responseTimeout`
-            // (1502). The ack-watchdog path resolves the completer directly with
+            // That path means the caller's original `responseTimeout` deadline elapsed
+            // without a response → `responseTimeout` (1502). The ack-watchdog path
+            // resolves the completer directly with
             // `connectionTimeout` (1501) and falls through the `throw error` branch.
             if let error = error as? LiveKitError, error.type == .timedOut {
                 throw RpcError.builtIn(.responseTimeout)
             }
-            throw error
+            throw normalizedTerminalError(
+                error,
+                responseDeadlineContinuousTimeNanoseconds: responseDeadlineContinuousTimeNanoseconds
+            )
         }
     }
 
@@ -167,11 +271,23 @@ actor RpcClientManager: Loggable {
     /// Watchdog terminal action: if `requestId` is still awaiting an ack, clear pending
     /// state and resolve its completer with `connectionTimeout`. Actor isolation and removing
     /// `pendingResponses[requestId]` before resolution give exactly one terminal path ownership.
-    func fireAckTimeoutIfPending(requestId: String) {
+    func fireAckTimeoutIfPending(requestId: String) async {
         guard pendingAcks.contains(requestId) else { return }
-        pendingAcks.remove(requestId)
-        let pending = pendingResponses.removeValue(forKey: requestId)
-        pending?.completer.resume(throwing: RpcError.builtIn(.connectionTimeout))
+        guard let pending = pendingResponses[requestId] else { return }
+        await completePending(
+            requestId: requestId,
+            pending: pending,
+            result: .failure(RpcError.builtIn(.connectionTimeout))
+        )
+    }
+
+    func fireResponseDeadlineIfPending(requestId: String) async {
+        guard let pending = pendingResponses[requestId] else { return }
+        await completePending(
+            requestId: requestId,
+            pending: pending,
+            result: .failure(RpcError.builtIn(.responseTimeout))
+        )
     }
 
     // MARK: - Incoming dispatch
@@ -185,7 +301,7 @@ actor RpcClientManager: Loggable {
                                 error: RpcError?,
                                 senderIdentity: Participant.Identity,
                                 senderParticipantSid: Participant.Sid?,
-                                dataPacketReceiveGeneration: UInt64)
+                                dataPacketReceiveGeneration: UInt64) async
     {
         guard let pending = validatedPending(
             requestId: requestId,
@@ -196,11 +312,10 @@ actor RpcClientManager: Loggable {
             log("[Rpc] Response received for unexpected RPC request, id = \(requestId)", .error)
             return
         }
-        pendingResponses.removeValue(forKey: requestId)
         if let error {
-            pending.completer.resume(throwing: error)
+            await completePending(requestId: requestId, pending: pending, result: .failure(error))
         } else {
-            pending.completer.resume(returning: payload ?? "")
+            await completePending(requestId: requestId, pending: pending, result: .success(payload ?? ""))
         }
     }
 
@@ -211,6 +326,7 @@ actor RpcClientManager: Loggable {
     /// pending entry is left in place so the legitimate sender can still resolve).
     func handleIncomingResponseStream(reader: TextStreamReader, senderIdentity: Participant.Identity) async {
         guard let requestId = reader.info.attributes[RpcStreamAttribute.requestId] else {
+            await reader.cancel()
             log("[Rpc] Incoming v2 RPC response stream is missing request id attribute", .error)
             return
         }
@@ -219,19 +335,30 @@ actor RpcClientManager: Loggable {
         // burning cycles (or worse, hitting `readAll` side effects) on a spoofed
         // payload. After this check passes, both the success and read-failure
         // paths trust the sender and resume the pending call directly.
-        guard validatedPending(
+        guard var pending = validatedPending(
             requestId: requestId,
             senderIdentity: senderIdentity,
             senderParticipantSid: reader.info.publisherParticipantSid,
             dataPacketReceiveGeneration: reader.info.dataPacketReceiveGeneration
-        ) != nil else {
+        ) else {
+            await reader.cancel()
             log("[Rpc] Response stream for \(requestId) has stale or mismatched sender provenance; ignoring", .error)
             return
         }
+        guard pending.responseStreamReader == nil else {
+            await reader.cancel()
+            log("[Rpc] Duplicate response stream received for pending request, id = \(requestId)", .error)
+            return
+        }
+        pending.responseStreamReader = reader
+        pendingResponses[requestId] = pending
 
         let payload: String
         do {
-            payload = try await reader.readAll()
+            payload = try await readResponsePayload(
+                from: reader,
+                responseDeadlineContinuousTimeNanoseconds: pending.responseDeadlineContinuousTimeNanoseconds
+            )
         } catch {
             log("[Rpc] Failed to read v2 RPC response payload for \(requestId): \(error)", .error)
             // Fail the pending call fast instead of letting it hang to responseTimeout.
@@ -241,15 +368,16 @@ actor RpcClientManager: Loggable {
                 senderParticipantSid: reader.info.publisherParticipantSid,
                 dataPacketReceiveGeneration: reader.info.dataPacketReceiveGeneration
             ) {
-                pendingResponses.removeValue(forKey: requestId)
-                let rpcError: RpcError = if case StreamError.streamSizeExceeded = error {
+                let rpcError: RpcError = if error is RpcResponseDeadlineExceeded {
+                    .builtIn(.responseTimeout)
+                } else if case StreamError.streamSizeExceeded = error {
                     .builtIn(.responsePayloadTooLarge)
                 } else {
                     RpcError(code: RpcError.BuiltInError.applicationError.code,
                              message: "Error reading RPC response payload",
                              data: "")
                 }
-                pending.completer.resume(throwing: rpcError)
+                await completePending(requestId: requestId, pending: pending, result: .failure(rpcError))
             }
             return
         }
@@ -263,11 +391,10 @@ actor RpcClientManager: Loggable {
             log("[Rpc] Response stream received for unexpected RPC request, id = \(requestId)", .error)
             return
         }
-        pendingResponses.removeValue(forKey: requestId)
-        pending.completer.resume(returning: payload)
+        await completePending(requestId: requestId, pending: pending, result: .success(payload))
     }
 
-    func handleIncomingResponseStreamRejection(_ rejection: IncomingStreamRejection) {
+    func handleIncomingResponseStreamRejection(_ rejection: IncomingStreamRejection) async {
         guard let requestId = rejection.attributes[RpcStreamAttribute.requestId] else {
             log("[Rpc] Rejected v2 response stream is missing request id", .error)
             return
@@ -279,14 +406,13 @@ actor RpcClientManager: Loggable {
             dataPacketReceiveGeneration: rejection.dataPacketReceiveGeneration
         )
         else { return }
-        pendingResponses.removeValue(forKey: requestId)
         let error: RpcError = switch rejection.error {
         case .streamSizeExceeded, .invalidDeclaredLength:
             .builtIn(.responsePayloadTooLarge)
         default:
             .builtIn(.applicationError)
         }
-        pending.completer.resume(throwing: error)
+        await completePending(requestId: requestId, pending: pending, result: .failure(error))
     }
 
     /// Clear the pending-ack flag for a request when an `RpcAck` arrives.
@@ -314,7 +440,7 @@ actor RpcClientManager: Loggable {
         participantSid: Participant.Sid,
         dataPacketReceiveGeneration: UInt64,
         participant: RemoteParticipant
-    ) {
+    ) async {
         let toReap = pendingResponses.filter {
             let connection = $0.value.participantConnection
             return connection.identity == identity &&
@@ -323,23 +449,26 @@ actor RpcClientManager: Loggable {
                 connection.participant === participant
         }
         for (requestId, pending) in toReap {
-            pendingResponses.removeValue(forKey: requestId)
-            pendingAcks.remove(requestId)
-            ackWatchdogs.removeValue(forKey: requestId)
-            pending.completer.resume(throwing: RpcError.builtIn(.recipientDisconnected))
+            await completePending(
+                requestId: requestId,
+                pending: pending,
+                result: .failure(RpcError.builtIn(.recipientDisconnected))
+            )
         }
     }
 
     /// Reject every in-flight RPC with `recipientDisconnected`. Called from
     /// `Room.cleanUp(...)` during teardown / full reconnect — at that point no
     /// participant survives, so identity-filtering is unnecessary.
-    func handleAllPendingDisconnected() {
-        for (_, pending) in pendingResponses {
-            pending.completer.resume(throwing: RpcError.builtIn(.recipientDisconnected))
+    func handleAllPendingDisconnected() async {
+        let pending = Array(pendingResponses)
+        for (requestId, response) in pending {
+            await completePending(
+                requestId: requestId,
+                pending: response,
+                result: .failure(RpcError.builtIn(.recipientDisconnected))
+            )
         }
-        pendingResponses.removeAll()
-        pendingAcks.removeAll()
-        ackWatchdogs.removeAll()
     }
 
     // MARK: - State ops
@@ -349,10 +478,92 @@ actor RpcClientManager: Loggable {
         pendingResponses.count
     }
 
-    func removeAllPending(_ requestId: String) {
+    @discardableResult
+    func removeAllPending(_ requestId: String) -> PendingRpcResponse? {
         pendingAcks.remove(requestId)
-        pendingResponses.removeValue(forKey: requestId)
         ackWatchdogs.removeValue(forKey: requestId)
+        responseDeadlineWatchdogs.removeValue(forKey: requestId)
+        let pending = pendingResponses.removeValue(forKey: requestId)
+        if let pending {
+            pending.publicationGate.revoke()
+            cancelResponseStream(for: pending)
+        }
+        return pending
+    }
+
+    private func completePending(
+        requestId: String,
+        pending: PendingRpcResponse,
+        result: Result<String, Error>
+    ) async {
+        guard pendingResponses[requestId]?.completer === pending.completer else { return }
+        let terminalResult: Result<String, Error>
+        if clientClock.nowNanoseconds() >= pending.responseDeadlineContinuousTimeNanoseconds {
+            terminalResult = .failure(RpcError.builtIn(.responseTimeout))
+        } else {
+            terminalResult = result
+        }
+        _ = removeAllPending(requestId)
+        pending.completer.resume(with: terminalResult)
+        await pending.publicationController.cancelAndWaitForStreamCleanup()
+    }
+
+    private func normalizedTerminalError(
+        _ error: Error,
+        responseDeadlineContinuousTimeNanoseconds: UInt64?
+    ) -> Error {
+        if error is RpcResponseDeadlineExceeded {
+            return RpcError.builtIn(.responseTimeout)
+        }
+        guard let responseDeadlineContinuousTimeNanoseconds,
+              clientClock.nowNanoseconds() >= responseDeadlineContinuousTimeNanoseconds
+        else { return error }
+        return RpcError.builtIn(.responseTimeout)
+    }
+
+    private func cancelResponseStream(for pending: PendingRpcResponse) {
+        guard let reader = pending.responseStreamReader else { return }
+        Task { await reader.cancel() }
+    }
+
+    private func readResponsePayload(
+        from reader: TextStreamReader,
+        responseDeadlineContinuousTimeNanoseconds: UInt64
+    ) async throws -> String {
+        let clientClock = clientClock
+        let now = clientClock.nowNanoseconds()
+        guard responseDeadlineContinuousTimeNanoseconds > now else {
+            await reader.cancel()
+            throw RpcResponseDeadlineExceeded()
+        }
+        let payload = try await withThrowingTaskGroup(of: String.self) { group in
+            group.addTask { try await reader.readAll() }
+            group.addTask {
+                while true {
+                    let now = clientClock.nowNanoseconds()
+                    guard responseDeadlineContinuousTimeNanoseconds > now else {
+                        throw RpcResponseDeadlineExceeded()
+                    }
+                    try await clientClock.sleepUntil(responseDeadlineContinuousTimeNanoseconds)
+                }
+            }
+            do {
+                guard let first = try await group.next() else {
+                    throw RpcResponseDeadlineExceeded()
+                }
+                group.cancelAll()
+                return first
+            } catch {
+                group.cancelAll()
+                await reader.cancel()
+                throw error
+            }
+        }
+        guard clientClock.nowNanoseconds() < responseDeadlineContinuousTimeNanoseconds else {
+            await reader.cancel()
+            throw RpcResponseDeadlineExceeded()
+        }
+        return payload
     }
 
     // MARK: - Outgoing wire
@@ -392,7 +603,8 @@ actor RpcClientManager: Loggable {
                                 requestId: String,
                                 method: String,
                                 payload: String,
-                                responseTimeoutMilliseconds: UInt32) async throws
+                                responseTimeoutMilliseconds: UInt32,
+                                publicationGate: RpcPublicationGate) async throws
     {
         try requireCurrent(destinationConnection, in: room)
         guard payload.byteLength <= MAX_RPC_PAYLOAD_BYTES else {
@@ -416,7 +628,7 @@ actor RpcClientManager: Loggable {
         try await room.send(
             dataPacket: dataPacket,
             expectedDataChannelSendGeneration: sendGeneration,
-            admission: { destinationConnection.isCurrent(in: room) }
+            admission: publicationGate.sendAdmission
         )
     }
 
@@ -426,7 +638,11 @@ actor RpcClientManager: Loggable {
                                       requestId: String,
                                       method: String,
                                       payload: String,
-                                      responseTimeoutMilliseconds: UInt32) async throws
+                                      responseTimeoutMilliseconds: UInt32,
+                                      publicationGate: RpcPublicationGate,
+                                      onReservation: @escaping @Sendable (
+                                          OutgoingStreamCancellation
+                                      ) -> Bool) async throws
     {
         try requireCurrent(destinationConnection, in: room)
         guard payload.byteLength <= RpcStreamLimits.maximumPayloadBytes else {
@@ -445,15 +661,18 @@ actor RpcClientManager: Loggable {
         try requireCurrent(destinationConnection, in: room)
         let writer = try await room.outgoingStreamManager.streamText(
             options: options,
-            admission: { destinationConnection.isCurrent(in: room) }
+            admission: publicationGate.sendAdmission,
+            onReservation: onReservation
         )
-        try requireCurrent(destinationConnection, in: room)
         try await writer.write(payload)
-        try requireCurrent(destinationConnection, in: room)
         try await writer.close()
     }
 
     // MARK: - Helpers
+
+    private func publicationTaskDidFinish() {
+        activePublicationTaskCount -= 1
+    }
 
     private func requireRoom() throws -> Room {
         guard let room else { throw LiveKitError(.invalidState, message: "Room is nil") }
