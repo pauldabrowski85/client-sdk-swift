@@ -209,6 +209,17 @@ public class Track: NSObject, @unchecked Sendable, Loggable {
         _statisticsTimer.cancel()
     }
 
+    /// Severs a remote track's transport ownership without suspension. This is
+    /// used at subscription-revocation boundaries where an async `set` could
+    /// otherwise leave a displaced track reachable by the retired transport.
+    func detachRemoteTransportSynchronously() {
+        _state.mutate {
+            $0.transport = nil
+            $0.rtpReceiver = nil
+        }
+        _statisticsTimer.cancel()
+    }
+
     func set(trackState: TrackState) {
         _state.mutate { $0.trackState = trackState }
     }
@@ -229,6 +240,29 @@ public class Track: NSObject, @unchecked Sendable, Loggable {
             try await startCapture()
             if self is RemoteTrack { try await enable() }
             _state.mutate { $0.trackState = .started }
+        }
+    }
+
+    /// Starts a remote track only if its owning publication can atomically
+    /// authorize the final media enablement. Remote tracks have no capture
+    /// startup work; the publication performs the admission check, enables the
+    /// exact RTC track, and commits `.started` in one synchronous critical
+    /// section with its ownership state.
+    func startRemote(
+        activating: @escaping @Sendable (Track) -> Bool
+    ) async throws {
+        guard self is RemoteTrack else {
+            throw LiveKitError(.invalidState, message: "Protected activation is only valid for remote tracks")
+        }
+        try await _startStopSerialRunner.run { [weak self] in
+            guard let self else { return }
+            guard _state.trackState != .started else {
+                log("Already started", .warning)
+                return
+            }
+            guard activating(self) else {
+                throw LiveKitError(.invalidState, message: "Remote-track subscription admission was revoked")
+            }
         }
     }
 

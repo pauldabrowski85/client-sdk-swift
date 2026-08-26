@@ -284,7 +284,7 @@ open class Session: ObservableObject {
                 connectionState = .connecting
                 agent.connecting(buffering: false)
                 dispatchesAgent = try await connect()
-                try await room.localParticipant.setMicrophone(enabled: true)
+                try await enableMicrophoneAfterConnectIfConfigured()
             }
 
             if dispatchesAgent {
@@ -307,6 +307,11 @@ open class Session: ObservableObject {
     /// Terminates the session.
     public func end() async {
         await room.disconnect()
+    }
+
+    func enableMicrophoneAfterConnectIfConfigured() async throws {
+        guard options.enableMicrophoneOnConnect else { return }
+        try await room.localParticipant.setMicrophone(enabled: true)
     }
 
     /// Resets the last error.

@@ -678,6 +678,51 @@ extension SignalClient {
         try await _sendRequest(r)
     }
 
+    /// Sends a protected subscription mutation directly on the exact current
+    /// signaling connection. Unlike the compatibility request queue, this path
+    /// never carries an authorization-sensitive mutation across reconnect and
+    /// propagates physical WebSocket send failures to the caller.
+    func sendProtectedUpdateSubscription(
+        participantSid: Participant.Sid,
+        trackSid: Track.Sid,
+        isSubscribed: Bool,
+        admission: @escaping @Sendable () -> Bool
+    ) async throws {
+        guard connectionState == .connected, admission() else {
+            throw LiveKitError(.invalidState, message: "Protected subscription admission is no longer current")
+        }
+
+        let participantTracks = Livekit_ParticipantTracks.with {
+            $0.participantSid = participantSid.stringValue
+            $0.trackSids = [trackSid.stringValue]
+        }
+        let request = Livekit_SignalRequest.with {
+            $0.subscription = Livekit_UpdateSubscription.with {
+                $0.trackSids = [trackSid.stringValue]
+                $0.participantTracks = [participantTracks]
+                $0.subscribe = isSubscribed
+            }
+        }
+        let data = try request.serializedData()
+        let webSocket = try await requireWebSocket()
+
+        guard connectionState == .connected,
+              _state.socket === webSocket,
+              admission()
+        else {
+            throw LiveKitError(.invalidState, message: "Protected subscription signaling connection changed")
+        }
+
+        try await webSocket.send(data: data)
+
+        guard connectionState == .connected,
+              _state.socket === webSocket,
+              admission()
+        else {
+            throw LiveKitError(.invalidState, message: "Protected subscription was revoked during signaling")
+        }
+    }
+
     func sendUpdateSubscriptionPermission(allParticipants: Bool,
                                           trackPermissions: [ParticipantTrackPermission]) async throws
     {

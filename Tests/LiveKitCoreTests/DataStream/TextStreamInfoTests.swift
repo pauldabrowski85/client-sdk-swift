@@ -51,7 +51,14 @@ struct TextStreamInfoTests {
         #expect(header.textHeader.generated == info.generated)
 
         let publisherParticipantSid = Participant.Sid(from: "PA_publisher")
-        let newInfo = TextStreamInfo(header, header.textHeader, publisherParticipantSid, .gcm)
+        let dataPacketReceiveGeneration: UInt64 = 42
+        let newInfo = TextStreamInfo(
+            header,
+            header.textHeader,
+            publisherParticipantSid,
+            dataPacketReceiveGeneration,
+            .gcm
+        )
         #expect(newInfo.id == info.id)
         #expect(newInfo.topic == info.topic)
         #expect(newInfo.timestamp == info.timestamp)
@@ -64,5 +71,6 @@ struct TextStreamInfoTests {
         #expect(newInfo.attachedStreamIDs == info.attachedStreamIDs)
         #expect(newInfo.generated == info.generated)
         #expect(newInfo.publisherParticipantSid == publisherParticipantSid)
+        #expect(newInfo.dataPacketReceiveGeneration == dataPacketReceiveGeneration)
     }
 }

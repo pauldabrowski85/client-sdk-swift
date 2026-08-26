@@ -30,6 +30,7 @@ actor Transport: NSObject, Loggable {
     nonisolated let target: Livekit_SignalTarget
     nonisolated let isPrimary: Bool
     nonisolated let singlePCMode: Bool
+    nonisolated var dataPacketReceiveGeneration: UInt64 { _dataPacketReceiveGeneration.copy() }
 
     var connectionState: LKRTCPeerConnectionState {
         _pc.connectionState
@@ -54,6 +55,7 @@ actor Transport: NSObject, Loggable {
     // MARK: - Private
 
     private let _delegate = MulticastDelegate<TransportDelegate>(label: "TransportDelegate")
+    private nonisolated let _dataPacketReceiveGeneration: StateSync<UInt64>
     private let _debounce = Debounce(delay: 0.02) // 20ms
 
     private var _reNegotiate: Bool = false
@@ -83,6 +85,7 @@ actor Transport: NSObject, Loggable {
          target: Livekit_SignalTarget,
          primary: Bool,
          singlePCMode: Bool = false,
+         dataPacketReceiveGeneration: UInt64 = 0,
          delegate: TransportDelegate) throws
     {
         // try create peerConnection
@@ -94,6 +97,7 @@ actor Transport: NSObject, Loggable {
         self.target = target
         isPrimary = primary
         self.singlePCMode = singlePCMode
+        _dataPacketReceiveGeneration = StateSync(dataPacketReceiveGeneration)
         _pc = pc
 
         super.init()
@@ -101,6 +105,13 @@ actor Transport: NSObject, Loggable {
 
         _pc.delegate = self
         _delegate.add(delegate: delegate)
+    }
+
+    nonisolated func advanceDataPacketReceiveGeneration(to generation: UInt64) {
+        _dataPacketReceiveGeneration.mutate { current in
+            guard generation >= current else { return }
+            current = generation
+        }
     }
 
     func negotiate(force: Bool = false) async throws {

@@ -33,6 +33,8 @@ struct RpcClientTests {
 
     @Test func performRpc() async throws {
         try await TestEnvironment.withRoom { room in
+            let destination = Participant.Identity(from: "test-destination")
+            try await RpcTestSupport.installRemote(in: room, identity: destination, clientProtocol: .v0)
             // Assert the wire format from the mock, but inject the ack/response from
             // the `afterPublish` hook, which `performRpc` awaits — an unstructured
             // `Task` here would race the response timeout.
@@ -43,16 +45,18 @@ struct RpcClientTests {
             }
 
             await room.rpcClient.setAfterPublish { requestId in
-                await room.rpcClient.handleIncomingAck(requestId: requestId)
-                await room.rpcClient.handleIncomingResponse(
+                await RpcTestSupport.deliverAck(in: room, requestId: requestId, from: destination)
+                await RpcTestSupport.deliverResponse(
+                    in: room,
                     requestId: requestId,
                     payload: "response-payload",
                     error: nil,
+                    from: destination
                 )
             }
 
             let response = try await room.localParticipant.performRpc(
-                destinationIdentity: Participant.Identity(from: "test-destination"),
+                destinationIdentity: destination,
                 method: "test-method",
                 payload: "test-payload",
             )
@@ -75,19 +79,23 @@ struct RpcClientTests {
     /// the call hung to the outer timeout.
     @Test func performRpcFastRemoteResponseRace() async throws {
         try await TestEnvironment.withRoom { room in
+            let destination = Participant.Identity(from: "test-destination")
+            try await RpcTestSupport.installRemote(in: room, identity: destination, clientProtocol: .v0)
             room.publisherDataChannel = MockDataChannelPair { _ in }
 
             await room.rpcClient.setAfterPublish { requestId in
-                await room.rpcClient.handleIncomingAck(requestId: requestId)
-                await room.rpcClient.handleIncomingResponse(
+                await RpcTestSupport.deliverAck(in: room, requestId: requestId, from: destination)
+                await RpcTestSupport.deliverResponse(
+                    in: room,
                     requestId: requestId,
                     payload: "fast-response",
                     error: nil,
+                    from: destination
                 )
             }
 
             let response = try await room.localParticipant.performRpc(
-                destinationIdentity: Participant.Identity(from: "test-destination"),
+                destinationIdentity: destination,
                 method: "test-method",
                 payload: "test-payload",
                 responseTimeout: 1,
@@ -110,14 +118,18 @@ struct RpcClientTests {
     /// `connectionTimeout`.
     @Test func performRpcResponseAndAckTimeoutDoubleResolve() async throws {
         try await TestEnvironment.withRoom { room in
+            let destination = Participant.Identity(from: "test-destination")
+            try await RpcTestSupport.installRemote(in: room, identity: destination, clientProtocol: .v0)
             room.publisherDataChannel = MockDataChannelPair { _ in }
 
             await room.rpcClient.setAfterPublish { requestId in
                 // Step 1: deliver the response, resolving the completer with "real-response".
-                await room.rpcClient.handleIncomingResponse(
+                await RpcTestSupport.deliverResponse(
+                    in: room,
                     requestId: requestId,
                     payload: "real-response",
                     error: nil,
+                    from: destination
                 )
                 // Step 2: force the ack-timeout watchdog. `pendingAcks` still contains
                 // `requestId` (handleIncomingResponse intentionally leaves it set), so the
@@ -127,7 +139,7 @@ struct RpcClientTests {
             }
 
             let response = try await room.localParticipant.performRpc(
-                destinationIdentity: Participant.Identity(from: "test-destination"),
+                destinationIdentity: destination,
                 method: "test-method",
                 payload: "test-payload",
                 responseTimeout: 1,
@@ -140,16 +152,16 @@ struct RpcClientTests {
     /// Regression test: when the destination participant disconnects mid-call, the
     /// caller receives `recipientDisconnected` (1503) immediately rather than the
     /// generic `connectionTimeout` (1501) after the user-supplied `responseTimeout`.
-    /// This v2→v1 variant uses an uninstalled destination so the caller picks the
-    /// v1 packet transport.
+    /// This v2→v1 variant uses a v0 destination so the caller picks the v1 packet transport.
     @Test(.spec("https://github.com/livekit/client-sdk-js/blob/92c72f06/RPC_SPEC.md?plain=1#L302"))
     func performRpcRejectsOnRecipientDisconnect() async throws {
         try await TestEnvironment.withRoom { room in
             let destination = Participant.Identity(from: "test-destination")
+            try await RpcTestSupport.installRemote(in: room, identity: destination, clientProtocol: .v0)
             room.publisherDataChannel = MockDataChannelPair { _ in }
 
             await room.rpcClient.setAfterPublish { _ in
-                await room.rpcClient.handleParticipantDisconnected(destination)
+                await RpcTestSupport.disconnectCurrent(in: room, identity: destination)
             }
 
             do {
@@ -179,7 +191,7 @@ struct RpcClientTests {
             room.publisherDataChannel = MockDataChannelPair { _ in }
 
             await room.rpcClient.setAfterPublish { _ in
-                await room.rpcClient.handleParticipantDisconnected(destination)
+                await RpcTestSupport.disconnectCurrent(in: room, identity: destination)
             }
 
             do {
@@ -202,6 +214,8 @@ struct RpcClientTests {
     ///   2. clean up the manager's pending state so it doesn't leak.
     @Test func performRpcCleansUpOnCancellation() async throws {
         try await TestEnvironment.withRoom { room in
+            let destination = Participant.Identity(from: "test-destination")
+            try await RpcTestSupport.installRemote(in: room, identity: destination, clientProtocol: .v0)
             room.publisherDataChannel = MockDataChannelPair { _ in }
 
             // Signal when performRpc has pre-registered pending state, instead of
@@ -213,7 +227,7 @@ struct RpcClientTests {
 
             let task = Task {
                 try await room.localParticipant.performRpc(
-                    destinationIdentity: Participant.Identity(from: "test-destination"),
+                    destinationIdentity: destination,
                     method: "method",
                     payload: "x",
                     responseTimeout: 30,
@@ -240,16 +254,19 @@ struct RpcClientTests {
         try await TestEnvironment.withRoom { room in
             let destination = Participant.Identity(from: "test-destination")
             let collector = TestStringCollector()
+            try await RpcTestSupport.installRemote(in: room, identity: destination, clientProtocol: .v0)
 
             room.publisherDataChannel = MockDataChannelPair { _ in }
 
             await room.rpcClient.setAfterPublish { requestId in
                 await collector.append(requestId)
-                await room.rpcClient.handleIncomingAck(requestId: requestId)
-                await room.rpcClient.handleIncomingResponse(
+                await RpcTestSupport.deliverAck(in: room, requestId: requestId, from: destination)
+                await RpcTestSupport.deliverResponse(
+                    in: room,
                     requestId: requestId,
                     payload: "response-\(requestId)",
                     error: nil,
+                    from: destination
                 )
             }
 
@@ -349,11 +366,13 @@ struct RpcClientTests {
             room.publisherDataChannel = MockDataChannelPair { _ in }
 
             await room.rpcClient.setAfterPublish { requestId in
-                await room.rpcClient.handleIncomingAck(requestId: requestId)
-                await room.rpcClient.handleIncomingResponse(
+                await RpcTestSupport.deliverAck(in: room, requestId: requestId, from: destination)
+                await RpcTestSupport.deliverResponse(
+                    in: room,
                     requestId: requestId,
                     payload: nil,
                     error: RpcError(code: 101, message: "Test error message", data: ""),
+                    from: destination
                 )
             }
 
@@ -381,6 +400,9 @@ struct RpcClientTests {
                 requestId: "no-such-request",
                 payload: "ignored",
                 error: nil,
+                senderIdentity: Participant.Identity(from: "anyone"),
+                senderParticipantSid: nil,
+                dataPacketReceiveGeneration: room.dataPacketReceiveGeneration
             )
             #expect(await room.rpcClient.pendingCount == 0)
         }
@@ -407,13 +429,22 @@ struct RpcClientTests {
     @Test func v2ResponseStreamReaderFailureFailsPending() async throws {
         try await TestEnvironment.withRoom { room in
             let destination = Participant.Identity(from: "v2-destination")
-            try await RpcTestSupport.installRemote(in: room, identity: destination, clientProtocol: .v1)
+            let participant = try await RpcTestSupport.installRemote(
+                in: room,
+                identity: destination,
+                clientProtocol: .v1
+            )
+            let sid = try #require(participant.sid)
 
             room.publisherDataChannel = MockDataChannelPair { _ in }
 
             await room.rpcClient.setAfterPublish { requestId in
-                await room.rpcClient.handleIncomingAck(requestId: requestId)
-                let reader = RpcTestSupport.makeFailingResponseReader(requestId: requestId)
+                await RpcTestSupport.deliverAck(in: room, requestId: requestId, from: destination)
+                let reader = RpcTestSupport.makeFailingResponseReader(
+                    requestId: requestId,
+                    publisherParticipantSid: sid,
+                    dataPacketReceiveGeneration: room.dataPacketReceiveGeneration
+                )
                 await room.rpcClient.handleIncomingResponseStream(reader: reader, senderIdentity: destination)
             }
 
@@ -442,13 +473,24 @@ struct RpcClientTests {
             let destination = Participant.Identity(from: "v2-destination")
             let imposter = Participant.Identity(from: "v2-imposter")
             try await RpcTestSupport.installRemote(in: room, identity: destination, clientProtocol: .v1)
+            let imposterParticipant = try await RpcTestSupport.installRemote(
+                in: room,
+                identity: imposter,
+                clientProtocol: .v1
+            )
+            let imposterSid = try #require(imposterParticipant.sid)
 
             room.publisherDataChannel = MockDataChannelPair { _ in }
 
             await room.rpcClient.setAfterPublish { requestId in
-                await room.rpcClient.handleIncomingAck(requestId: requestId)
+                await RpcTestSupport.deliverAck(in: room, requestId: requestId, from: destination)
                 // Inject a response stream from the imposter — must be ignored.
-                let reader = RpcTestSupport.makeResponseReader(requestId: requestId, payload: "spoofed")
+                let reader = RpcTestSupport.makeResponseReader(
+                    requestId: requestId,
+                    payload: "spoofed",
+                    publisherParticipantSid: imposterSid,
+                    dataPacketReceiveGeneration: room.dataPacketReceiveGeneration
+                )
                 await room.rpcClient.handleIncomingResponseStream(reader: reader, senderIdentity: imposter)
             }
 
@@ -481,6 +523,9 @@ struct RpcServerTests {
     @Test(.spec("https://github.com/livekit/client-sdk-js/blob/92c72f06/RPC_SPEC.md?plain=1#L274"))
     func handleIncomingRpcRequest() async throws {
         try await TestEnvironment.withRoom { room in
+            let caller = Participant.Identity(from: "test-caller")
+            let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v0)
+            let sid = try #require(participant.sid)
             try await confirmation("Should send RPC response packet") { confirm in
                 let mockDataChannel = MockDataChannelPair { packet in
                     guard case let .rpcResponse(response) = packet.value,
@@ -504,7 +549,9 @@ struct RpcServerTests {
                 }
 
                 await room.rpcServer.handleIncomingRequest(
-                    callerIdentity: Participant.Identity(from: "test-caller"),
+                    callerIdentity: caller,
+                    callerParticipantSid: sid,
+                    callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
                     requestId: "test-request-1",
                     method: "greet",
                     payload: "Hi there!",
@@ -515,10 +562,9 @@ struct RpcServerTests {
         }
     }
 
-    /// A packet admitted for participant A must retain A's server-issued SID
-    /// even if participant B with the same identity is already canonical when
-    /// the detached RPC handler runs.
-    @Test func v1InvocationRetainsPacketPublisherSidAcrossIdentityReplacement() async throws {
+    /// A packet admitted for participant A must not reach the application after
+    /// participant B with the same identity has become canonical.
+    @Test func v1InvocationRejectsPublisherSidAcrossIdentityReplacement() async throws {
         let room = Room()
         await room.rpcServer.attach(to: room)
         room.publisherDataChannel = MockDataChannelPair { _ in }
@@ -537,15 +583,9 @@ struct RpcServerTests {
         )
         room._state.mutate { $0.remoteParticipants[identity] = replacement }
 
-        let invoked = AsyncCompleter<Void>(
-            label: "v1 provenance handler",
-            defaultTimeout: 1
-        )
-        try await room.registerRpcMethod("provenance-v1") { data in
-            #expect(data.callerIdentity == identity)
-            #expect(data.callerParticipantSid == originalSid)
-            #expect(data.callerParticipantSid != replacement.sid)
-            invoked.resume(returning: ())
+        let invoked = StateSync(false)
+        try await room.registerRpcMethod("provenance-v1") { _ in
+            invoked.mutate { $0 = true }
             return "ok"
         }
 
@@ -561,14 +601,16 @@ struct RpcServerTests {
         }
         room.dataChannel(
             MockDataChannelPair { _ in },
-            didReceiveDataPacket: packet
+            didReceiveDataPacket: packet,
+            receiveGeneration: room.dataPacketReceiveGeneration
         )
-        try await invoked.wait(timeout: 1)
+        try? await Task.sleep(nanoseconds: 10_000_000)
+        #expect(!invoked.copy())
     }
 
-    /// The v2 stream path must forward the immutable publisher SID from
-    /// `TextStreamInfo`, never recover a SID from the current participant map.
-    @Test func v2InvocationRetainsHeaderPublisherSidAcrossIdentityReplacement() async throws {
+    /// The v2 stream path must reject immutable publisher provenance that no
+    /// longer names the current participant object.
+    @Test func v2InvocationRejectsHeaderPublisherSidAcrossIdentityReplacement() async throws {
         let room = Room()
         await room.rpcServer.attach(to: room)
         room.publisherDataChannel = MockDataChannelPair { _ in }
@@ -587,32 +629,147 @@ struct RpcServerTests {
         )
         room._state.mutate { $0.remoteParticipants[identity] = replacement }
 
-        try await confirmation("Handler receives header publisher SID") { invoked in
-            try await room.registerRpcMethod("provenance-v2") { data in
-                #expect(data.callerIdentity == identity)
-                #expect(data.callerParticipantSid == originalSid)
-                #expect(data.callerParticipantSid != replacement.sid)
-                invoked()
-                return "ok"
-            }
-
-            let reader = RpcTestSupport.makeRequestReader(
-                requestId: "v2-provenance",
-                method: "provenance-v2",
-                payload: "",
-                timeoutMs: 8_000,
-                publisherParticipantSid: originalSid
-            )
-            await room.rpcServer.handleIncomingRequestStream(
-                reader: reader,
-                callerIdentity: identity
-            )
+        let invoked = StateSync(false)
+        try await room.registerRpcMethod("provenance-v2") { _ in
+            invoked.mutate { $0 = true }
+            return "ok"
         }
+
+        let reader = RpcTestSupport.makeRequestReader(
+            requestId: "v2-provenance",
+            method: "provenance-v2",
+            payload: "",
+            timeoutMs: 8_000,
+            publisherParticipantSid: originalSid,
+            dataPacketReceiveGeneration: 0
+        )
+        await room.rpcServer.handleIncomingRequestStream(
+            reader: reader,
+            callerIdentity: identity
+        )
+        #expect(!invoked.copy())
+    }
+
+    /// Models the v1 packet task after it captured immutable admission data but
+    /// before actor dispatch. A full reconnect may install a new participant
+    /// object with the same identity and server SID; the old generation must
+    /// remain visible to application authorization.
+    @Test func v1QueuedInvocationRetainsOldGenerationWhenSidIsReused() async throws {
+        let room = Room()
+        await room.rpcServer.attach(to: room)
+        let sentCount = StateSync(0)
+        room.publisherDataChannel = MockDataChannelPair { _ in sentCount.mutate { $0 += 1 } }
+
+        let identity = Participant.Identity(from: "same-agent")
+        let reusedSid = Participant.Sid(from: "PA_reused")
+        let oldGeneration = room.dataPacketReceiveGeneration
+        let original = RemoteParticipant(
+            info: .with {
+                $0.identity = identity.stringValue
+                $0.sid = reusedSid.stringValue
+            },
+            room: room,
+            connectionState: .connected
+        )
+        room._state.mutate { $0.remoteParticipants[identity] = original }
+
+        let invoked = StateSync(false)
+        try await room.registerRpcMethod("generation-v1") { _ in
+            invoked.mutate { $0 = true }
+            return "ok"
+        }
+
+        await room.cleanUp(isFullReconnect: true)
+        let replacement = RemoteParticipant(
+            info: .with {
+                $0.identity = identity.stringValue
+                $0.sid = reusedSid.stringValue
+            },
+            room: room,
+            connectionState: .connected
+        )
+        room._state.mutate { $0.remoteParticipants[identity] = replacement }
+
+        #expect(ObjectIdentifier(original) != ObjectIdentifier(replacement))
+        #expect(room.dataPacketReceiveGeneration > oldGeneration)
+        await room.rpcServer.handleIncomingRequest(
+            callerIdentity: identity,
+            callerParticipantSid: reusedSid,
+            callerDataPacketReceiveGeneration: oldGeneration,
+            requestId: "v1-old-generation",
+            method: "generation-v1",
+            payload: "",
+            responseTimeout: 8,
+            version: 1
+        )
+        #expect(!invoked.copy())
+        #expect(sentCount.copy() == 0)
+    }
+
+    /// A v2 reader is created when its header is admitted, before its detached
+    /// handler starts. Starting that handler after full reconnect must not
+    /// rewrite the old header generation from a same-SID replacement.
+    @Test func v2QueuedInvocationRetainsOldGenerationWhenSidIsReused() async throws {
+        let room = Room()
+        await room.rpcServer.attach(to: room)
+        let sentCount = StateSync(0)
+        room.publisherDataChannel = MockDataChannelPair { _ in sentCount.mutate { $0 += 1 } }
+
+        let identity = Participant.Identity(from: "same-agent")
+        let reusedSid = Participant.Sid(from: "PA_reused")
+        let oldGeneration = room.dataPacketReceiveGeneration
+        let original = RemoteParticipant(
+            info: .with {
+                $0.identity = identity.stringValue
+                $0.sid = reusedSid.stringValue
+            },
+            room: room,
+            connectionState: .connected
+        )
+        room._state.mutate { $0.remoteParticipants[identity] = original }
+
+        let queuedReader = RpcTestSupport.makeRequestReader(
+            requestId: "v2-old-generation",
+            method: "generation-v2",
+            payload: "",
+            timeoutMs: 8_000,
+            publisherParticipantSid: reusedSid,
+            dataPacketReceiveGeneration: oldGeneration
+        )
+
+        let invoked = StateSync(false)
+        try await room.registerRpcMethod("generation-v2") { _ in
+            invoked.mutate { $0 = true }
+            return "ok"
+        }
+
+        await room.cleanUp(isFullReconnect: true)
+        let replacement = RemoteParticipant(
+            info: .with {
+                $0.identity = identity.stringValue
+                $0.sid = reusedSid.stringValue
+            },
+            room: room,
+            connectionState: .connected
+        )
+        room._state.mutate { $0.remoteParticipants[identity] = replacement }
+
+        #expect(ObjectIdentifier(original) != ObjectIdentifier(replacement))
+        #expect(room.dataPacketReceiveGeneration > oldGeneration)
+        await room.rpcServer.handleIncomingRequestStream(
+            reader: queuedReader,
+            callerIdentity: identity
+        )
+        #expect(!invoked.copy())
+        #expect(sentCount.copy() == 0)
     }
 
     @Test(.spec("https://github.com/livekit/client-sdk-js/blob/92c72f06/RPC_SPEC.md?plain=1#L324"))
     func rpcErrorHandling() async throws {
         try await TestEnvironment.withRoom { room in
+            let caller = Participant.Identity(from: "test-caller")
+            let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v0)
+            let sid = try #require(participant.sid)
             try await confirmation("Should send error response packet") { confirm in
                 let mockDataChannel = MockDataChannelPair { packet in
                     guard case let .rpcResponse(response) = packet.value,
@@ -630,7 +787,9 @@ struct RpcServerTests {
                 }
 
                 await room.rpcServer.handleIncomingRequest(
-                    callerIdentity: Participant.Identity(from: "test-caller"),
+                    callerIdentity: caller,
+                    callerParticipantSid: sid,
+                    callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
                     requestId: "test-request-1",
                     method: "failingMethod",
                     payload: "test",
@@ -648,6 +807,9 @@ struct RpcServerTests {
     @Test(.spec("https://github.com/livekit/client-sdk-js/blob/92c72f06/RPC_SPEC.md?plain=1#L318"))
     func v1HandlerUnhandledErrorReturnsPacket() async throws {
         try await TestEnvironment.withRoom { room in
+            let caller = Participant.Identity(from: "v1-caller")
+            let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v0)
+            let sid = try #require(participant.sid)
             try await confirmation("Sends APPLICATION_ERROR packet") { confirm in
                 let mockDataChannel = MockDataChannelPair { packet in
                     guard case let .rpcResponse(response) = packet.value,
@@ -664,7 +826,9 @@ struct RpcServerTests {
                 }
 
                 await room.rpcServer.handleIncomingRequest(
-                    callerIdentity: Participant.Identity(from: "v1-caller"),
+                    callerIdentity: caller,
+                    callerParticipantSid: sid,
+                    callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
                     requestId: "v1-unhandled",
                     method: "error-method",
                     payload: "",
@@ -677,6 +841,9 @@ struct RpcServerTests {
 
     @Test func unregisterRpcMethod() async throws {
         try await TestEnvironment.withRoom { room in
+            let caller = Participant.Identity(from: "test-caller")
+            let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v0)
+            let sid = try #require(participant.sid)
             try await confirmation("Should send unsupported method error packet") { confirm in
                 let mockDataChannel = MockDataChannelPair { packet in
                     guard case let .rpcResponse(response) = packet.value,
@@ -693,7 +860,9 @@ struct RpcServerTests {
                 #expect(!isRegistered)
 
                 await room.rpcServer.handleIncomingRequest(
-                    callerIdentity: Participant.Identity(from: "test-caller"),
+                    callerIdentity: caller,
+                    callerParticipantSid: sid,
+                    callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
                     requestId: "test-request-1",
                     method: "test",
                     payload: "test",
@@ -710,6 +879,9 @@ struct RpcServerTests {
     /// no such cap (`v2HandlerCanReturnLargeResponse` covers that side).
     @Test func v1HandlerOversizeResponseReturnsTooLargePacket() async throws {
         try await TestEnvironment.withRoom { room in
+            let caller = Participant.Identity(from: "v1-caller")
+            let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v0)
+            let sid = try #require(participant.sid)
             try await confirmation("Sends responsePayloadTooLarge error packet") { confirm in
                 let mockDataChannel = MockDataChannelPair { packet in
                     guard case let .rpcResponse(response) = packet.value,
@@ -725,7 +897,9 @@ struct RpcServerTests {
                 try await room.registerRpcMethod("big") { _ in oversize }
 
                 await room.rpcServer.handleIncomingRequest(
-                    callerIdentity: Participant.Identity(from: "v1-caller"),
+                    callerIdentity: caller,
+                    callerParticipantSid: sid,
+                    callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
                     requestId: "v1-oversize",
                     method: "big",
                     payload: "",
@@ -746,7 +920,8 @@ struct RpcServerTests {
     func v1CallerToV2HandlerResponseUsesV1Packet() async throws {
         try await TestEnvironment.withRoom { room in
             let v1Caller = Participant.Identity(from: "legacy-v1-caller")
-            try await RpcTestSupport.installRemote(in: room, identity: v1Caller, clientProtocol: .v0)
+            let participant = try await RpcTestSupport.installRemote(in: room, identity: v1Caller, clientProtocol: .v0)
+            let sid = try #require(participant.sid)
 
             try await confirmation("Response arrives as v1 RpcResponse packet, not a stream") { confirm in
                 let mockDataChannel = MockDataChannelPair { packet in
@@ -767,6 +942,8 @@ struct RpcServerTests {
 
                 await room.rpcServer.handleIncomingRequest(
                     callerIdentity: v1Caller,
+                    callerParticipantSid: sid,
+                    callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
                     requestId: "v1-to-v2",
                     method: "ping",
                     payload: "",
@@ -782,6 +959,9 @@ struct RpcServerTests {
     /// path of `RpcServerManager.handleIncomingRequest`.
     @Test func v1HandleIncomingRequestUnsupportedVersion() async throws {
         try await TestEnvironment.withRoom { room in
+            let caller = Participant.Identity(from: "v1-caller")
+            let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v0)
+            let sid = try #require(participant.sid)
             await confirmation("Sends unsupportedVersion error packet") { confirm in
                 let mockDataChannel = MockDataChannelPair { packet in
                     guard case let .rpcResponse(response) = packet.value,
@@ -793,7 +973,9 @@ struct RpcServerTests {
                 room.publisherDataChannel = mockDataChannel
 
                 await room.rpcServer.handleIncomingRequest(
-                    callerIdentity: Participant.Identity(from: "v1-caller"),
+                    callerIdentity: caller,
+                    callerParticipantSid: sid,
+                    callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
                     requestId: "v1-bad-version",
                     method: "anything",
                     payload: "",
@@ -842,6 +1024,9 @@ struct RpcServerTests {
     /// reply, so the handler must log and bail — never publish a packet.
     @Test func v2RequestStreamMissingRequestIdIsSilent() async throws {
         try await TestEnvironment.withRoom { room in
+            let caller = Participant.Identity(from: "v2-caller")
+            let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v1)
+            let sid = try #require(participant.sid)
             await confirmation("No packet sent", expectedCount: 0) { confirm in
                 room.publisherDataChannel = MockDataChannelPair { _ in confirm() }
 
@@ -850,10 +1035,12 @@ struct RpcServerTests {
                     method: "anything",
                     payload: "",
                     timeoutMs: 8000,
+                    publisherParticipantSid: sid,
+                    dataPacketReceiveGeneration: room.dataPacketReceiveGeneration
                 )
                 await room.rpcServer.handleIncomingRequestStream(
                     reader: reader,
-                    callerIdentity: Participant.Identity(from: "v2-caller"),
+                    callerIdentity: caller,
                 )
             }
         }
@@ -880,19 +1067,28 @@ struct RpcServerTests {
             }
         }
 
-        func makeReader() -> TextStreamReader {
+        func makeReader(
+            publisherParticipantSid: Participant.Sid,
+            dataPacketReceiveGeneration: UInt64
+        ) -> TextStreamReader {
             switch self {
             case .missingMethod:
                 RpcTestSupport.makeRequestReader(
                     requestId: requestId, method: nil, payload: "", timeoutMs: 8000,
+                    publisherParticipantSid: publisherParticipantSid,
+                    dataPacketReceiveGeneration: dataPacketReceiveGeneration
                 )
             case .wrongVersion:
                 RpcTestSupport.makeRequestReader(
                     requestId: requestId, method: "anything", payload: "", timeoutMs: 8000, version: "3",
+                    publisherParticipantSid: publisherParticipantSid,
+                    dataPacketReceiveGeneration: dataPacketReceiveGeneration
                 )
             case .readerFailure:
                 RpcTestSupport.makeFailingRequestReader(
                     requestId: requestId, method: "anything", timeoutMs: 8000,
+                    publisherParticipantSid: publisherParticipantSid,
+                    dataPacketReceiveGeneration: dataPacketReceiveGeneration
                 )
             }
         }
@@ -922,6 +1118,9 @@ struct RpcServerTests {
     @Test(arguments: V2RequestErrorScenario.allCases)
     func v2RequestStreamErrorReturnsPacket(_ scenario: V2RequestErrorScenario) async throws {
         try await TestEnvironment.withRoom { room in
+            let caller = Participant.Identity(from: "v2-caller")
+            let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v1)
+            let sid = try #require(participant.sid)
             await confirmation("Sends matching error packet (\(scenario.testDescription))") { confirm in
                 let mockDataChannel = MockDataChannelPair { packet in
                     guard case let .rpcResponse(response) = packet.value,
@@ -935,8 +1134,11 @@ struct RpcServerTests {
                 room.publisherDataChannel = mockDataChannel
 
                 await room.rpcServer.handleIncomingRequestStream(
-                    reader: scenario.makeReader(),
-                    callerIdentity: Participant.Identity(from: "v2-caller"),
+                    reader: scenario.makeReader(
+                        publisherParticipantSid: sid,
+                        dataPacketReceiveGeneration: room.dataPacketReceiveGeneration
+                    ),
+                    callerIdentity: caller,
                 )
             }
         }
@@ -949,6 +1151,9 @@ struct RpcServerTests {
     )
     func v2HandlerErrorReturnsPacket(_ scenario: HandlerErrorScenario) async throws {
         try await TestEnvironment.withRoom { room in
+            let caller = Participant.Identity(from: "v2-caller")
+            let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v1)
+            let sid = try #require(participant.sid)
             try await confirmation("Sends v1 RpcResponse error packet (\(scenario.testDescription))") { confirm in
                 let mockDataChannel = MockDataChannelPair { packet in
                     guard case let .rpcResponse(response) = packet.value,
@@ -972,10 +1177,12 @@ struct RpcServerTests {
                     method: "error-method",
                     payload: "",
                     timeoutMs: 8000,
+                    publisherParticipantSid: sid,
+                    dataPacketReceiveGeneration: room.dataPacketReceiveGeneration
                 )
                 await room.rpcServer.handleIncomingRequestStream(
                     reader: reader,
-                    callerIdentity: Participant.Identity(from: "v2-caller"),
+                    callerIdentity: caller,
                 )
             }
         }
@@ -984,22 +1191,351 @@ struct RpcServerTests {
 
 // swiftlint:enable type_body_length
 
+@Suite(.serialized, .tags(.rpc))
+struct RpcParticipantGenerationTests {
+    @Test func generationAdvanceInvalidatesParticipantBeforeDictionaryCleanup() async throws {
+        let room = Room()
+        await room.rpcClient.attach(to: room)
+        let identity = Participant.Identity(from: "same-agent")
+        let reusedSid = Participant.Sid(from: "PA_reused")
+        let original = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: identity,
+            clientProtocol: .v0,
+            sid: reusedSid
+        )
+        let originalConnection = try #require(
+            RpcParticipantConnection.resolveCurrent(in: room, identity: identity)
+        )
+        let originalGeneration = room.dataPacketReceiveGeneration
+
+        _ = room.incrementDataPacketReceiveGeneration()
+
+        #expect(room.remoteParticipants[identity] === original)
+        #expect(room.dataPacketReceiveGeneration > originalGeneration)
+        #expect(!originalConnection.isCurrent(in: room))
+        #expect(RpcParticipantConnection.resolveCurrent(in: room, identity: identity) == nil)
+
+        let sentCount = StateSync(0)
+        room.publisherDataChannel = MockDataChannelPair { _ in sentCount.mutate { $0 += 1 } }
+        await #expect(throws: RpcError.self) {
+            try await room.localParticipant.performRpc(
+                destinationIdentity: identity,
+                method: "must-not-send",
+                payload: ""
+            )
+        }
+        #expect(sentCount.copy() == 0)
+
+        let replacement = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: identity,
+            clientProtocol: .v0,
+            sid: reusedSid
+        )
+        let replacementConnection = try #require(
+            RpcParticipantConnection.resolveCurrent(in: room, identity: identity)
+        )
+        #expect(replacement !== original)
+        #expect(replacementConnection.participant === replacement)
+        #expect(replacementConnection.dataPacketReceiveGeneration == room.dataPacketReceiveGeneration)
+    }
+}
+
+@Suite(.serialized, .tags(.rpc))
+struct RpcStreamResourceLimitTests {
+    private let caller = Participant.Identity(from: "bounded-caller")
+
+    @Test func declaredOversizeRequestNeverReachesApplicationHandler() async throws {
+        let room = Room()
+        let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v1)
+        let sid = try #require(participant.sid)
+        let invoked = StateSync(false)
+        let responseError = StateSync<Livekit_RpcError?>(nil)
+        room.publisherDataChannel = MockDataChannelPair { packet in
+            guard case let .rpcResponse(response) = packet.value,
+                  case let .error(error) = response.value
+            else { return }
+            responseError.mutate { $0 = error }
+        }
+        await room.setupRpc()
+        try await room.registerRpcMethod("bounded") { _ in
+            invoked.mutate { $0 = true }
+            return "unreachable"
+        }
+
+        room.incomingStreamManager.handle(.header(
+            requestHeader(
+                id: "declared-request",
+                requestId: "request-1",
+                declaredLength: UInt64(RpcStreamLimits.maximumPayloadBytes + 1)
+            ),
+            caller.stringValue,
+            sid,
+            room.dataPacketReceiveGeneration,
+            .none
+        ))
+        await waitForRpcError(responseError)
+
+        #expect(!invoked.copy())
+        #expect(responseError.copy()?.code == UInt32(RpcError.BuiltInError.requestPayloadTooLarge.code))
+    }
+
+    @Test func streamedRequestOverflowNeverReachesApplicationHandler() async throws {
+        let room = Room()
+        let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v1)
+        let sid = try #require(participant.sid)
+        let invoked = StateSync(false)
+        let responseError = StateSync<Livekit_RpcError?>(nil)
+        room.publisherDataChannel = MockDataChannelPair { packet in
+            guard case let .rpcResponse(response) = packet.value,
+                  case let .error(error) = response.value
+            else { return }
+            responseError.mutate { $0 = error }
+        }
+        await room.setupRpc()
+        try await room.registerRpcMethod("bounded") { _ in
+            invoked.mutate { $0 = true }
+            return "unreachable"
+        }
+
+        let streamID = "streamed-request"
+        room.incomingStreamManager.handle(.header(
+            requestHeader(id: streamID, requestId: "request-2", declaredLength: nil),
+            caller.stringValue,
+            sid,
+            room.dataPacketReceiveGeneration,
+            .none
+        ))
+        room.incomingStreamManager.handle(.chunk(
+            chunk(id: streamID, count: RpcStreamLimits.maximumPayloadBytes),
+            caller.stringValue,
+            sid,
+            room.dataPacketReceiveGeneration,
+            .none
+        ))
+        room.incomingStreamManager.handle(.chunk(
+            chunk(id: streamID, count: 1),
+            caller.stringValue,
+            sid,
+            room.dataPacketReceiveGeneration,
+            .none
+        ))
+        await waitForRpcError(responseError)
+
+        #expect(!invoked.copy())
+        #expect(responseError.copy()?.code == UInt32(RpcError.BuiltInError.requestPayloadTooLarge.code))
+    }
+
+    @Test func declaredOversizeResponseFailsPendingCallWithTypedError() async throws {
+        let room = Room()
+        let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v1)
+        let sid = try #require(participant.sid)
+        room.publisherDataChannel = MockDataChannelPair { _ in }
+        await room.setupRpc()
+        await room.rpcClient.setAfterPublish { requestId in
+            await RpcTestSupport.deliverAck(in: room, requestId: requestId, from: self.caller)
+            room.incomingStreamManager.handle(.header(
+                responseHeader(
+                    id: "declared-response",
+                    requestId: requestId,
+                    declaredLength: UInt64(RpcStreamLimits.maximumPayloadBytes + 1)
+                ),
+                self.caller.stringValue,
+                sid,
+                room.dataPacketReceiveGeneration,
+                .none
+            ))
+        }
+
+        await #expect {
+            try await room.localParticipant.performRpc(
+                destinationIdentity: caller,
+                method: "bounded",
+                payload: "request",
+                responseTimeout: 1
+            )
+        } throws: { error in
+            (error as? RpcError)?.code == RpcError.BuiltInError.responsePayloadTooLarge.code
+        }
+    }
+
+    @Test func streamedResponseOverflowFailsPendingCallWithTypedError() async throws {
+        let room = Room()
+        let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v1)
+        let sid = try #require(participant.sid)
+        room.publisherDataChannel = MockDataChannelPair { _ in }
+        await room.setupRpc()
+        await room.rpcClient.setAfterPublish { requestId in
+            await RpcTestSupport.deliverAck(in: room, requestId: requestId, from: self.caller)
+            let streamID = "streamed-response"
+            room.incomingStreamManager.handle(.header(
+                responseHeader(id: streamID, requestId: requestId, declaredLength: nil),
+                self.caller.stringValue,
+                sid,
+                room.dataPacketReceiveGeneration,
+                .none
+            ))
+            room.incomingStreamManager.handle(.chunk(
+                chunk(id: streamID, count: RpcStreamLimits.maximumPayloadBytes),
+                self.caller.stringValue,
+                sid,
+                room.dataPacketReceiveGeneration,
+                .none
+            ))
+            room.incomingStreamManager.handle(.chunk(
+                chunk(id: streamID, count: 1),
+                self.caller.stringValue,
+                sid,
+                room.dataPacketReceiveGeneration,
+                .none
+            ))
+        }
+
+        await #expect {
+            try await room.localParticipant.performRpc(
+                destinationIdentity: caller,
+                method: "bounded",
+                payload: "request",
+                responseTimeout: 1
+            )
+        } throws: { error in
+            (error as? RpcError)?.code == RpcError.BuiltInError.responsePayloadTooLarge.code
+        }
+    }
+
+    private func requestHeader(
+        id: String,
+        requestId: String,
+        declaredLength: UInt64?
+    ) -> Livekit_DataStream.Header {
+        var header = Livekit_DataStream.Header()
+        header.streamID = id
+        header.topic = RpcStreamTopic.request
+        if let declaredLength { header.totalLength = declaredLength }
+        header.attributes = [
+            RpcStreamAttribute.requestId: requestId,
+            RpcStreamAttribute.method: "bounded",
+            RpcStreamAttribute.timeoutMs: "1000",
+            RpcStreamAttribute.version: RPC_STREAM_VERSION,
+        ]
+        header.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        return header
+    }
+
+    private func responseHeader(
+        id: String,
+        requestId: String,
+        declaredLength: UInt64?
+    ) -> Livekit_DataStream.Header {
+        var header = Livekit_DataStream.Header()
+        header.streamID = id
+        header.topic = RpcStreamTopic.response
+        if let declaredLength { header.totalLength = declaredLength }
+        header.attributes = [RpcStreamAttribute.requestId: requestId]
+        header.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        return header
+    }
+
+    private func chunk(id: String, count: Int) -> Livekit_DataStream.Chunk {
+        Livekit_DataStream.Chunk.with {
+            $0.streamID = id
+            $0.content = Data(repeating: 0x61, count: count)
+        }
+    }
+
+    private func waitForRpcError(_ error: StateSync<Livekit_RpcError?>) async {
+        let deadline = Date().addingTimeInterval(10)
+        while error.copy() == nil, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+}
+
 // MARK: - Shared test support
 
 private enum RpcTestSupport {
     /// Install a remote participant into `room` whose `clientProtocol` advertises the
     /// given version. Required for `performRpc` to read `remoteParticipants[...]?.clientProtocol`
     /// when there's no real signaling.
-    static func installRemote(in room: Room, identity: Participant.Identity, clientProtocol: ClientProtocol) async throws {
+    @discardableResult
+    static func installRemote(
+        in room: Room,
+        identity: Participant.Identity,
+        clientProtocol: ClientProtocol,
+        sid: Participant.Sid? = nil
+    ) async throws -> RemoteParticipant {
         let info = Livekit_ParticipantInfo.with {
             $0.identity = identity.stringValue
-            $0.sid = "PA_\(UUID().uuidString.prefix(8))"
+            $0.sid = (sid ?? Participant.Sid(from: "PA_\(UUID().uuidString.prefix(8))")).stringValue
             $0.clientProtocol = Int32(clientProtocol.rawValue)
         }
         let remote = RemoteParticipant(info: info, room: room, connectionState: .connected)
         room._state.mutate {
             $0.remoteParticipants[identity] = remote
         }
+        return remote
+    }
+
+    static func currentConnection(
+        in room: Room,
+        identity: Participant.Identity
+    ) -> RpcParticipantConnection? {
+        RpcParticipantConnection.resolveCurrent(in: room, identity: identity)
+    }
+
+    static func deliverAck(
+        in room: Room,
+        requestId: String,
+        from identity: Participant.Identity
+    ) async {
+        guard let connection = currentConnection(in: room, identity: identity) else {
+            Issue.record("Missing exact RPC participant connection for \(identity)")
+            return
+        }
+        await room.rpcClient.handleIncomingAck(
+            requestId: requestId,
+            senderIdentity: identity,
+            senderParticipantSid: connection.sid,
+            dataPacketReceiveGeneration: connection.dataPacketReceiveGeneration
+        )
+    }
+
+    static func deliverResponse(
+        in room: Room,
+        requestId: String,
+        payload: String?,
+        error: RpcError?,
+        from identity: Participant.Identity
+    ) async {
+        guard let connection = currentConnection(in: room, identity: identity) else {
+            Issue.record("Missing exact RPC participant connection for \(identity)")
+            return
+        }
+        await room.rpcClient.handleIncomingResponse(
+            requestId: requestId,
+            payload: payload,
+            error: error,
+            senderIdentity: identity,
+            senderParticipantSid: connection.sid,
+            dataPacketReceiveGeneration: connection.dataPacketReceiveGeneration
+        )
+    }
+
+    static func disconnectCurrent(
+        in room: Room,
+        identity: Participant.Identity
+    ) async {
+        guard let connection = currentConnection(in: room, identity: identity) else {
+            Issue.record("Missing exact RPC participant connection for \(identity)")
+            return
+        }
+        await room.rpcClient.handleParticipantDisconnected(
+            identity: identity,
+            participantSid: connection.sid,
+            dataPacketReceiveGeneration: connection.dataPacketReceiveGeneration,
+            participant: connection.participant
+        )
     }
 
     /// Builds a v2 request-stream reader. Pass `nil` for any attribute to omit
@@ -1012,6 +1548,7 @@ private enum RpcTestSupport {
         timeoutMs: UInt32?,
         version: String? = RPC_STREAM_VERSION,
         publisherParticipantSid: Participant.Sid? = nil,
+        dataPacketReceiveGeneration: UInt64? = nil,
     ) -> TextStreamReader {
         var attributes: [String: String] = [:]
         if let requestId { attributes[RpcStreamAttribute.requestId] = requestId }
@@ -1031,6 +1568,7 @@ private enum RpcTestSupport {
             attachedStreamIDs: [],
             generated: false,
             publisherParticipantSid: publisherParticipantSid,
+            dataPacketReceiveGeneration: dataPacketReceiveGeneration,
         )
         let source = StreamReaderSource { continuation in
             if let data = payload.data(using: .utf8) { continuation.yield(data) }
@@ -1042,7 +1580,12 @@ private enum RpcTestSupport {
     /// Builds a v2 response-stream reader. Pass `nil` for `requestId` to omit
     /// the correlation attribute — used by negative tests that exercise
     /// `RpcClientManager.handleIncomingResponseStream`'s missing-id branch.
-    static func makeResponseReader(requestId: String?, payload: String) -> TextStreamReader {
+    static func makeResponseReader(
+        requestId: String?,
+        payload: String,
+        publisherParticipantSid: Participant.Sid? = nil,
+        dataPacketReceiveGeneration: UInt64? = nil
+    ) -> TextStreamReader {
         var attributes: [String: String] = [:]
         if let requestId { attributes[RpcStreamAttribute.requestId] = requestId }
         let info = TextStreamInfo(
@@ -1057,6 +1600,8 @@ private enum RpcTestSupport {
             replyToStreamID: nil,
             attachedStreamIDs: [],
             generated: false,
+            publisherParticipantSid: publisherParticipantSid,
+            dataPacketReceiveGeneration: dataPacketReceiveGeneration,
         )
         let source = StreamReaderSource { continuation in
             if let data = payload.data(using: .utf8) { continuation.yield(data) }
@@ -1073,6 +1618,8 @@ private enum RpcTestSupport {
         method: String,
         timeoutMs: UInt32,
         error: Error = StreamError.terminated,
+        publisherParticipantSid: Participant.Sid? = nil,
+        dataPacketReceiveGeneration: UInt64? = nil,
     ) -> TextStreamReader {
         let info = TextStreamInfo(
             id: UUID().uuidString,
@@ -1091,6 +1638,8 @@ private enum RpcTestSupport {
             replyToStreamID: nil,
             attachedStreamIDs: [],
             generated: false,
+            publisherParticipantSid: publisherParticipantSid,
+            dataPacketReceiveGeneration: dataPacketReceiveGeneration,
         )
         let source = StreamReaderSource { continuation in
             continuation.finish(throwing: error)
@@ -1103,6 +1652,8 @@ private enum RpcTestSupport {
     static func makeFailingResponseReader(
         requestId: String,
         error: Error = StreamError.terminated,
+        publisherParticipantSid: Participant.Sid? = nil,
+        dataPacketReceiveGeneration: UInt64? = nil,
     ) -> TextStreamReader {
         let info = TextStreamInfo(
             id: UUID().uuidString,
@@ -1116,6 +1667,8 @@ private enum RpcTestSupport {
             replyToStreamID: nil,
             attachedStreamIDs: [],
             generated: false,
+            publisherParticipantSid: publisherParticipantSid,
+            dataPacketReceiveGeneration: dataPacketReceiveGeneration,
         )
         let source = StreamReaderSource { continuation in
             continuation.finish(throwing: error)

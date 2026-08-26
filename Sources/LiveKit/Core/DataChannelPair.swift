@@ -21,70 +21,97 @@ internal import LiveKitWebRTC
 // MARK: - Internal delegate
 
 protocol DataChannelDelegate: AnyObject, Sendable {
-    /// `encryptionType` is how the packet arrived on the wire. It rides alongside the packet
-    /// because decryption rewrites the payload oneof, which *clears* `encryptedPacket` — reading
-    /// the type off a decrypted packet reports every encrypted message as unencrypted.
-    func dataChannel(_ dataChannelPair: DataChannelPair, didReceiveDataPacket dataPacket: Livekit_DataPacket, encryptionType: EncryptionType)
-    func dataChannel(_ dataChannelPair: DataChannelPair, didFailToDecryptDataPacket dataPacket: Livekit_DataPacket, error: LiveKitError)
+    /// The encryption type is captured before decryption rewrites the packet payload.
+    func dataChannel(
+        _ dataChannelPair: DataChannelPair,
+        didReceiveDataPacket dataPacket: Livekit_DataPacket,
+        encryptionType: EncryptionType,
+        receiveGeneration: UInt64
+    )
+
+    func dataChannel(
+        _ dataChannelPair: DataChannelPair,
+        didFailToDecryptDataPacket dataPacket: Livekit_DataPacket,
+        error: LiveKitError,
+        receiveGeneration: UInt64
+    )
 }
 
 /// The lossy and reliable data channels for one peer connection, plus the packet semantics they
-/// share: encryption, the receive-side dedup gate, and the pair-level open latch.
+/// share: authenticated receive provenance, encryption, deduplication, and generation-bound sends.
 ///
-/// Each channel's queue, buffered-amount gate and per-kind policy belong to its own
-/// ``DataChannelDrain``, which is also that channel's `LKRTCDataChannelDelegate` — so nothing here
-/// dispatches on channel labels. What a drain cannot answer it hands back: received bytes, and
-/// readiness changes that only matter to the pair.
-///
-/// ## Live readiness vs. the open latch
-/// ``openCompleter`` is a *sticky latch* that resolves the first time **both** channels reach
-/// `.open`, and stays resolved until ``reset(throwing:)``. `room.send(dataPacket:)` awaits it so a
-/// never-connected transport fails in bounded time instead of hanging forever.
-///
-/// It is not a live gate. Each drain decides for itself, per send, whether its own channel can take
-/// bytes — the two are independent SCTP streams, so a lossy blip must not stall reliable sends.
-///
-/// ## Concurrency model
-/// `@unchecked Sendable`. `_state` holds the dedup table and the E2EE manager behind a lock; the
-/// drains own everything else and synchronize themselves.
+/// Each channel owns its queue and flow control in a DataChannelDrain. This type binds those drains
+/// to the Room generation that installed them. A replaced channel can finish an already-running
+/// callback, so every receive is revalidated against the exact channel identity and generation
+/// before it can mutate deduplication state or reach a delegate.
 class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
     // MARK: - Public
 
     let delegates = MulticastDelegate<DataChannelDelegate>(label: "DataChannelDelegate")
+    let openCompleter = AsyncCompleter<Void>(
+        label: "Data channel open",
+        defaultTimeout: .defaultPublisherDataChannelOpen
+    )
 
-    let openCompleter = AsyncCompleter<Void>(label: "Data channel open", defaultTimeout: .defaultPublisherDataChannelOpen)
-
-    /// Whether *both* channels can currently take bytes. Only the open latch and diagnostics use
-    /// this; the send path gates per channel.
     var isOpen: Bool { lossy.isOpen && reliable.isOpen }
+    var sendGeneration: UInt64 { _state.sendGeneration }
+
+    // MARK: - Provenance
+
+    enum ChannelKind: Equatable, Sendable {
+        case lossy
+        case reliable
+    }
+
+    struct ChannelOwnership: Equatable, Sendable {
+        let channelIdentifier: ObjectIdentifier
+        let receiveGeneration: UInt64
+    }
+
+    enum ReceiveAdmission: Equatable, Sendable {
+        case accepted
+        case duplicate
+        case stale
+    }
+
+    struct PreparedSend: Sendable {
+        let packet: Livekit_DataPacket
+        let sendGeneration: UInt64
+        let admission: (@Sendable () -> Bool)?
+    }
 
     // MARK: - Private
 
     private struct State {
-        var reliableReceivedState: TTLDictionary<String, UInt32> = TTLDictionary(ttl: reliableReceivedStateTTL)
+        var lossyChannelIdentifier: ObjectIdentifier?
+        var reliableChannelIdentifier: ObjectIdentifier?
+        var lossyReceiveGeneration: UInt64 = 0
+        var reliableReceiveGeneration: UInt64 = 0
+        var sendGeneration: UInt64 = 0
+        var isResetting = false
+        var lastResetError: Error?
+        var reliableReceivedState = TTLDictionary<String, UInt32>(
+            ttl: DataChannelPair.reliableReceivedStateTTL
+        )
         var e2eeManager: E2EEManager?
     }
 
     private let _state = StateSync(State())
 
-    // Implicitly unwrapped because their message and state callbacks capture `self`, which is not
-    // available until after `super.init()`. Assigned there, never reassigned — and both are set
-    // before `self` escapes to any other thread (the first escape is `set(lossy:)`/`set(reliable:)`
-    // wiring a channel), which is the ordering that makes the unsynchronized reads from WebRTC's
-    // callback threads safe. Keep it that way.
+    // Assigned after super.init and never replaced. Each drain owns the delegate slot of its
+    // currently attached WebRTC channel and rejects callbacks from superseded channels.
     private var lossy: DataChannelDrain<LossyStage>!
     private var reliable: DataChannelDrain<ReliableStage>!
 
     // MARK: - Init
 
-    /// `onBufferStatusChange` is wired only for a pair whose channels send — the publisher's. The
-    /// subscriber's channels are receive-only, so its pair is constructed without reporting rather
-    /// than filtered downstream.
-    init(delegate: DataChannelDelegate? = nil,
-         lossyChannel: LKRTCDataChannel? = nil,
-         reliableChannel: LKRTCDataChannel? = nil,
-         onBufferStatusChange: (@Sendable (Bool, DataChannelKind) -> Void)? = nil)
-    {
+    init(
+        delegate: DataChannelDelegate? = nil,
+        lossyChannel: LKRTCDataChannel? = nil,
+        reliableChannel: LKRTCDataChannel? = nil,
+        receiveGeneration: UInt64 = 0,
+        onBufferStatusChange: (@Sendable (Bool, DataChannelKind) -> Void)? = nil
+    ) {
         super.init()
 
         if let delegate {
@@ -97,9 +124,11 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
             overflow: .dropOldest,
             stage: LossyStage(),
             maxMessageSize: Self.defaultMaxMessageSize,
-            onMessage: { [weak self] data in self?.handle(received: data, isReliable: false) },
+            onMessage: { [weak self] data, channel in
+                self?.handle(received: data, from: channel, kind: .lossy)
+            },
             onStateChange: { [weak self] _ in self?.handleStateChange() },
-            onBufferStatusChange: { isLow in onBufferStatusChange?(isLow, .lossy) },
+            onBufferStatusChange: { isLow in onBufferStatusChange?(isLow, .lossy) }
         )
         reliable = DataChannelDrain(
             label: LKRTCDataChannel.Labels.reliable,
@@ -107,37 +136,62 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
             overflow: .park,
             stage: ReliableStage(retryFloor: Self.reliableRetryAmount),
             maxMessageSize: Self.defaultMaxMessageSize,
-            onMessage: { [weak self] data in self?.handle(received: data, isReliable: true) },
+            onMessage: { [weak self] data, channel in
+                self?.handle(received: data, from: channel, kind: .reliable)
+            },
             onStateChange: { [weak self] _ in self?.handleStateChange() },
-            onBufferStatusChange: { isLow in onBufferStatusChange?(isLow, .reliable) },
+            onBufferStatusChange: { isLow in onBufferStatusChange?(isLow, .reliable) }
         )
 
-        if let lossyChannel { set(lossy: lossyChannel) }
-        if let reliableChannel { set(reliable: reliableChannel) }
+        if let lossyChannel {
+            set(lossy: lossyChannel, receiveGeneration: receiveGeneration)
+        }
+        if let reliableChannel {
+            set(reliable: reliableChannel, receiveGeneration: receiveGeneration)
+        }
     }
 
     // MARK: - Channels
 
-    func set(reliable channel: LKRTCDataChannel?) {
-        reliable.setChannel(channel)
+    func set(reliable channel: LKRTCDataChannel?, receiveGeneration: UInt64) {
+        setChannel(channel, kind: .reliable, receiveGeneration: receiveGeneration)
+    }
+
+    func set(lossy channel: LKRTCDataChannel?, receiveGeneration: UInt64) {
+        setChannel(channel, kind: .lossy, receiveGeneration: receiveGeneration)
+    }
+
+    private func setChannel(
+        _ channel: LKRTCDataChannel?,
+        kind: ChannelKind,
+        receiveGeneration: UInt64
+    ) {
+        _state.mutate { state in
+            switch kind {
+            case .lossy:
+                state.lossyChannelIdentifier = channel.map(ObjectIdentifier.init)
+                state.lossyReceiveGeneration = receiveGeneration
+            case .reliable:
+                state.reliableChannelIdentifier = channel.map(ObjectIdentifier.init)
+                state.reliableReceiveGeneration = receiveGeneration
+            }
+        }
+
+        switch kind {
+        case .lossy:
+            lossy.setChannel(channel)
+        case .reliable:
+            reliable.setChannel(channel)
+        }
         handleStateChange()
     }
 
-    func set(lossy channel: LKRTCDataChannel?) {
-        lossy.setChannel(channel)
-        handleStateChange()
-    }
-
-    /// Resolves the open latch once both channels are usable. Reached from either drain's state
-    /// callback and from a channel swap.
     private func handleStateChange() {
         if isOpen {
             openCompleter.resume(returning: ())
         }
     }
 
-    /// Update the negotiated SCTP max-message-size cap on both channels. Called by the room after
-    /// parsing `a=max-message-size` from the publisher answer SDP. `0` is honored as "no limit".
     func set(maxMessageSize: UInt64) {
         lossy.set(maxMessageSize: maxMessageSize)
         reliable.set(maxMessageSize: maxMessageSize)
@@ -147,107 +201,361 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
         _state.mutate { $0.e2eeManager = e2eeManager }
     }
 
+    /// Advances provenance without replacing the underlying channels, such as during a room move.
+    func advanceReceiveGeneration(to generation: UInt64) {
+        _state.mutate { state in
+            if state.lossyChannelIdentifier != nil, generation >= state.lossyReceiveGeneration {
+                state.lossyReceiveGeneration = generation
+            }
+            if state.reliableChannelIdentifier != nil, generation >= state.reliableReceiveGeneration {
+                state.reliableReceiveGeneration = generation
+            }
+            state.reliableReceivedState.removeAll()
+        }
+    }
+
     func reset(throwing error: Error? = nil) {
-        _state.mutate { $0.reliableReceivedState.removeAll() }
+        let nextGeneration = _state.mutate { state -> UInt64 in
+            state.lossyChannelIdentifier = nil
+            state.reliableChannelIdentifier = nil
+            state.sendGeneration &+= 1
+            state.isResetting = true
+            state.lastResetError = error
+            state.reliableReceivedState.removeAll()
+            return state.sendGeneration
+        }
+
+        // Both fail events are enqueued before a send can observe isResetting == false. A send
+        // prepared under the replacement generation therefore cannot be drained by the teardown
+        // event for its predecessor.
         lossy.reset(throwing: error)
         reliable.reset(throwing: error)
-        // Negotiated per session (from the SDP answer); the next session must not inherit it.
         set(maxMessageSize: Self.defaultMaxMessageSize)
         openCompleter.reset(throwing: error)
-    }
 
-    // MARK: - Send
-
-    func send(userPacket: Livekit_UserPacket, kind: Livekit_DataPacket_Kind) async throws {
-        try await send(dataPacket: .with {
-            $0.kind = kind // TODO: field is deprecated
-            $0.user = userPacket
-        })
-    }
-
-    func send(dataPacket packet: consuming Livekit_DataPacket) async throws {
-        // Encrypt off the event loop: CPU work that doesn't touch ordering.
-        let encryptedPacket = try withEncryption(packet)
-        let isLossy = encryptedPacket.kind == .lossy // TODO: field is deprecated
-
-        // Serialization and sequence assignment happen inside the drain, so the sequence on the
-        // wire matches the FIFO order in which writes reach `sendData`.
-        if isLossy {
-            try await lossy.send(encryptedPacket)
-        } else {
-            try await reliable.send(encryptedPacket)
+        _state.mutate { state in
+            if state.sendGeneration == nextGeneration {
+                state.isResetting = false
+            }
         }
-    }
-
-    private func withEncryption(_ packet: Livekit_DataPacket) throws -> Livekit_DataPacket {
-        guard let e2eeManager = _state.e2eeManager, e2eeManager.isDataChannelEncryptionEnabled,
-              let payload = Livekit_EncryptedPacketPayload(dataPacket: packet) else { return packet }
-        let encrypted: Livekit_EncryptedPacket
-        do {
-            let payloadData = try payload.serializedData()
-            encrypted = try Livekit_EncryptedPacket(rtcPacket: e2eeManager.encrypt(data: payloadData))
-        } catch {
-            throw LiveKitError(.encryptionFailed, internalError: error)
-        }
-        return packet.modifying { $0.encryptedPacket = encrypted }
-    }
-
-    func retryReliable(lastSequence: UInt32) {
-        reliable.submit(command: .replay(after: lastSequence))
     }
 
     // MARK: - Receive
 
-    private func handle(received data: Data, isReliable: Bool) {
+    func currentOwnership(for dataChannel: LKRTCDataChannel) -> ChannelOwnership? {
+        let kind = dataChannel.dataChannelPairKind
+        return _state.read { state in
+            let identifier = ObjectIdentifier(dataChannel)
+            let currentIdentifier: ObjectIdentifier?
+            let generation: UInt64
+            switch kind {
+            case .lossy:
+                currentIdentifier = state.lossyChannelIdentifier
+                generation = state.lossyReceiveGeneration
+            case .reliable:
+                currentIdentifier = state.reliableChannelIdentifier
+                generation = state.reliableReceiveGeneration
+            }
+            guard currentIdentifier == identifier else { return nil }
+            return ChannelOwnership(
+                channelIdentifier: identifier,
+                receiveGeneration: generation
+            )
+        }
+    }
+
+    func admitReceivedPacket(
+        _ dataPacket: Livekit_DataPacket,
+        from kind: ChannelKind,
+        ownership: ChannelOwnership
+    ) -> ReceiveAdmission {
+        _state.mutate { state in
+            guard Self.owns(ownership, kind: kind, state: state) else {
+                return .stale
+            }
+            guard kind == .reliable,
+                  dataPacket.sequence > 0,
+                  !dataPacket.participantSid.isEmpty
+            else {
+                return .accepted
+            }
+            if let lastSequence = state.reliableReceivedState[dataPacket.participantSid],
+               dataPacket.sequence <= lastSequence
+            {
+                return .duplicate
+            }
+            state.reliableReceivedState[dataPacket.participantSid] = dataPacket.sequence
+            return .accepted
+        }
+    }
+
+    private static func owns(
+        _ ownership: ChannelOwnership,
+        kind: ChannelKind,
+        state: State
+    ) -> Bool {
+        switch kind {
+        case .lossy:
+            state.lossyChannelIdentifier == ownership.channelIdentifier &&
+                state.lossyReceiveGeneration == ownership.receiveGeneration
+        case .reliable:
+            state.reliableChannelIdentifier == ownership.channelIdentifier &&
+                state.reliableReceiveGeneration == ownership.receiveGeneration
+        }
+    }
+
+    private func handle(
+        received data: Data,
+        from dataChannel: LKRTCDataChannel,
+        kind: ChannelKind
+    ) {
+        guard let ownership = currentOwnership(for: dataChannel) else {
+            log("Ignoring data message from a superseded data channel", .warning)
+            return
+        }
         guard let dataPacket = try? Livekit_DataPacket(serializedBytes: data) else {
             log("Could not decode data message", .error)
             return
         }
 
-        if isReliable, dataPacket.sequence > 0, !dataPacket.participantSid.isEmpty {
-            // Check and update in one locked step so two concurrent receives for the same sender
-            // can't both pass the dedup gate.
-            let isDuplicate = _state.mutate { state -> Bool in
-                if let lastSeq = state.reliableReceivedState[dataPacket.participantSid], dataPacket.sequence <= lastSeq {
-                    return true
-                }
-                state.reliableReceivedState[dataPacket.participantSid] = dataPacket.sequence
-                return false
-            }
-            if isDuplicate {
-                log("Ignoring duplicate/out-of-order reliable data message", .warning)
-                return
-            }
+        switch admitReceivedPacket(dataPacket, from: kind, ownership: ownership) {
+        case .accepted:
+            break
+        case .duplicate:
+            log("Ignoring duplicate/out-of-order reliable data message", .warning)
+            return
+        case .stale:
+            log("Ignoring data message from a superseded data channel", .warning)
+            return
         }
 
         guard let encryptedPacket = dataPacket.encryptedPacketOrNil,
               let e2eeManager = _state.e2eeManager
         else {
             delegates.notify {
-                $0.dataChannel(self, didReceiveDataPacket: dataPacket, encryptionType: .none)
+                $0.dataChannel(
+                    self,
+                    didReceiveDataPacket: dataPacket,
+                    encryptionType: .none,
+                    receiveGeneration: ownership.receiveGeneration
+                )
             }
             return
         }
 
-        // Captured before decryption: applying the decrypted payload rewrites the oneof, which
-        // clears `encryptedPacket` and with it the type.
         let encryptionType = encryptedPacket.encryptionType.toLKType()
-
         do {
-            let decryptedData = try e2eeManager.handle(encryptedData: encryptedPacket.toRTCEncryptedPacket(), participantIdentity: dataPacket.participantIdentity)
+            let decryptedData = try e2eeManager.handle(
+                encryptedData: encryptedPacket.toRTCEncryptedPacket(),
+                participantIdentity: dataPacket.participantIdentity
+            )
             let decryptedPayload = try Livekit_EncryptedPacketPayload(serializedBytes: decryptedData)
-
             let decrypted = dataPacket.modifying { decryptedPayload.applyTo(&$0) }
 
             delegates.notify { [decrypted] in
-                $0.dataChannel(self, didReceiveDataPacket: decrypted, encryptionType: encryptionType)
+                $0.dataChannel(
+                    self,
+                    didReceiveDataPacket: decrypted,
+                    encryptionType: encryptionType,
+                    receiveGeneration: ownership.receiveGeneration
+                )
             }
         } catch {
             log("Failed to decrypt data packet: \(error)", .error)
             delegates.notify {
-                $0.dataChannel(self, didFailToDecryptDataPacket: dataPacket, error: LiveKitError(.decryptionFailed, internalError: error))
+                $0.dataChannel(
+                    self,
+                    didFailToDecryptDataPacket: dataPacket,
+                    error: LiveKitError(.decryptionFailed, internalError: error),
+                    receiveGeneration: ownership.receiveGeneration
+                )
             }
         }
+    }
+
+    // MARK: - Send
+
+    func send(userPacket: Livekit_UserPacket, kind: Livekit_DataPacket_Kind) async throws {
+        try await send(dataPacket: .with {
+            $0.kind = kind
+            $0.user = userPacket
+        })
+    }
+
+    func send(dataPacket packet: consuming Livekit_DataPacket) async throws {
+        try await send(prepared: prepareSend(dataPacket: packet))
+    }
+
+    func send(
+        dataPacket packet: Livekit_DataPacket,
+        expectedSendGeneration: UInt64
+    ) async throws {
+        try await send(prepared: prepareSend(
+            dataPacket: packet,
+            expectedSendGeneration: expectedSendGeneration
+        ))
+    }
+
+    func send(
+        dataPacket packet: Livekit_DataPacket,
+        expectedSendGeneration: UInt64,
+        admission: @escaping @Sendable () -> Bool
+    ) async throws {
+        try await send(prepared: prepareSend(
+            dataPacket: packet,
+            expectedSendGeneration: expectedSendGeneration,
+            admission: admission
+        ))
+    }
+
+    func prepareSend(dataPacket packet: Livekit_DataPacket) throws -> PreparedSend {
+        let generation = try currentSendGeneration()
+        return PreparedSend(
+            packet: try withEncryption(packet),
+            sendGeneration: generation,
+            admission: nil
+        )
+    }
+
+    private func prepareSend(
+        dataPacket packet: Livekit_DataPacket,
+        expectedSendGeneration: UInt64,
+        admission: (@Sendable () -> Bool)? = nil
+    ) throws -> PreparedSend {
+        let generation = try currentSendGeneration()
+        guard generation == expectedSendGeneration else {
+            throw staleSendError()
+        }
+        return PreparedSend(
+            packet: try withEncryption(packet),
+            sendGeneration: generation,
+            admission: admission
+        )
+    }
+
+    func send(prepared: PreparedSend) async throws {
+        let kind: ChannelKind = prepared.packet.kind == .lossy ? .lossy : .reliable
+        let gate = makeSendAdmission(
+            kind: kind,
+            generation: prepared.sendGeneration,
+            additionalAdmission: prepared.admission
+        )
+        switch kind {
+        case .lossy:
+            try await lossy.send(prepared.packet, admission: gate)
+        case .reliable:
+            try await reliable.send(prepared.packet, admission: gate)
+        }
+    }
+
+    private func currentSendGeneration() throws -> UInt64 {
+        let snapshot = _state.read {
+            ($0.sendGeneration, $0.isResetting, $0.lastResetError)
+        }
+        guard !snapshot.1 else {
+            throw snapshot.2 ?? LiveKitError(
+                .cancelled,
+                message: "Data channel generation is resetting"
+            )
+        }
+        return snapshot.0
+    }
+
+    private func makeSendAdmission(
+        kind: ChannelKind,
+        generation: UInt64,
+        additionalAdmission: (@Sendable () -> Bool)?
+    ) -> DrainSendAdmission {
+        DrainSendAdmission(
+            preflight: { [weak self] in
+                guard let self else {
+                    return LiveKitError(
+                        .cancelled,
+                        message: "Data channel owner was released"
+                    )
+                }
+                return self._state.read { state in
+                    guard !state.isResetting, state.sendGeneration == generation else {
+                        return Self.staleSendError(from: state)
+                    }
+                    guard additionalAdmission?() != false else {
+                        return LiveKitError(
+                            .cancelled,
+                            message: "Data channel send admission was revoked"
+                        )
+                    }
+                    return nil
+                }
+            },
+            attempt: { [weak self] dataChannel, send in
+                guard let self else {
+                    return .rejected(LiveKitError(
+                        .cancelled,
+                        message: "Data channel owner was released"
+                    ))
+                }
+                return self._state.read { state in
+                    guard !state.isResetting, state.sendGeneration == generation else {
+                        return .rejected(Self.staleSendError(from: state))
+                    }
+                    guard additionalAdmission?() != false else {
+                        return .rejected(LiveKitError(
+                            .cancelled,
+                            message: "Data channel send admission was revoked"
+                        ))
+                    }
+                    let currentIdentifier = switch kind {
+                    case .lossy: state.lossyChannelIdentifier
+                    case .reliable: state.reliableChannelIdentifier
+                    }
+                    guard currentIdentifier == ObjectIdentifier(dataChannel) else {
+                        return .unavailable
+                    }
+                    return send() ? .sent : .failed
+                }
+            }
+        )
+    }
+
+    private func withEncryption(_ packet: Livekit_DataPacket) throws -> Livekit_DataPacket {
+        guard let e2eeManager = _state.e2eeManager,
+              e2eeManager.isDataChannelEncryptionEnabled,
+              let payload = Livekit_EncryptedPacketPayload(dataPacket: packet)
+        else {
+            return packet
+        }
+        do {
+            let payloadData = try payload.serializedData()
+            let encrypted = try Livekit_EncryptedPacket(
+                rtcPacket: e2eeManager.encrypt(data: payloadData)
+            )
+            return packet.modifying { $0.encryptedPacket = encrypted }
+        } catch {
+            throw LiveKitError(.encryptionFailed, internalError: error)
+        }
+    }
+
+    func retryReliable(lastSequence: UInt32) {
+        let generation = _state.sendGeneration
+        reliable.submit(
+            command: .replay(after: lastSequence),
+            admission: { [weak self] in
+                self?._state.read {
+                    !$0.isResetting && $0.sendGeneration == generation
+                } ?? false
+            }
+        )
+    }
+
+    private func staleSendError() -> Error {
+        _state.read(Self.staleSendError(from:))
+    }
+
+    private static func staleSendError(from state: State) -> Error {
+        state.lastResetError ?? LiveKitError(
+            .cancelled,
+            message: "Data channel generation changed"
+        )
     }
 
     // MARK: - Sync state
@@ -258,10 +566,10 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
 
     func receiveStates() -> [Livekit_DataChannelReceiveState] {
         _state.read { state in
-            state.reliableReceivedState.map { sid, seq in
+            state.reliableReceivedState.map { sid, sequence in
                 Livekit_DataChannelReceiveState.with {
                     $0.publisherSid = sid
-                    $0.lastSeq = seq
+                    $0.lastSeq = sequence
                 }
             }
         }
@@ -269,38 +577,27 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
 
     // MARK: - Constants
 
-    private static let reliableLowThreshold: UInt64 = 2 * 1024 * 1024 // 2 MB
-
-    /// Deliberately the same as the reliable threshold, even though this channel drops rather than
-    /// queues. A lower mark would make a burst of small publishes drop packets that the transport
-    /// would have flushed in microseconds — and since `DataPublishOptions.reliable` defaults to
-    /// `false`, that burst is the SDK's *default* publish path. Dropping stays reserved for genuine
-    /// sustained overload.
+    private static let reliableLowThreshold: UInt64 = 2 * 1024 * 1024
     private static let lossyLowThreshold: UInt64 = reliableLowThreshold
-
-    // If rtc drains its buffer to 0, keep at least this amount of data for retry.
-    // Should be >= the full backpressure amount to avoid losing packets.
-    private static let reliableRetryAmount: UInt64 = .init(Double(reliableLowThreshold) * 1.25)
+    private static let reliableRetryAmount: UInt64 = .init(
+        Double(reliableLowThreshold) * 1.25
+    )
     private static let reliableReceivedStateTTL: TimeInterval = 30
 
-    /// Default max-message-size assumed before SDP negotiation completes, and
-    /// the upper bound clamp applied to any value parsed from the SDP answer.
-    /// LiveKit/pion advertises ~64 KiB; libwebrtc's internal default is 256 KiB.
+    /// Default before SDP negotiation and the clamp for malformed peer advertisements.
     static let defaultMaxMessageSize: UInt64 = 64000
+}
+
+private extension LKRTCDataChannel {
+    var dataChannelPairKind: DataChannelPair.ChannelKind {
+        label == Labels.lossy ? .lossy : .reliable
+    }
 }
 
 // MARK: - SDP parsing
 
-/// Parses the `a=max-message-size` attribute (RFC 8841) from an SDP string,
-/// returning the value in bytes. Returns `nil` when the attribute is absent
-/// or malformed.
-///
-/// Per RFC 8841, a value of `0` indicates "no limit"; callers downstream
-/// honor that by skipping the send-side size check.
+/// Parses the RFC 8841 max-message-size attribute. A value of zero means no limit.
 func parseSDPMaxMessageSize(_ sdp: String) -> UInt64? {
-    // `components(separatedBy: .newlines)` splits on Unicode scalars, which is
-    // what we want here — `String.split` treats CRLF as a single grapheme and
-    // would leave a stray `\r` on every line of a typical SDP.
     for line in sdp.components(separatedBy: .newlines) {
         let trimmed = line.trimmingCharacters(in: .whitespaces)
         let prefix = "a=max-message-size:"

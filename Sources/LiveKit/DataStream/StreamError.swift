@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-public enum StreamError: Error, Equatable {
+public enum StreamError: Error, Equatable, Sendable {
     /// Unable to open a stream with the same ID more than once.
     case alreadyOpened
 
@@ -26,6 +26,21 @@ public enum StreamError: Error, Equatable {
 
     /// Read length exceeded total length specified in stream header.
     case lengthExceeded
+
+    /// Stream length exceeded the receiver's configured resource limit.
+    case streamSizeExceeded(maximumBytes: Int)
+
+    /// Declared stream length cannot be represented safely on this platform.
+    case invalidDeclaredLength
+
+    /// The receiver already has the configured number of streams open.
+    case tooManyOpenStreams(maximum: Int)
+
+    /// A suspended handler allowed its bounded chunk buffer to fill.
+    case bufferOverflow
+
+    /// The room's bounded incoming packet-event buffer filled.
+    case ingressBufferOverflow
 
     /// Read length less than total length specified in stream header.
     case incomplete
@@ -47,4 +62,7 @@ public enum StreamError: Error, Equatable {
 
     /// Encryption type mismatch between stream header and chunk/trailer.
     case encryptionTypeMismatch(expected: EncryptionType, received: EncryptionType)
+
+    /// A stream fragment was published by a different participant connection than its header.
+    case senderMismatch
 }

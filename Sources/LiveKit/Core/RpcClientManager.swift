@@ -62,8 +62,14 @@ actor RpcClientManager: Loggable {
                     maxRoundTripLatency: TimeInterval = RpcClientManager.defaultMaxRoundTripLatency) async throws -> String
     {
         let room = try requireRoom()
+        guard let destinationConnection = RpcParticipantConnection.resolveCurrent(
+            in: room,
+            identity: destinationIdentity
+        ) else {
+            throw RpcError.builtIn(.recipientDisconnected)
+        }
 
-        let remoteClientProtocol = room.remoteParticipants[destinationIdentity]?.clientProtocol ?? .v0
+        let remoteClientProtocol = destinationConnection.participant.clientProtocol
         let useStreamTransport = remoteClientProtocol >= .v1 && Self.serverSupportsRpcV2(room.serverVersion)
 
         let requestId = UUID().uuidString
@@ -77,21 +83,22 @@ actor RpcClientManager: Loggable {
         let completer = AsyncCompleter<String>(label: "rpc-\(requestId)", defaultTimeout: responseTimeout)
         pendingAcks.insert(requestId)
         pendingResponses[requestId] = PendingRpcResponse(
-            participantIdentity: destinationIdentity,
+            participantConnection: destinationConnection,
             completer: completer,
         )
 
         do {
+            try requireCurrent(destinationConnection, in: room)
             if useStreamTransport {
                 try await publishRequestStream(in: room,
-                                               destinationIdentity: destinationIdentity,
+                                               destinationConnection: destinationConnection,
                                                requestId: requestId,
                                                method: method,
                                                payload: payload,
                                                responseTimeout: effectiveTimeout)
             } else {
                 try await publishRequest(in: room,
-                                         destinationIdentity: destinationIdentity,
+                                         destinationConnection: destinationConnection,
                                          requestId: requestId,
                                          method: method,
                                          payload: payload,
@@ -162,12 +169,21 @@ actor RpcClientManager: Loggable {
     /// because the completer is idempotent.
     func handleIncomingResponse(requestId: String,
                                 payload: String?,
-                                error: RpcError?)
+                                error: RpcError?,
+                                senderIdentity: Participant.Identity,
+                                senderParticipantSid: Participant.Sid?,
+                                dataPacketReceiveGeneration: UInt64)
     {
-        guard let pending = pendingResponses.removeValue(forKey: requestId) else {
+        guard let pending = validatedPending(
+            requestId: requestId,
+            senderIdentity: senderIdentity,
+            senderParticipantSid: senderParticipantSid,
+            dataPacketReceiveGeneration: dataPacketReceiveGeneration
+        ) else {
             log("[Rpc] Response received for unexpected RPC request, id = \(requestId)", .error)
             return
         }
+        pendingResponses.removeValue(forKey: requestId)
         if let error {
             pending.completer.resume(throwing: error)
         } else {
@@ -190,8 +206,13 @@ actor RpcClientManager: Loggable {
         // burning cycles (or worse, hitting `readAll` side effects) on a spoofed
         // payload. After this check passes, both the success and read-failure
         // paths trust the sender and resume the pending call directly.
-        if let pending = pendingResponses[requestId], pending.participantIdentity != senderIdentity {
-            log("[Rpc] Response stream for \(requestId) from wrong sender (expected \(pending.participantIdentity), got \(senderIdentity)); ignoring", .error)
+        guard validatedPending(
+            requestId: requestId,
+            senderIdentity: senderIdentity,
+            senderParticipantSid: reader.info.publisherParticipantSid,
+            dataPacketReceiveGeneration: reader.info.dataPacketReceiveGeneration
+        ) != nil else {
+            log("[Rpc] Response stream for \(requestId) has stale or mismatched sender provenance; ignoring", .error)
             return
         }
 
@@ -201,23 +222,72 @@ actor RpcClientManager: Loggable {
         } catch {
             log("[Rpc] Failed to read v2 RPC response payload for \(requestId): \(error)", .error)
             // Fail the pending call fast instead of letting it hang to responseTimeout.
-            if let pending = pendingResponses.removeValue(forKey: requestId) {
-                pending.completer.resume(throwing: RpcError(code: RpcError.BuiltInError.applicationError.code,
-                                                            message: "Error reading RPC response payload",
-                                                            data: ""))
+            if let pending = validatedPending(
+                requestId: requestId,
+                senderIdentity: senderIdentity,
+                senderParticipantSid: reader.info.publisherParticipantSid,
+                dataPacketReceiveGeneration: reader.info.dataPacketReceiveGeneration
+            ) {
+                pendingResponses.removeValue(forKey: requestId)
+                let rpcError: RpcError = if case StreamError.streamSizeExceeded = error {
+                    .builtIn(.responsePayloadTooLarge)
+                } else {
+                    RpcError(code: RpcError.BuiltInError.applicationError.code,
+                             message: "Error reading RPC response payload",
+                             data: "")
+                }
+                pending.completer.resume(throwing: rpcError)
             }
             return
         }
 
-        guard let pending = pendingResponses.removeValue(forKey: requestId) else {
+        guard let pending = validatedPending(
+            requestId: requestId,
+            senderIdentity: senderIdentity,
+            senderParticipantSid: reader.info.publisherParticipantSid,
+            dataPacketReceiveGeneration: reader.info.dataPacketReceiveGeneration
+        ) else {
             log("[Rpc] Response stream received for unexpected RPC request, id = \(requestId)", .error)
             return
         }
+        pendingResponses.removeValue(forKey: requestId)
         pending.completer.resume(returning: payload)
     }
 
+    func handleIncomingResponseStreamRejection(_ rejection: IncomingStreamRejection) {
+        guard let requestId = rejection.attributes[RpcStreamAttribute.requestId] else {
+            log("[Rpc] Rejected v2 response stream is missing request id", .error)
+            return
+        }
+        guard let pending = validatedPending(
+            requestId: requestId,
+            senderIdentity: rejection.participantIdentity,
+            senderParticipantSid: rejection.publisherParticipantSid,
+            dataPacketReceiveGeneration: rejection.dataPacketReceiveGeneration
+        )
+        else { return }
+        pendingResponses.removeValue(forKey: requestId)
+        let error: RpcError = switch rejection.error {
+        case .streamSizeExceeded, .invalidDeclaredLength:
+            .builtIn(.responsePayloadTooLarge)
+        default:
+            .builtIn(.applicationError)
+        }
+        pending.completer.resume(throwing: error)
+    }
+
     /// Clear the pending-ack flag for a request when an `RpcAck` arrives.
-    func handleIncomingAck(requestId: String) {
+    func handleIncomingAck(requestId: String,
+                           senderIdentity: Participant.Identity,
+                           senderParticipantSid: Participant.Sid?,
+                           dataPacketReceiveGeneration: UInt64)
+    {
+        guard validatedPending(
+            requestId: requestId,
+            senderIdentity: senderIdentity,
+            senderParticipantSid: senderParticipantSid,
+            dataPacketReceiveGeneration: dataPacketReceiveGeneration
+        ) != nil else { return }
         pendingAcks.remove(requestId)
     }
 
@@ -226,8 +296,19 @@ actor RpcClientManager: Loggable {
     /// learns immediately instead of waiting for the user-supplied `responseTimeout`.
     /// AsyncCompleter idempotency makes this safe even if a real response races the
     /// disconnect.
-    func handleParticipantDisconnected(_ identity: Participant.Identity) {
-        let toReap = pendingResponses.filter { $0.value.participantIdentity == identity }
+    func handleParticipantDisconnected(
+        identity: Participant.Identity,
+        participantSid: Participant.Sid,
+        dataPacketReceiveGeneration: UInt64,
+        participant: RemoteParticipant
+    ) {
+        let toReap = pendingResponses.filter {
+            let connection = $0.value.participantConnection
+            return connection.identity == identity &&
+                connection.sid == participantSid &&
+                connection.dataPacketReceiveGeneration == dataPacketReceiveGeneration &&
+                connection.participant === participant
+        }
         for (requestId, pending) in toReap {
             pendingResponses.removeValue(forKey: requestId)
             pendingAcks.remove(requestId)
@@ -263,20 +344,50 @@ actor RpcClientManager: Loggable {
 
     // MARK: - Outgoing wire
 
+    private func validatedPending(
+        requestId: String,
+        senderIdentity: Participant.Identity,
+        senderParticipantSid: Participant.Sid?,
+        dataPacketReceiveGeneration: UInt64?
+    ) -> PendingRpcResponse? {
+        guard let room,
+              let pending = pendingResponses[requestId],
+              let senderParticipantSid,
+              let dataPacketReceiveGeneration
+        else { return nil }
+        let connection = pending.participantConnection
+        guard connection.identity == senderIdentity,
+              connection.sid == senderParticipantSid,
+              connection.dataPacketReceiveGeneration == dataPacketReceiveGeneration,
+              connection.isCurrent(in: room)
+        else { return nil }
+        return pending
+    }
+
+    private func requireCurrent(
+        _ connection: RpcParticipantConnection,
+        in room: Room
+    ) throws {
+        guard connection.isCurrent(in: room) else {
+            throw RpcError.builtIn(.recipientDisconnected)
+        }
+    }
+
     // swiftlint:disable:next function_parameter_count
     private func publishRequest(in room: Room,
-                                destinationIdentity: Participant.Identity,
+                                destinationConnection: RpcParticipantConnection,
                                 requestId: String,
                                 method: String,
                                 payload: String,
                                 responseTimeout: TimeInterval) async throws
     {
+        try requireCurrent(destinationConnection, in: room)
         guard payload.byteLength <= MAX_RPC_PAYLOAD_BYTES else {
             throw RpcError.builtIn(.requestPayloadTooLarge)
         }
 
         let dataPacket = Livekit_DataPacket.with {
-            $0.destinationIdentities = [destinationIdentity.stringValue]
+            $0.destinationIdentities = [destinationConnection.identity.stringValue]
             $0.kind = .reliable
             $0.rpcRequest = Livekit_RpcRequest.with {
                 $0.id = requestId
@@ -287,17 +398,27 @@ actor RpcClientManager: Loggable {
             }
         }
 
-        try await room.send(dataPacket: dataPacket)
+        try requireCurrent(destinationConnection, in: room)
+        let sendGeneration = room.publisherDataChannel.sendGeneration
+        try await room.send(
+            dataPacket: dataPacket,
+            expectedDataChannelSendGeneration: sendGeneration,
+            admission: { destinationConnection.isCurrent(in: room) }
+        )
     }
 
     // swiftlint:disable:next function_parameter_count
     private func publishRequestStream(in room: Room,
-                                      destinationIdentity: Participant.Identity,
+                                      destinationConnection: RpcParticipantConnection,
                                       requestId: String,
                                       method: String,
                                       payload: String,
                                       responseTimeout: TimeInterval) async throws
     {
+        try requireCurrent(destinationConnection, in: room)
+        guard payload.byteLength <= RpcStreamLimits.maximumPayloadBytes else {
+            throw RpcError.builtIn(.requestPayloadTooLarge)
+        }
         let options = StreamTextOptions(
             topic: RpcStreamTopic.request,
             attributes: [
@@ -306,10 +427,16 @@ actor RpcClientManager: Loggable {
                 RpcStreamAttribute.timeoutMs: String(UInt32(responseTimeout * 1000)),
                 RpcStreamAttribute.version: RPC_STREAM_VERSION,
             ],
-            destinationIdentities: [destinationIdentity],
+            destinationIdentities: [destinationConnection.identity],
         )
-        let writer = try await room.localParticipant.streamText(options: options)
+        try requireCurrent(destinationConnection, in: room)
+        let writer = try await room.outgoingStreamManager.streamText(
+            options: options,
+            admission: { destinationConnection.isCurrent(in: room) }
+        )
+        try requireCurrent(destinationConnection, in: room)
         try await writer.write(payload)
+        try requireCurrent(destinationConnection, in: room)
         try await writer.close()
     }
 

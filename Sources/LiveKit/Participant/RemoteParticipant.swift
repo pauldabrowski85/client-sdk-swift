@@ -28,7 +28,10 @@ public class RemoteParticipant: Participant, @unchecked Sendable {
         _state.dataTracks.reduce(into: [:]) { $0[$1.name] = $1 }
     }
 
+    let dataPacketReceiveGeneration: UInt64
+
     init(info: Livekit_ParticipantInfo, room: Room, connectionState: ConnectionState) {
+        dataPacketReceiveGeneration = room.dataPacketReceiveGeneration
         super.init(room: room, sid: Participant.Sid(from: info.sid), identity: Participant.Identity(from: info.identity))
         set(info: info, connectionState: connectionState)
     }
@@ -101,6 +104,7 @@ public class RemoteParticipant: Participant, @unchecked Sendable {
             .compactMap { $0 as? RemoteTrackPublication }
 
         for unpublishRemoteTrackPublication in unpublishRemoteTrackPublications {
+            unpublishRemoteTrackPublication.invalidateSubscriptionAdmissionForOwnershipLoss()
             Task.detached {
                 do {
                     try await self.unpublish(publication: unpublishRemoteTrackPublication)
@@ -111,7 +115,14 @@ public class RemoteParticipant: Participant, @unchecked Sendable {
         }
     }
 
-    func addSubscribedMediaTrack(rtcTrack: LKRTCMediaStreamTrack, rtpReceiver: LKRTCRtpReceiver, trackSid: Track.Sid) async throws {
+    func addSubscribedMediaTrack(
+        rtcTrack: LKRTCMediaStreamTrack,
+        rtpReceiver: LKRTCRtpReceiver,
+        trackSid: Track.Sid,
+        sourceTransport: Transport,
+        receiveGeneration: UInt64,
+        subscriptionAdmission: RemoteTrackSubscriptionAdmissionSnapshot
+    ) async throws {
         let room = try requireRoom()
         let track: Track
 
@@ -126,6 +137,20 @@ public class RemoteParticipant: Participant, @unchecked Sendable {
             }
             throw error
         }
+
+        guard publication.isSubscriptionAdmissionCurrent(subscriptionAdmission) else {
+            rtcTrack.isEnabled = false
+            return
+        }
+
+        try await publication.stopRetainedRemoteTracks()
+
+        guard room.isCurrentMediaSource(
+            sourceTransport,
+            participant: self,
+            publication: publication,
+            receiveGeneration: receiveGeneration
+        ) else { return }
 
         switch rtcTrack.kind {
         case "audio":
@@ -149,18 +174,81 @@ public class RemoteParticipant: Participant, @unchecked Sendable {
             throw error
         }
 
-        await publication.set(track: track)
-        publication.set(subscriptionAllowed: true)
-
-        if let transport = room._state.transport?.subscriber {
-            await track.set(transport: transport, rtpReceiver: rtpReceiver)
-        } else {
-            log("Transport is nil", .error)
+        if !subscriptionAdmission.isLegacy {
+            rtcTrack.isEnabled = false
+            (track as? RemoteAudioTrack)?.volume = 0
         }
 
-        add(publication: publication)
+        let replacedTrack = publication.track
+        guard publication.isSubscriptionAdmissionCurrent(subscriptionAdmission),
+              await publication.replaceSubscribedTrack(
+                  expected: replacedTrack,
+                  with: track,
+                  admission: subscriptionAdmission
+              )
+        else {
+            rtcTrack.isEnabled = false
+            return
+        }
+        if let replacedTrack {
+            try await publication.retireRetainedRemoteTrack(replacedTrack)
+        }
+        guard room.isCurrentMediaSource(
+            sourceTransport,
+            participant: self,
+            publication: publication,
+            track: track,
+            rtcTrack: rtcTrack,
+            receiveGeneration: receiveGeneration
+        ), publication.isSubscriptionAdmissionCurrent(subscriptionAdmission, track: track) else {
+            try await publication.removeStaleTrack(track)
+            return
+        }
+        publication.set(subscriptionAllowed: true)
 
-        try await track.start()
+        await track.set(transport: sourceTransport, rtpReceiver: rtpReceiver)
+        guard room.isCurrentMediaSource(
+            sourceTransport,
+            participant: self,
+            publication: publication,
+            track: track,
+            rtcTrack: rtcTrack,
+            receiveGeneration: receiveGeneration
+        ), publication.isSubscriptionAdmissionCurrent(subscriptionAdmission, track: track) else {
+            await track.set(transport: nil, rtpReceiver: nil)
+            try await publication.removeStaleTrack(track)
+            return
+        }
+
+        guard room.isCurrentMediaSource(
+            sourceTransport,
+            participant: self,
+            publication: publication,
+            track: track,
+            rtcTrack: rtcTrack,
+            receiveGeneration: receiveGeneration
+        ), publication.isSubscriptionAdmissionCurrent(subscriptionAdmission, track: track) else {
+            await track.set(transport: nil, rtpReceiver: nil)
+            try await publication.removeStaleTrack(track)
+            return
+        }
+        try await track.startRemote { exactTrack in
+            publication.activateSubscribedTrack(
+                exactTrack,
+                admission: subscriptionAdmission
+            )
+        }
+        guard room.isCurrentMediaSource(
+            sourceTransport,
+            participant: self,
+            publication: publication,
+            track: track,
+            rtcTrack: rtcTrack,
+            receiveGeneration: receiveGeneration
+        ), publication.isSubscriptionAdmissionCurrent(subscriptionAdmission, track: track) else {
+            try await publication.removeStaleTrack(track)
+            return
+        }
 
         delegates.notify(label: { "participant.didSubscribe \(publication)" }) {
             $0.participant?(self, didSubscribeTrack: publication)
@@ -201,6 +289,8 @@ public class RemoteParticipant: Participant, @unchecked Sendable {
     }
 
     func unpublish(publication: RemoteTrackPublication, notify _notify: Bool = true) async throws {
+        let hadSubscribedTrack = publication.track != nil
+        publication.invalidateSubscriptionAdmissionForOwnershipLoss()
         let room = try requireRoom()
 
         func _notifyUnpublish() async {
@@ -213,17 +303,16 @@ public class RemoteParticipant: Participant, @unchecked Sendable {
             }
         }
 
-        // Remove the publication
-        _state.mutate { $0.trackPublications.removeValue(forKey: publication.sid) }
+        try await publication.stopRetainedRemoteTracks()
 
-        // Continue if the publication has a track
-        guard let track = publication.track else {
-            return await _notifyUnpublish()
+        // Retain the publication, and therefore every exact failed track, until
+        // the stop barrier has completed successfully.
+        _state.mutate { state in
+            guard state.trackPublications[publication.sid] === publication else { return }
+            state.trackPublications.removeValue(forKey: publication.sid)
         }
 
-        try await track.stop()
-
-        if _notify {
+        if _notify, hadSubscribedTrack {
             // Notify unsubscribe
             delegates.notify(label: { "participant.didUnsubscribe \(publication)" }) {
                 $0.participant?(self, didUnsubscribeTrack: publication)
@@ -234,5 +323,12 @@ public class RemoteParticipant: Participant, @unchecked Sendable {
         }
 
         await _notifyUnpublish()
+    }
+
+    func invalidateAllSubscriptionAdmissionsForOwnershipLoss() {
+        let publications = _state.trackPublications.values.compactMap { $0 as? RemoteTrackPublication }
+        for publication in publications {
+            publication.invalidateSubscriptionAdmissionForOwnershipLoss()
+        }
     }
 }

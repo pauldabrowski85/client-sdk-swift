@@ -65,6 +65,10 @@ public final class TextStreamInfo: NSObject, StreamInfo {
     /// participant is replaced and can therefore bind a stream to its sender
     /// epoch without consulting mutable room state.
     public let publisherParticipantSid: Participant.Sid?
+    /// Client-local receive generation captured with the stream header before
+    /// handler dispatch. Combined with the publisher SID, this distinguishes
+    /// delayed work from an earlier transport even when the server reuses a SID.
+    @nonobjc public let dataPacketReceiveGeneration: UInt64?
 
     init(
         id: String,
@@ -79,6 +83,7 @@ public final class TextStreamInfo: NSObject, StreamInfo {
         attachedStreamIDs: [String],
         generated: Bool,
         publisherParticipantSid: Participant.Sid? = nil,
+        dataPacketReceiveGeneration: UInt64? = nil,
     ) {
         self.id = id
         self.topic = topic
@@ -92,6 +97,7 @@ public final class TextStreamInfo: NSObject, StreamInfo {
         self.attachedStreamIDs = attachedStreamIDs
         self.generated = generated
         self.publisherParticipantSid = publisherParticipantSid
+        self.dataPacketReceiveGeneration = dataPacketReceiveGeneration
     }
 }
 

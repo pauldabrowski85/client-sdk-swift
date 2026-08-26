@@ -135,20 +135,38 @@ extension Room: SignalClientDelegate {
     }
 
     func signalClient(_: SignalClient, didReceiveRoomMoved response: Livekit_RoomMovedResponse) async {
+        let receiveGeneration = incrementDataPacketReceiveGeneration()
+        await incomingStreamManager.reset(to: receiveGeneration)
+        let moveError = LiveKitError(.cancelled, message: "Room moved; replacing transports")
+        let wasConnected = _state.connectionState == .connected
+        let supersededTransport = _state.mutate { state -> TransportMode? in
+            let transport = state.transport
+            state.transport = nil
+            return transport
+        }
+        publisherDataChannel.reset(throwing: moveError)
+        subscriberDataChannel.reset(throwing: moveError)
+        await supersededTransport?.close()
+
         log("didReceiveRoomMoved to room: \(response.hasRoom ? response.room.name : "unknown")")
 
         _updateState(for: response)
-        await _disconnectAllParticipants()
 
         if response.hasRoom {
             _notifyRoomMoved(name: response.room.name)
         }
 
-        if response.hasParticipant {
-            localParticipant.set(info: response.participant, connectionState: _state.connectionState)
-        }
+        guard wasConnected else { return }
 
-        _republishLocalTracks()
+        do {
+            try await startReconnect(reason: .transport, nextReconnectMode: .full)
+        } catch {
+            log("Unable to replace transports after room move: \(error)", .error)
+            await disconnect()
+        }
+        if _state.roomOptions.autoRepublishLocalTracksOnFullReconnect {
+            _republishLocalTracks()
+        }
 
         let newParticipants = _addNewParticipants(from: response.otherParticipants)
         _notifyNewParticipants(newParticipants)
@@ -261,10 +279,19 @@ extension Room: SignalClientDelegate {
     func signalClient(_: SignalClient, didUpdateParticipants participants: [Livekit_ParticipantInfo]) async {
         log("participants: \(participants)")
 
-        var disconnectedParticipantIdentities = [Participant.Identity]()
+        let receiveGeneration = dataPacketReceiveGeneration
+        var disconnectedParticipants = [(RemoteParticipant, Participant.Identity, Participant.Sid)]()
         var newParticipants = [RemoteParticipant]()
 
         _state.mutate {
+            for info in participants where info.state == .disconnected {
+                let identity = Participant.Identity(from: info.identity)
+                let sid = Participant.Sid(from: info.sid)
+                if let participant = $0.remoteParticipants[identity], participant.sid == sid {
+                    disconnectedParticipants.append((participant, identity, sid))
+                }
+            }
+
             for info in participants {
                 let infoIdentity = Participant.Identity(from: info.identity)
 
@@ -274,10 +301,10 @@ extension Room: SignalClientDelegate {
                 }
 
                 if info.state == .disconnected {
-                    // when it's disconnected, send updates
-                    disconnectedParticipantIdentities.append(infoIdentity)
+                    continue
                 } else {
-                    let isNewParticipant = $0.remoteParticipants[infoIdentity] == nil
+                    let infoSid = Participant.Sid(from: info.sid)
+                    let isNewParticipant = $0.remoteParticipants[infoIdentity]?.sid != infoSid
                     let participant = $0.updateRemoteParticipant(info: info, room: self)
 
                     if isNewParticipant {
@@ -290,10 +317,15 @@ extension Room: SignalClientDelegate {
         }
 
         await withTaskGroup { group in
-            for identity in disconnectedParticipantIdentities {
+            for (participant, identity, sid) in disconnectedParticipants {
                 group.addTask {
                     do {
-                        try await self._onParticipantDidDisconnect(identity: identity)
+                        try await self._onParticipantDidDisconnect(
+                            participant: participant,
+                            identity: identity,
+                            sid: sid,
+                            receiveGeneration: receiveGeneration
+                        )
                     } catch {
                         self.log("Failed to process participant disconnection, error: \(error)", .error)
                     }
@@ -457,18 +489,6 @@ private extension Room {
         _state.mutate { $0.apply(roomInfo: response.room) }
     }
 
-    func _disconnectAllParticipants() async {
-        // Disconnect all remote participants
-        let participantsToDisconnect = _state.read { Array($0.remoteParticipants.keys) }
-        for identity in participantsToDisconnect {
-            do {
-                try await _onParticipantDidDisconnect(identity: identity)
-            } catch {
-                log("Failed to disconnect participant \(identity) with error: \(error)", .error)
-            }
-        }
-    }
-
     func _notifyRoomMoved(name: String) {
         // Emit room moved event with new room name (on both Room and LocalParticipant delegates)
         delegates.notify(label: { "room.didMoveToRoomNamed \(name)" }) {
@@ -479,35 +499,4 @@ private extension Room {
         }
     }
 
-    func _republishLocalTracks() {
-        // Republish all local tracks to the new room
-        log("Re-publishing local tracks after room move...")
-        Task.detached { [weak self] in
-            guard let self else { return }
-            do {
-                try await localParticipant.republishAllTracks()
-                log("Successfully re-published local tracks after room move")
-            } catch {
-                log("Failed to re-publish local tracks after room move, error: \(error)", .error)
-            }
-        }
-    }
-
-    func _addNewParticipants(from infos: [Livekit_ParticipantInfo]) -> [RemoteParticipant] {
-        // Re-add participants
-        var newParticipants: [RemoteParticipant] = []
-        for info in infos {
-            let participant = _state.mutate { $0.updateRemoteParticipant(info: info, room: self) }
-            newParticipants.append(participant)
-        }
-        return newParticipants
-    }
-
-    func _notifyNewParticipants(_ participants: [RemoteParticipant]) {
-        for participant in participants {
-            delegates.notify(label: { "room.remoteParticipantDidConnect: \(participant)" }) {
-                $0.room?(self, participantDidConnect: participant)
-            }
-        }
-    }
 }

@@ -30,6 +30,8 @@ extension LKRTCPeerConnectionState {
 
 extension Room: TransportDelegate {
     func transport(_ transport: Transport, didUpdateState pcState: LKRTCPeerConnectionState) {
+        let receiveGeneration = transport.dataPacketReceiveGeneration
+        guard isCurrentTransport(transport, receiveGeneration: receiveGeneration) else { return }
         log("target: \(transport.target), connectionState: \(pcState.description)")
 
         let pcError: LiveKitError? = _state.connectionState.isTearingDown ? nil : LiveKitError(
@@ -58,6 +60,10 @@ extension Room: TransportDelegate {
             // Attempt re-connect if primary or publisher transport failed
             if transport.isPrimary || (_state.hasPublished && transport.target == .publisher), pcState.isDisconnected {
                 Task {
+                    guard self.isCurrentTransport(
+                        transport,
+                        receiveGeneration: receiveGeneration
+                    ) else { return }
                     do {
                         try await startReconnect(reason: .transport)
                     } catch {
@@ -69,7 +75,13 @@ extension Room: TransportDelegate {
     }
 
     func transport(_ transport: Transport, didGenerateIceCandidate iceCandidate: IceCandidate) {
+        let receiveGeneration = transport.dataPacketReceiveGeneration
+        guard isCurrentTransport(transport, receiveGeneration: receiveGeneration) else { return }
         Task {
+            guard self.isCurrentTransport(
+                transport,
+                receiveGeneration: receiveGeneration
+            ) else { return }
             do {
                 log("sending iceCandidate")
                 try await signalClient.sendCandidate(candidate: iceCandidate, target: transport.target)
@@ -80,12 +92,23 @@ extension Room: TransportDelegate {
     }
 
     func transport(_ transport: Transport, didAddTrack track: LKRTCMediaStreamTrack, rtpReceiver: LKRTCRtpReceiver, streams: [LKRTCMediaStream]) {
+        // WebRTC delivers remote media enabled. Silence it synchronously at the
+        // ingress boundary, before any execution-queue or Task hop can delay
+        // subscription admission. The exact admitted publication re-enables
+        // the track only inside `activateSubscribedTrack`.
+        track.isEnabled = false
+
         guard !streams.isEmpty else {
             log("Received onTrack with no streams!", .warning)
             return
         }
 
-        guard transport.target == _state.transport?.subscriber.target else { return }
+        let receiveGeneration = transport.dataPacketReceiveGeneration
+        guard isCurrentTransport(
+            transport,
+            receiveGeneration: receiveGeneration,
+            asSubscriber: true
+        ) else { return }
 
         // execute block when connected
         execute(when: { state, _ in state.connectionState == .connected },
@@ -94,31 +117,86 @@ extension Room: TransportDelegate {
         { [weak self] in
             guard let self else { return }
             Task {
-                await self.engine(self, didAddTrack: track, rtpReceiver: rtpReceiver, stream: streams.first!)
+                await self.engine(
+                    self,
+                    didAddTrack: track,
+                    rtpReceiver: rtpReceiver,
+                    stream: streams.first!,
+                    sourceTransport: transport,
+                    receiveGeneration: receiveGeneration
+                )
             }
         }
     }
 
     func transport(_ transport: Transport, didRemoveTrack track: LKRTCMediaStreamTrack) {
-        guard transport.target == _state.transport?.subscriber.target else { return }
+        let receiveGeneration = transport.dataPacketReceiveGeneration
+        guard isCurrentTransport(
+            transport,
+            receiveGeneration: receiveGeneration,
+            asSubscriber: true
+        ) else { return }
 
-        Task {
-            await engine(self, didRemoveTrack: track)
+        execute(when: { state, _ in state.connectionState == .connected },
+                removeWhen: { state, _ in state.connectionState == .disconnected })
+        { [weak self] in
+            guard let self else { return }
+            Task {
+                do {
+                    try await self.engine(
+                        self,
+                        didRemoveTrack: track,
+                        sourceTransport: transport,
+                        receiveGeneration: receiveGeneration
+                    )
+                } catch {
+                    self.log("Failed to retire removed remote track: \(error)", .error)
+                    await self.disconnect()
+                }
+            }
         }
     }
 
     func transport(_ transport: Transport, didOpenDataChannel dataChannel: LKRTCDataChannel) {
         log("Server opened data channel \(dataChannel.label)(\(dataChannel.readyState))")
 
-        guard transport.target == _state.transport?.subscriber.target else { return }
+        let receiveGeneration = transport.dataPacketReceiveGeneration
+        guard isCurrentTransport(
+            transport,
+            receiveGeneration: receiveGeneration,
+            asSubscriber: true
+        ) else { return }
 
         switch dataChannel.label {
-        case LKRTCDataChannel.Labels.reliable: subscriberDataChannel.set(reliable: dataChannel)
-        case LKRTCDataChannel.Labels.lossy: subscriberDataChannel.set(lossy: dataChannel)
+        case LKRTCDataChannel.Labels.reliable:
+            subscriberDataChannel.set(
+                reliable: dataChannel,
+                receiveGeneration: receiveGeneration
+            )
+        case LKRTCDataChannel.Labels.lossy:
+            subscriberDataChannel.set(
+                lossy: dataChannel,
+                receiveGeneration: receiveGeneration
+            )
         case LKRTCDataChannel.Labels.dataTrack: dataTracks?.setSubscriberChannel(dataChannel)
         default: log("Unknown data channel label \(dataChannel.label)", .warning)
         }
     }
 
     func transportShouldNegotiate(_: Transport) {}
+
+    func isCurrentTransport(
+        _ transport: Transport,
+        receiveGeneration: UInt64,
+        asSubscriber: Bool = false
+    ) -> Bool {
+        guard receiveGeneration == dataPacketReceiveGeneration,
+              transport.dataPacketReceiveGeneration == receiveGeneration
+        else { return false }
+        return _state.read { state in
+            guard let current = state.transport else { return false }
+            if asSubscriber { return current.subscriber === transport }
+            return current.allTransports.contains { $0 === transport }
+        }
+    }
 }
