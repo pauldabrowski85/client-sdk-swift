@@ -38,7 +38,7 @@ class DeviceManager: @unchecked Sendable, Loggable {
     }
 
     #if os(iOS) || os(macOS) || os(tvOS)
-    private lazy var discoverySession: AVCaptureDevice.DiscoverySession = {
+    private let discoverySession: AVCaptureDevice.DiscoverySession = {
         var deviceTypes: [AVCaptureDevice.DeviceType]
         #if os(iOS) || os(tvOS)
         // In order of priority
