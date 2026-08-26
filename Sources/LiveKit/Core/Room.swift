@@ -35,7 +35,7 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
 
     // MARK: - Metrics
 
-    lazy var metricsManager = MetricsManager()
+    let metricsManager = MetricsManager()
 
     // MARK: - Public
 
@@ -394,6 +394,17 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
         super.init()
         // log sdk & os versions
         log("sdk: \(LiveKitSDK.version), ffi: \(LiveKitSDK.ffiVersion), os: \(String(describing: Utils.os()))(\(Utils.osVersionString())), modelId: \(String(describing: Utils.modelIdentifier() ?? "unknown"))")
+
+        // Force initialization while the initializer still exclusively owns self.
+        // Swift lazy initialization is not atomic, and these members are reachable
+        // from independent isolation domains after the delegate and tasks below
+        // publish the Room.
+        _ = localParticipant
+        _ = subscriberDataChannel
+        _ = publisherDataChannel
+        _ = incomingStreamManager
+        _ = outgoingStreamManager
+        _ = preConnectBuffer
 
         signalClient._delegate.set(delegate: self)
 

@@ -1,0 +1,1 @@
+patch type="fixed" "Fix data races on Room's lazily initialized members by initializing them before the Room escapes its initializer"
