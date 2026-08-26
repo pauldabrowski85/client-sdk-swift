@@ -312,6 +312,7 @@ struct RoomTransportOwnershipTests {
             let publication = try #require(
                 fixture.original.trackPublications[fixture.trackSid] as? RemoteTrackPublication
             )
+            publication.remoteAudioPlayoutCoordinator = makeTransportPlayoutCoordinator()
             let admission = try publication.admitSubscription()
             let enteredSubscribeSignal = TestMediaGate()
             let releaseSubscribeSignal = TestMediaGate()
@@ -815,6 +816,47 @@ private actor TestMediaGate {
         waiters.removeAll()
         continuations.forEach { $0.resume() }
     }
+}
+
+private func makeTransportPlayoutCoordinator() -> RemoteAudioPlayoutCoordinator {
+    let lifecycle = StateSync(RemoteAudioDeviceLifecycleSnapshot(
+        isPlaying: false,
+        isRecording: false,
+        isEngineRunning: false
+    ))
+    let driver = RemoteAudioPlayoutDriver(
+        acquirePlaybackSession: { SessionRequirementHandle {} },
+        isPlayoutInitialized: { true },
+        initializePlayout: {},
+        isPlaying: { lifecycle.isPlaying },
+        isRecording: { lifecycle.isRecording },
+        isEngineRunning: { lifecycle.isEngineRunning },
+        startPlayout: {
+            lifecycle.mutate {
+                $0 = RemoteAudioDeviceLifecycleSnapshot(
+                    isPlaying: true,
+                    isRecording: $0.isRecording,
+                    isEngineRunning: true
+                )
+            }
+        },
+        stopPlayoutWithRecordingProof: {
+            let before = lifecycle.copy()
+            lifecycle.mutate {
+                $0 = RemoteAudioDeviceLifecycleSnapshot(
+                    isPlaying: false,
+                    isRecording: $0.isRecording,
+                    isEngineRunning: $0.isRecording
+                )
+            }
+            return RemoteAudioPlayoutStopObservation(
+                recordingBeforeStop: before.isRecording,
+                recordingTransitionWasStable: true,
+                afterStop: lifecycle.copy()
+            )
+        }
+    )
+    return RemoteAudioPlayoutCoordinator(driver: driver)
 }
 
 private struct TransportOwnershipFixture {

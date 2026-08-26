@@ -38,7 +38,6 @@ struct LocalParticipantPublishCancellationTests {
             transport: .publisherOnly(publisher: publisher)
         )
         room._state.mutate {
-            $0.connectionState = .connected
             $0.stage = .connected(join)
         }
         room.localParticipant.set(
