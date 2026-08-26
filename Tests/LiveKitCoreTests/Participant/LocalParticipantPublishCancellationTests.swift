@@ -22,15 +22,24 @@ import Testing
 struct LocalParticipantPublishCancellationTests {
     @Test func cancellationBeforePublicationCommitStopsExactTrackAndDoesNotInsert() async throws {
         let room = Room()
+        let connection = ConnectionDependencies(
+            room: room,
+            roomOptions: room._state.roomOptions
+        )
+        let transportDelegate = PublishCancellationTransportDelegate()
         let publisher = try Transport(
             config: .liveKitDefault(),
             target: .publisher,
             primary: true,
-            delegate: room
+            delegate: transportDelegate
+        )
+        let join = JoinDependencies(
+            connection: connection,
+            transport: .publisherOnly(publisher: publisher)
         )
         room._state.mutate {
             $0.connectionState = .connected
-            $0.transport = .publisherOnly(publisher: publisher)
+            $0.stage = .connected(join)
         }
         room.localParticipant.set(
             info: .with {
@@ -46,15 +55,14 @@ struct LocalParticipantPublishCancellationTests {
         let track = CancellationProbeAudioTrack(
             captureStarted: captureStarted,
             releaseStart: releaseStart,
-            stopFailures: 1
+            stopFailures: 1,
+            cancelAfterCapture: true
         )
         let task = Task {
             try await room.localParticipant._publish(track: track)
         }
 
         await captureStarted.wait()
-        task.cancel()
-        #expect(task.isCancelled)
         releaseStart.open()
 
         await #expect(throws: CancellationError.self) {
@@ -70,6 +78,41 @@ struct LocalParticipantPublishCancellationTests {
         #expect(track.stopAttemptCount.copy() == 2)
         #expect(room.localParticipant.failedPublishTrackCount == 0)
         await publisher.close()
+    }
+
+    @Test func cancellationAtPublicationCommitNeverInsertsTheTrack() async throws {
+        let room = Room()
+        let captureStarted = PublishCancellationGate()
+        let releaseStart = PublishCancellationGate()
+        releaseStart.open()
+        let track = CancellationProbeAudioTrack(
+            captureStarted: captureStarted,
+            releaseStart: releaseStart,
+            stopFailures: 0
+        )
+        try await track.start()
+
+        let commit = Task {
+            withUnsafeCurrentTask { $0?.cancel() }
+            return try await room.localParticipant.commitPublishedTrack(
+                track,
+                trackInfo: .with {
+                    $0.sid = "TR_cancelled-commit"
+                    $0.name = track.name
+                    $0.type = .audio
+                    $0.source = .microphone
+                },
+                options: nil,
+                room: room
+            )
+        }
+
+        await #expect(throws: CancellationError.self) {
+            try await commit.value
+        }
+        #expect(room.localParticipant.trackPublications.isEmpty)
+        #expect(track.trackState == .started)
+        try await track.stop()
     }
 
     @Test func failedUnpublishRetainsExactTrackUntilCaptureStopIsConfirmed() async throws {
@@ -120,15 +163,18 @@ private final class CancellationProbeAudioTrack: LocalAudioTrack, @unchecked Sen
     private let captureStarted: PublishCancellationGate
     private let releaseStart: PublishCancellationGate
     private let stopFailures: Int
+    private let cancelAfterCapture: Bool
 
     init(
         captureStarted: PublishCancellationGate,
         releaseStart: PublishCancellationGate,
-        stopFailures: Int
+        stopFailures: Int,
+        cancelAfterCapture: Bool = false
     ) {
         self.captureStarted = captureStarted
         self.releaseStart = releaseStart
         self.stopFailures = stopFailures
+        self.cancelAfterCapture = cancelAfterCapture
         let source = RTC.createAudioSource(nil)
         let mediaTrack = RTC.peerConnectionFactory.audioTrack(
             with: source,
@@ -146,6 +192,10 @@ private final class CancellationProbeAudioTrack: LocalAudioTrack, @unchecked Sen
     override func startCapture() async throws {
         captureStarted.open()
         await releaseStart.wait()
+        if cancelAfterCapture {
+            set(trackState: .started)
+            throw CancellationError()
+        }
     }
 
     override func stopCapture() async throws {
@@ -155,6 +205,20 @@ private final class CancellationProbeAudioTrack: LocalAudioTrack, @unchecked Sen
         }
         if attempt <= stopFailures { throw ProbeError.stopFailed }
     }
+}
+
+private final class PublishCancellationTransportDelegate: TransportDelegate, @unchecked Sendable {
+    func transport(_: Transport, didUpdateState _: LKRTCPeerConnectionState) {}
+    func transport(_: Transport, didGenerateIceCandidate _: IceCandidate) {}
+    func transport(_: Transport, didOpenDataChannel _: LKRTCDataChannel) {}
+    func transport(
+        _: Transport,
+        didAddTrack _: LKRTCMediaStreamTrack,
+        rtpReceiver _: LKRTCRtpReceiver,
+        streams _: [LKRTCMediaStream]
+    ) {}
+    func transport(_: Transport, didRemoveTrack _: LKRTCMediaStreamTrack) {}
+    func transportShouldNegotiate(_: Transport) {}
 }
 
 private final class PublishCancellationGate: @unchecked Sendable {

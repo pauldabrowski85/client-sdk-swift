@@ -95,7 +95,12 @@ public class TrackPublication: NSObject, @unchecked Sendable, ObservableObject, 
         var isSubscribePreferred: Bool?
         var isMetadataMuted: Bool = false
         var subscriptionAdmission = RemoteSubscriptionAdmissionState()
+        var remoteAudioPlayoutOwner: RemoteAudioPlayoutOwner?
+        var remoteAudioPlayoutOwnerNeedsRelease = false
+        var remoteAudioLegacyDemandOwner: RemoteAudioLegacyDemandOwner?
+        var remoteAudioLegacyDemandOwnerNeedsRelease = false
         var failedRemoteRevocationTracks: [ObjectIdentifier: Track] = [:]
+        var failedRemoteTrackRetirementGeneration: UInt64 = 0
         var encryptionType: EncryptionType = .none
 
         var latestInfo: Livekit_TrackInfo?

@@ -251,11 +251,21 @@ public class RemoteParticipant: Participant, @unchecked Sendable {
             try await publication.removeStaleTrack(track)
             return
         }
-        try await track.startRemote { exactTrack in
-            publication.activateSubscribedTrack(
-                exactTrack,
-                admission: subscriptionAdmission
-            )
+        do {
+            try await track.startRemote { exactTrack in
+                try await publication.activateSubscribedTrack(
+                    exactTrack,
+                    admission: subscriptionAdmission
+                )
+            }
+        } catch {
+            publication.invalidateSubscriptionAdmissionForOwnershipLoss()
+            do {
+                try await publication.removeStaleTrack(track)
+            } catch let retirementError {
+                throw retirementError
+            }
+            throw error
         }
         guard room.isCurrentMediaSource(
             sourceTransport,

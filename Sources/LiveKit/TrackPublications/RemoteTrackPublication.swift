@@ -51,6 +51,7 @@ public class RemoteTrackPublication: TrackPublication, @unchecked Sendable {
 
     private let _subscriptionSerialRunner = SerialRunnerActor<Void>()
     var subscriptionRequestSender: SubscriptionRequestSender?
+    var remoteAudioPlayoutCoordinator = RemoteAudioPlayoutCoordinator.shared
 
     // MARK: - Public
 
@@ -105,8 +106,13 @@ public class RemoteTrackPublication: TrackPublication, @unchecked Sendable {
     public func admitSubscription() throws -> RemoteTrackSubscriptionAdmission {
         try _state.mutate { state in
             let admission = state.subscriptionAdmission
-            guard admission.revocationInFlightCount == 0,
-                  !admission.revocationNeedsRetry
+            guard state.isSubscriptionAllowed,
+                  admission.revocationInFlightCount == 0,
+                  !admission.revocationNeedsRetry,
+                  state.remoteAudioPlayoutOwner == nil,
+                  !state.remoteAudioPlayoutOwnerNeedsRelease,
+                  state.remoteAudioLegacyDemandOwner == nil,
+                  !state.remoteAudioLegacyDemandOwnerNeedsRelease
             else {
                 throw LiveKitError(
                     .invalidState,
@@ -133,7 +139,10 @@ public class RemoteTrackPublication: TrackPublication, @unchecked Sendable {
         admission: RemoteTrackSubscriptionAdmission
     ) async throws {
         guard newValue else {
-            try await revokeSubscription()
+            try await revokeSubscription(
+                requiresExplicitAdmission: true,
+                matching: admission
+            )
             return
         }
         let snapshot = try snapshot(for: admission)
@@ -271,23 +280,25 @@ public class RemoteTrackPublication: TrackPublication, @unchecked Sendable {
         admission: RemoteTrackSubscriptionAdmissionSnapshot?
     ) async -> Bool {
         newValue?.add(delegate: self)
-        let didReplace = _state.mutate { state -> Bool in
+        let didReplace = admitFailedRemoteTrackRetirement { state -> (Bool, Bool) in
             if let admission, !Self.matches(admission, state: state) {
-                return false
+                return (false, false)
             }
             let ownsExpectedTrack = switch (state.track, expected) {
             case (nil, nil): true
             case let (current?, expected?): current === expected
             default: false
             }
-            guard ownsExpectedTrack else { return false }
+            guard ownsExpectedTrack else { return (false, false) }
+            var admittedRetirement = false
             if let expected, expected !== newValue {
                 Self.silenceAndDetach(expected)
                 state.failedRemoteRevocationTracks[ObjectIdentifier(expected)] = expected
                 state.subscriptionAdmission.revocationNeedsRetry = true
+                admittedRetirement = true
             }
             state.track = newValue
-            return true
+            return (true, admittedRetirement)
         }
         guard didReplace else {
             newValue?.remove(delegate: self)
@@ -331,16 +342,30 @@ public class RemoteTrackPublication: TrackPublication, @unchecked Sendable {
             await track.set(transport: nil, rtpReceiver: nil)
         } catch {
             await track.set(transport: nil, rtpReceiver: nil)
+            (participant as? RemoteParticipant)?._room?.retainFailedRemoteTrackRetirement(self)
             throw error
         }
 
-        _state.mutate { state in
+        let completedGeneration = _state.mutate { state -> UInt64? in
             state.failedRemoteRevocationTracks.removeValue(forKey: ObjectIdentifier(track))
             if state.failedRemoteRevocationTracks.isEmpty,
+               !state.remoteAudioPlayoutOwnerNeedsRelease,
+               !state.remoteAudioLegacyDemandOwnerNeedsRelease,
                state.subscriptionAdmission.revocationInFlightCount == 0
             {
                 state.subscriptionAdmission.revocationNeedsRetry = false
             }
+            guard state.failedRemoteRevocationTracks.isEmpty,
+                  !state.remoteAudioPlayoutOwnerNeedsRelease,
+                  !state.remoteAudioLegacyDemandOwnerNeedsRelease
+            else { return nil }
+            return state.failedRemoteTrackRetirementGeneration
+        }
+        if let completedGeneration {
+            (participant as? RemoteParticipant)?._room?.releaseFailedRemoteTrackRetirement(
+                self,
+                generation: completedGeneration
+            )
         }
     }
 
@@ -356,6 +381,69 @@ public class RemoteTrackPublication: TrackPublication, @unchecked Sendable {
             } catch {
                 if firstError == nil { firstError = error }
             }
+        }
+        let ownerToRelease = _state.read { state in
+            state.remoteAudioPlayoutOwnerNeedsRelease ? state.remoteAudioPlayoutOwner : nil
+        }
+        if let ownerToRelease {
+            do {
+                try await remoteAudioPlayoutCoordinator.release(owner: ownerToRelease)
+                _state.mutate { state in
+                    guard state.remoteAudioPlayoutOwner == ownerToRelease else { return }
+                    state.remoteAudioPlayoutOwner = nil
+                    state.remoteAudioPlayoutOwnerNeedsRelease = false
+                }
+            } catch {
+                (participant as? RemoteParticipant)?._room?.retainFailedRemoteTrackRetirement(self)
+                if firstError == nil { firstError = error }
+            }
+        } else {
+            _state.mutate { state in
+                guard state.remoteAudioPlayoutOwnerNeedsRelease,
+                      state.remoteAudioPlayoutOwner == nil
+                else { return }
+                state.remoteAudioPlayoutOwnerNeedsRelease = false
+            }
+        }
+        let legacyOwnerToRelease = _state.read { state in
+            state.remoteAudioLegacyDemandOwnerNeedsRelease ? state.remoteAudioLegacyDemandOwner : nil
+        }
+        if let legacyOwnerToRelease {
+            do {
+                try await remoteAudioPlayoutCoordinator.releaseLegacyDemand(owner: legacyOwnerToRelease)
+                _state.mutate { state in
+                    guard state.remoteAudioLegacyDemandOwner == legacyOwnerToRelease else { return }
+                    state.remoteAudioLegacyDemandOwner = nil
+                    state.remoteAudioLegacyDemandOwnerNeedsRelease = false
+                }
+            } catch {
+                (participant as? RemoteParticipant)?._room?.retainFailedRemoteTrackRetirement(self)
+                if firstError == nil { firstError = error }
+            }
+        } else {
+            _state.mutate { state in
+                guard state.remoteAudioLegacyDemandOwnerNeedsRelease,
+                      state.remoteAudioLegacyDemandOwner == nil
+                else { return }
+                state.remoteAudioLegacyDemandOwnerNeedsRelease = false
+            }
+        }
+        let completedGeneration = _state.read { state -> UInt64? in
+            guard state.failedRemoteRevocationTracks.isEmpty,
+                  !state.remoteAudioPlayoutOwnerNeedsRelease,
+                  !state.remoteAudioLegacyDemandOwnerNeedsRelease
+            else { return nil }
+            return state.failedRemoteTrackRetirementGeneration
+        }
+        if let completedGeneration {
+            _state.mutate { state in
+                guard state.subscriptionAdmission.revocationInFlightCount == 0 else { return }
+                state.subscriptionAdmission.revocationNeedsRetry = false
+            }
+            (participant as? RemoteParticipant)?._room?.releaseFailedRemoteTrackRetirement(
+                self,
+                generation: completedGeneration
+            )
         }
         if let firstError { throw firstError }
     }
@@ -398,42 +486,102 @@ public class RemoteTrackPublication: TrackPublication, @unchecked Sendable {
     func activateSubscribedTrack(
         _ track: Track,
         admission: RemoteTrackSubscriptionAdmissionSnapshot
+    ) async throws -> Bool {
+        if track is RemoteAudioTrack, admission.isLegacy {
+            let owner = try prepareRemoteAudioLegacyDemandOwner(for: admission)
+            if let owner {
+                do {
+                    try await remoteAudioPlayoutCoordinator.reserveLegacyDemand(
+                        owner: owner,
+                        admissionIsCurrent: { [weak self, weak track] in
+                            guard let self, let track else { return false }
+                            return isSubscriptionAdmissionCurrent(admission, track: track) &&
+                                _state.read { state in
+                                    state.remoteAudioLegacyDemandOwner == owner &&
+                                        !state.remoteAudioLegacyDemandOwnerNeedsRelease
+                                }
+                        }
+                    )
+                    try await remoteAudioPlayoutCoordinator.validateLegacyDemand(
+                        owner: owner,
+                        admissionIsCurrent: { [weak self, weak track] in
+                            guard let self, let track else { return false }
+                            return isSubscriptionAdmissionCurrent(admission, track: track)
+                        }
+                    )
+                } catch {
+                    markRemoteAudioLegacyDemandOwnerForRelease(owner)
+                    try await stopRetainedRemoteTracks()
+                    throw error
+                }
+            }
+        }
+
+        guard let audioTrack = track as? RemoteAudioTrack,
+              !admission.isLegacy
+        else {
+            return activateSubscribedTrackAfterPlayout(
+                track,
+                admission: admission,
+                audioTrack: nil
+            )
+        }
+
+        guard let owner = _state.read({ state -> RemoteAudioPlayoutOwner? in
+            guard Self.matches(admission, state: state),
+                  !state.remoteAudioPlayoutOwnerNeedsRelease
+            else { return nil }
+            return state.remoteAudioPlayoutOwner
+        }) else {
+            return false
+        }
+
+        try await remoteAudioPlayoutCoordinator.validate(owner: owner) { [weak self, weak track] in
+            guard let self, let track else { return false }
+            return isSubscriptionAdmissionCurrent(admission, track: track) &&
+                _state.read { state in
+                    state.remoteAudioPlayoutOwner == owner &&
+                        !state.remoteAudioPlayoutOwnerNeedsRelease
+                }
+        }
+
+        let activated = activateSubscribedTrackAfterPlayout(
+            track,
+            admission: admission,
+            audioTrack: audioTrack
+        )
+        return activated
+    }
+
+    private func activateSubscribedTrackAfterPlayout(
+        _ track: Track,
+        admission: RemoteTrackSubscriptionAdmissionSnapshot,
+        audioTrack: RemoteAudioTrack?
     ) -> Bool {
         _state.mutate { state in
             guard Self.matches(admission, state: state),
                   !state.subscriptionAdmission.revocationNeedsRetry,
                   state.track === track
             else { return false }
+            track._state.mutate { $0.trackState = .started }
+            if let audioTrack {
+                audioTrack.volume = 1
+            }
             // Enabled inside the admission lock so a revoked admission cannot race it. Like
             // `RemoteAudioTrack.volume`, this is a blocking hop onto the RTC executor.
             track.mediaTrack.blocking { $0.isEnabled = true }
-            track._state.mutate { $0.trackState = .started }
-            if let audioTrack = track as? RemoteAudioTrack, !admission.isLegacy {
-                audioTrack.volume = 1
-            }
             return true
         }
     }
 
     func invalidateSubscriptionAdmissionForOwnershipLoss() {
-        let detachedTrack = _state.mutate { state -> Track? in
-            state.subscriptionAdmission.generation &+= 1
-            state.subscriptionAdmission.mode = .revoked
-            state.subscriptionAdmission.requiresExplicitAdmission = true
-            state.subscriptionAdmission.revocationNeedsRetry = true
-            state.isSubscribePreferred = false
-            let detached = state.track
-            if let detached {
-                Self.silenceAndDetach(detached)
-                state.failedRemoteRevocationTracks[ObjectIdentifier(detached)] = detached
-                state.track = nil
-            }
-            for track in state.failedRemoteRevocationTracks.values {
-                Self.silenceAndDetach(track)
-            }
-            return detached
+        let participant = participant as? RemoteParticipant
+        let room = participant?._room
+        let result = admitFailedRemoteTrackRetirement(room: room) { state in
+            let result = Self.revokeForOwnershipLoss(state: &state)
+            return (result, result.requiresRetirement)
         }
-        detachedTrack?.remove(delegate: self)
+        result.track?.remove(delegate: self)
         _asTimer.cancel()
     }
 }
@@ -447,6 +595,22 @@ private extension RemoteTrackPublication {
         let room: Room?
     }
 
+    func admitFailedRemoteTrackRetirement<Result>(
+        room: Room? = nil,
+        _ mutation: (inout TrackPublication.State) throws -> (Result, Bool)
+    ) rethrows -> Result {
+        if let room = room ?? (participant as? RemoteParticipant)?._room {
+            return try room.admitFailedRemoteTrackRetirement(self, mutation)
+        }
+        return try _state.mutate { state in
+            let (result, admittedWork) = try mutation(&state)
+            if admittedWork {
+                state.failedRemoteTrackRetirementGeneration &+= 1
+            }
+            return result
+        }
+    }
+
     func beginLegacySubscription() throws -> RemoteTrackSubscriptionAdmissionSnapshot {
         try _state.mutate { state in
             guard !state.subscriptionAdmission.requiresExplicitAdmission else {
@@ -456,7 +620,11 @@ private extension RemoteTrackPublication {
                 )
             }
             guard state.subscriptionAdmission.revocationInFlightCount == 0,
-                  !state.subscriptionAdmission.revocationNeedsRetry
+                  !state.subscriptionAdmission.revocationNeedsRetry,
+                  state.remoteAudioPlayoutOwner == nil,
+                  !state.remoteAudioPlayoutOwnerNeedsRelease,
+                  state.remoteAudioLegacyDemandOwner == nil,
+                  !state.remoteAudioLegacyDemandOwnerNeedsRelease
             else {
                 throw LiveKitError(
                     .invalidState,
@@ -494,6 +662,92 @@ private extension RemoteTrackPublication {
         }
     }
 
+    func prepareRemoteAudioPlayoutOwner(
+        for snapshot: RemoteTrackSubscriptionAdmissionSnapshot
+    ) throws -> RemoteAudioPlayoutOwner? {
+        guard kind == .audio, !snapshot.isLegacy,
+              let admissionTokenNonce = snapshot.tokenNonce
+        else { return nil }
+
+        return try _state.mutate { state in
+            guard Self.matches(snapshot, state: state),
+                  !state.remoteAudioPlayoutOwnerNeedsRelease
+            else {
+                throw LiveKitError(.invalidState, message: "Subscription admission was revoked")
+            }
+            if let owner = state.remoteAudioPlayoutOwner {
+                guard owner.publicationNonce == snapshot.publicationNonce,
+                      owner.admissionGeneration == snapshot.generation,
+                      owner.admissionTokenNonce == admissionTokenNonce
+                else {
+                    throw LiveKitError(
+                        .invalidState,
+                        message: "A different protected audio admission still owns playout"
+                    )
+                }
+                return owner
+            }
+            let owner = RemoteAudioPlayoutOwner(
+                publicationNonce: snapshot.publicationNonce,
+                admissionGeneration: snapshot.generation,
+                admissionTokenNonce: admissionTokenNonce
+            )
+            state.remoteAudioPlayoutOwner = owner
+            return owner
+        }
+    }
+
+    func prepareRemoteAudioLegacyDemandOwner(
+        for snapshot: RemoteTrackSubscriptionAdmissionSnapshot
+    ) throws -> RemoteAudioLegacyDemandOwner? {
+        guard kind == .audio, snapshot.isLegacy else { return nil }
+        return try _state.mutate { state in
+            guard Self.matches(snapshot, state: state),
+                  !state.remoteAudioLegacyDemandOwnerNeedsRelease
+            else {
+                throw LiveKitError(.invalidState, message: "Legacy subscription admission was revoked")
+            }
+            if let owner = state.remoteAudioLegacyDemandOwner { return owner }
+            let owner = RemoteAudioLegacyDemandOwner(
+                publicationNonce: snapshot.publicationNonce,
+                admissionGeneration: snapshot.generation
+            )
+            state.remoteAudioLegacyDemandOwner = owner
+            return owner
+        }
+    }
+
+    func isCurrentPlayoutOwner(
+        _ owner: RemoteAudioPlayoutOwner,
+        snapshot: RemoteTrackSubscriptionAdmissionSnapshot,
+        participant: RemoteParticipant,
+        in room: Room
+    ) -> Bool {
+        isCurrentSubscription(snapshot, participant: participant, in: room) &&
+            _state.read { state in
+                state.remoteAudioPlayoutOwner == owner &&
+                    !state.remoteAudioPlayoutOwnerNeedsRelease
+            }
+    }
+
+    func markRemoteAudioPlayoutOwnerForRelease(_ owner: RemoteAudioPlayoutOwner) {
+        _ = admitFailedRemoteTrackRetirement { state -> (Bool, Bool) in
+            guard state.remoteAudioPlayoutOwner == owner else { return (false, false) }
+            state.remoteAudioPlayoutOwnerNeedsRelease = true
+            state.subscriptionAdmission.revocationNeedsRetry = true
+            return (true, true)
+        }
+    }
+
+    func markRemoteAudioLegacyDemandOwnerForRelease(_ owner: RemoteAudioLegacyDemandOwner) {
+        _ = admitFailedRemoteTrackRetirement { state -> (Bool, Bool) in
+            guard state.remoteAudioLegacyDemandOwner == owner else { return (false, false) }
+            state.remoteAudioLegacyDemandOwnerNeedsRelease = true
+            state.subscriptionAdmission.revocationNeedsRetry = true
+            return (true, true)
+        }
+    }
+
     func setSubscribed(snapshot: RemoteTrackSubscriptionAdmissionSnapshot) async throws {
         try await _subscriptionSerialRunner.run { [weak self] in
             guard let self else { return }
@@ -507,8 +761,84 @@ private extension RemoteTrackPublication {
             }
 
             try requireCurrentSubscription(snapshot, participant: participant, in: room)
+            let legacyDemandOwner = try prepareRemoteAudioLegacyDemandOwner(for: snapshot)
+            if let legacyDemandOwner {
+                do {
+                    try await remoteAudioPlayoutCoordinator.reserveLegacyDemand(
+                        owner: legacyDemandOwner,
+                        admissionIsCurrent: { [weak self, weak participant, weak room] in
+                            guard let self, let participant, let room else { return false }
+                            return self.isCurrentSubscription(
+                                snapshot,
+                                participant: participant,
+                                in: room
+                            ) && self._state.read {
+                                $0.remoteAudioLegacyDemandOwner == legacyDemandOwner &&
+                                    !$0.remoteAudioLegacyDemandOwnerNeedsRelease
+                            }
+                        }
+                    )
+                } catch {
+                    markRemoteAudioLegacyDemandOwnerForRelease(legacyDemandOwner)
+                    try await stopRetainedRemoteTracks()
+                    _state.mutate { state in
+                        guard Self.matches(snapshot, state: state) else { return }
+                        state.isSubscribePreferred = false
+                    }
+                    throw error
+                }
+            }
+            let playoutOwner = try prepareRemoteAudioPlayoutOwner(for: snapshot)
+            if let playoutOwner {
+                do {
+                    try await remoteAudioPlayoutCoordinator.acquire(
+                        owner: playoutOwner,
+                        admissionIsCurrent: { [weak self, weak participant, weak room] in
+                            guard let self, let participant, let room else { return false }
+                            return self.isCurrentPlayoutOwner(
+                                playoutOwner,
+                                snapshot: snapshot,
+                                participant: participant,
+                                in: room
+                            )
+                        },
+                        onGlobalQuarantine: { [weak self, weak participant, weak room] in
+                            guard let self, let participant, let room,
+                                  self.isCurrentPlayoutOwner(
+                                      playoutOwner,
+                                      snapshot: snapshot,
+                                      participant: participant,
+                                      in: room
+                                  )
+                            else { return }
+                            self.invalidateSubscriptionAdmissionForOwnershipLoss()
+                            Task.detached { [weak room] in
+                                await room?.disconnect()
+                            }
+                        }
+                    )
+                } catch {
+                    markRemoteAudioPlayoutOwnerForRelease(playoutOwner)
+                    do {
+                        try await stopRetainedRemoteTracks()
+                    } catch let releaseError {
+                        throw releaseError
+                    }
+                    throw error
+                }
+            }
+
             try _state.mutate { state in
-                guard Self.matches(snapshot, state: state) else {
+                guard Self.matches(snapshot, state: state),
+                      playoutOwner == nil || (
+                          state.remoteAudioPlayoutOwner == playoutOwner &&
+                              !state.remoteAudioPlayoutOwnerNeedsRelease
+                      ),
+                      legacyDemandOwner == nil || (
+                          state.remoteAudioLegacyDemandOwner == legacyDemandOwner &&
+                              !state.remoteAudioLegacyDemandOwnerNeedsRelease
+                      )
+                else {
                     throw LiveKitError(.invalidState, message: "Subscription admission was revoked")
                 }
                 state.isSubscribePreferred = true
@@ -525,17 +855,38 @@ private extension RemoteTrackPublication {
                     }
                 )
             } catch {
-                if !isCurrentSubscription(snapshot, participant: participant, in: room) {
+                if let legacyDemandOwner {
+                    markRemoteAudioLegacyDemandOwnerForRelease(legacyDemandOwner)
+                    try await stopRetainedRemoteTracks()
+                    _state.mutate { state in
+                        guard Self.matches(snapshot, state: state) else { return }
+                        state.isSubscribePreferred = false
+                    }
+                    throw error
+                }
+                invalidateSubscriptionAdmissionForOwnershipLoss()
+                do {
+                    try await stopRetainedRemoteTracks()
                     try await sendCompensatingUnsubscribe(
                         room: room,
                         participant: participant,
                         participantSid: participantSid
                     )
+                } catch let rollbackError {
+                    throw rollbackError
                 }
                 throw error
             }
 
             guard isCurrentSubscription(snapshot, participant: participant, in: room) else {
+                if let legacyDemandOwner {
+                    markRemoteAudioLegacyDemandOwnerForRelease(legacyDemandOwner)
+                    try await stopRetainedRemoteTracks()
+                }
+                if let playoutOwner {
+                    markRemoteAudioPlayoutOwnerForRelease(playoutOwner)
+                    try await stopRetainedRemoteTracks()
+                }
                 try await sendCompensatingUnsubscribe(
                     room: room,
                     participant: participant,
@@ -546,21 +897,23 @@ private extension RemoteTrackPublication {
         }
     }
 
-    func revokeSubscription(requiresExplicitAdmission: Bool) async throws {
-        let context = beginSubscriptionRevocation(
-            requiresExplicitAdmission: requiresExplicitAdmission
+    func revokeSubscription(
+        requiresExplicitAdmission: Bool,
+        matching admission: RemoteTrackSubscriptionAdmission? = nil
+    ) async throws {
+        let context = try beginSubscriptionRevocation(
+            requiresExplicitAdmission: requiresExplicitAdmission,
+            matching: admission
         )
         var confirmed = false
         do {
             try await _subscriptionSerialRunner.run { [weak self] in
                 guard let self else { return }
-                var firstTrackStopError: Error?
-                for track in context.tracks {
-                    do {
-                        try await retireRetainedRemoteTrack(track)
-                    } catch {
-                        if firstTrackStopError == nil { firstTrackStopError = error }
-                    }
+                var firstRetirementError: Error?
+                do {
+                    try await stopRetainedRemoteTracks()
+                } catch {
+                    firstRetirementError = error
                 }
 
                 if let participant = context.participant,
@@ -577,7 +930,7 @@ private extension RemoteTrackPublication {
                     )
                 }
 
-                if let firstTrackStopError { throw firstTrackStopError }
+                if let firstRetirementError { throw firstRetirementError }
             }
             confirmed = true
             finishSubscriptionRevocation(confirmed: true)
@@ -599,11 +952,28 @@ private extension RemoteTrackPublication {
         }
     }
 
-    func beginSubscriptionRevocation(requiresExplicitAdmission: Bool) -> RevocationContext {
+    func beginSubscriptionRevocation(
+        requiresExplicitAdmission: Bool,
+        matching admission: RemoteTrackSubscriptionAdmission?
+    ) throws -> RevocationContext {
         let participant = participant as? RemoteParticipant
         let room = participant?._room
         let participantSid = participant?.sid
-        let result = _state.mutate { state -> (tracks: [Track], detached: Track?) in
+        let result = try admitFailedRemoteTrackRetirement(room: room) { state -> (
+            (tracks: [Track], detached: Track?, requiresRetirement: Bool),
+            Bool
+        ) in
+            if let admission {
+                guard state.subscriptionAdmission.publicationNonce == admission.publicationNonce,
+                      state.subscriptionAdmission.generation == admission.generation,
+                      state.subscriptionAdmission.mode == .admitted(tokenNonce: admission.tokenNonce)
+                else {
+                    throw LiveKitError(
+                        .invalidState,
+                        message: "Subscription admission is stale or belongs to another publication"
+                    )
+                }
+            }
             state.subscriptionAdmission.generation &+= 1
             state.subscriptionAdmission.mode = .revoked
             state.subscriptionAdmission.requiresExplicitAdmission =
@@ -611,6 +981,10 @@ private extension RemoteTrackPublication {
             state.subscriptionAdmission.revocationInFlightCount += 1
             state.subscriptionAdmission.revocationNeedsRetry = true
             state.isSubscribePreferred = false
+            state.remoteAudioPlayoutOwnerNeedsRelease =
+                state.remoteAudioPlayoutOwner != nil
+            state.remoteAudioLegacyDemandOwnerNeedsRelease =
+                state.remoteAudioLegacyDemandOwner != nil
 
             let detached = state.track
             if let detached {
@@ -621,7 +995,14 @@ private extension RemoteTrackPublication {
             for track in state.failedRemoteRevocationTracks.values {
                 Self.silenceAndDetach(track)
             }
-            return (Array(state.failedRemoteRevocationTracks.values), detached)
+            let result = (
+                Array(state.failedRemoteRevocationTracks.values),
+                detached,
+                !state.failedRemoteRevocationTracks.isEmpty ||
+                    state.remoteAudioPlayoutOwnerNeedsRelease ||
+                    state.remoteAudioLegacyDemandOwnerNeedsRelease
+            )
+            return (result, result.2)
         }
 
         result.detached?.remove(delegate: self)
@@ -643,7 +1024,9 @@ private extension RemoteTrackPublication {
             )
             if confirmed {
                 state.subscriptionAdmission.revocationNeedsRetry =
-                    !state.failedRemoteRevocationTracks.isEmpty
+                    !state.failedRemoteRevocationTracks.isEmpty ||
+                    state.remoteAudioPlayoutOwnerNeedsRelease ||
+                    state.remoteAudioLegacyDemandOwnerNeedsRelease
             }
         }
     }
@@ -652,13 +1035,13 @@ private extension RemoteTrackPublication {
         _ track: Track,
         detachIfCurrent: Bool
     ) {
-        let detachedCurrent = _state.mutate { state -> Bool in
+        let detachedCurrent = admitFailedRemoteTrackRetirement { state -> (Bool, Bool) in
             Self.silenceAndDetach(track)
             state.failedRemoteRevocationTracks[ObjectIdentifier(track)] = track
             state.subscriptionAdmission.revocationNeedsRetry = true
-            guard detachIfCurrent, state.track === track else { return false }
+            guard detachIfCurrent, state.track === track else { return (false, true) }
             state.track = nil
-            return true
+            return (true, true)
         }
         if detachedCurrent {
             track.remove(delegate: self)
@@ -672,6 +1055,35 @@ private extension RemoteTrackPublication {
         }
         track.mediaTrack.blocking { $0.isEnabled = false }
         track.detachRemoteTransportSynchronously()
+    }
+
+    static func revokeForOwnershipLoss(
+        state: inout TrackPublication.State
+    ) -> (track: Track?, requiresRetirement: Bool) {
+        state.subscriptionAdmission.generation &+= 1
+        state.subscriptionAdmission.mode = .revoked
+        state.subscriptionAdmission.requiresExplicitAdmission = true
+        state.subscriptionAdmission.revocationNeedsRetry = true
+        state.isSubscribePreferred = false
+        state.remoteAudioPlayoutOwnerNeedsRelease =
+            state.remoteAudioPlayoutOwner != nil
+        state.remoteAudioLegacyDemandOwnerNeedsRelease =
+            state.remoteAudioLegacyDemandOwner != nil
+        let detached = state.track
+        if let detached {
+            silenceAndDetach(detached)
+            state.failedRemoteRevocationTracks[ObjectIdentifier(detached)] = detached
+            state.track = nil
+        }
+        for track in state.failedRemoteRevocationTracks.values {
+            silenceAndDetach(track)
+        }
+        return (
+            detached,
+            !state.failedRemoteRevocationTracks.isEmpty ||
+                state.remoteAudioPlayoutOwnerNeedsRelease ||
+                state.remoteAudioLegacyDemandOwnerNeedsRelease
+        )
     }
 
     func sendCompensatingUnsubscribe(
@@ -815,6 +1227,48 @@ extension RemoteTrackPublication {
         room.delegates.notify(label: { "room.didUpdate permission: \(newValue)" }) {
             $0.room?(room, participant: participant, trackPublication: self, didUpdateIsSubscriptionAllowed: newValue)
         }
+    }
+
+    @discardableResult
+    func applySubscriptionPermission(_ isAllowed: Bool) async throws -> Bool {
+        guard !isAllowed else {
+            set(subscriptionAllowed: true)
+            return false
+        }
+
+        let participant = participant as? RemoteParticipant
+        let room = participant?._room
+        let result = admitFailedRemoteTrackRetirement(room: room) { state -> (
+            (didChange: Bool, revokedTrack: Track?, requiresRetirement: Bool),
+            Bool
+        ) in
+            let didChange = state.isSubscriptionAllowed
+            state.isSubscriptionAllowed = false
+            guard state.subscriptionAdmission.requiresExplicitAdmission else {
+                return ((didChange, nil, false), false)
+            }
+            let revocation = Self.revokeForOwnershipLoss(state: &state)
+            return (
+                (didChange, revocation.track, revocation.requiresRetirement),
+                revocation.requiresRetirement
+            )
+        }
+
+        result.revokedTrack?.remove(delegate: self)
+        if result.revokedTrack != nil { _asTimer.cancel() }
+        if result.didChange, let participant, let room {
+            participant.delegates.notify(label: { "participant.didUpdate permission: false" }) {
+                $0.participant?(participant, trackPublication: self, didUpdateIsSubscriptionAllowed: false)
+            }
+            room.delegates.notify(label: { "room.didUpdate permission: false" }) {
+                $0.room?(room, participant: participant, trackPublication: self, didUpdateIsSubscriptionAllowed: false)
+            }
+        }
+
+        if result.requiresRetirement {
+            try await stopRetainedRemoteTracks()
+        }
+        return _state.subscriptionAdmission.requiresExplicitAdmission
     }
 }
 

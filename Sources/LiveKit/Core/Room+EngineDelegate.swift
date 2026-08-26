@@ -200,7 +200,7 @@ extension Room {
             return
         }
 
-        let task = Task.retrying(retryDelay: 0.2) { _, _ in
+        let addTrack: @Sendable () async throws -> Void = {
             guard self.isCurrentMediaSource(
                 sourceTransport,
                 participant: participant,
@@ -219,9 +219,19 @@ extension Room {
         }
 
         do {
-            try await task.value
+            if subscriptionAdmission.isLegacy {
+                let task = Task.retrying(retryDelay: 0.2) { _, _ in
+                    try await addTrack()
+                }
+                try await task.value
+            } else {
+                try await addTrack()
+            }
         } catch {
             log("addSubscribedMediaTrack failed, error: \(error)", .error)
+            if !subscriptionAdmission.isLegacy {
+                await disconnect()
+            }
         }
     }
 

@@ -88,12 +88,11 @@ public final class SessionRequirementHandle: @unchecked Sendable {
     }
 
     private func releaseIfNeeded() throws {
-        let releaseImpl = _state.mutate { state -> (@Sendable () throws -> Void)? in
-            let releaseImpl = state.releaseImpl
+        try _state.mutate { state in
+            guard let releaseImpl = state.releaseImpl else { return }
+            try releaseImpl()
             state.releaseImpl = nil
-            return releaseImpl
         }
-        try releaseImpl?()
     }
 }
 

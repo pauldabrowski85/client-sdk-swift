@@ -67,22 +67,21 @@ struct RoomLocalTrackAutoRepublishTests {
             autoRepublishLocalTracksOnFullReconnect: false
         ))
         let oldGeneration = room.dataPacketReceiveGeneration
-        let publisher = try Transport(
-            config: .liveKitDefault(),
-            target: .publisher,
-            primary: false,
-            dataPacketReceiveGeneration: oldGeneration,
-            delegate: room
+        let connection = ConnectionDependencies(
+            room: room,
+            roomOptions: room._state.roomOptions
         )
-        let subscriber = try Transport(
-            config: .liveKitDefault(),
-            target: .subscriber,
-            primary: true,
-            dataPacketReceiveGeneration: oldGeneration,
-            delegate: room
+        let join = try await JoinDependencies.make(
+            room: room,
+            connection: connection,
+            joinResponse: .with { $0.subscriberPrimary = true },
+            rtcConfiguration: .liveKitDefault(),
+            singlePeerConnection: false
         )
+        let publisher = try #require(join.transport.publisher)
+        let subscriber = try #require(join.transport.subscriber)
         room._state.mutate {
-            $0.transport = .subscriberPrimary(publisher: publisher, subscriber: subscriber)
+            $0.stage = .connected(join)
         }
 
         await room.signalClient(
@@ -93,9 +92,8 @@ struct RoomLocalTrackAutoRepublishTests {
         #expect(room.dataPacketReceiveGeneration == oldGeneration + 1)
         #expect(publisher.dataPacketReceiveGeneration == oldGeneration)
         #expect(subscriber.dataPacketReceiveGeneration == oldGeneration)
-        #expect(room._state.transport == nil)
-        await publisher.close()
-        await subscriber.close()
+        #expect(room._state.transport == join.transport)
+        await join.transport.close()
     }
 
     private func installMutedRetainedTrack(in room: Room) async -> LocalTrackPublication {

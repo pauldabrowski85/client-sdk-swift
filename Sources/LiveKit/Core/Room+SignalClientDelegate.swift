@@ -139,14 +139,8 @@ extension Room: SignalClientDelegate {
         await incomingStreamManager.reset(to: receiveGeneration)
         let moveError = LiveKitError(.cancelled, message: "Room moved; replacing transports")
         let wasConnected = _state.connectionState == .connected
-        let supersededTransport = _state.mutate { state -> TransportMode? in
-            let transport = state.transport
-            state.transport = nil
-            return transport
-        }
         publisherDataChannel.reset(throwing: moveError)
         subscriberDataChannel.reset(throwing: moveError)
-        await supersededTransport?.close()
 
         log("didReceiveRoomMoved to room: \(response.hasRoom ? response.room.name : "unknown")")
 
@@ -163,17 +157,6 @@ extension Room: SignalClientDelegate {
         } catch {
             log("Unable to replace transports after room move: \(error)", .error)
             await disconnect()
-        }
-        if _state.roomOptions.autoRepublishLocalTracksOnFullReconnect {
-            _republishLocalTracks()
-        }
-
-        let newParticipants = _addNewParticipants(from: response.otherParticipants)
-        _notifyNewParticipants(newParticipants)
-
-        // Republish local data tracks into the new room and surface its existing publications.
-        if let identity = localParticipant.identity?.stringValue {
-            dataTracks?.handleRoomMoved(response.otherParticipants, localIdentity: identity)
         }
     }
 
@@ -257,7 +240,22 @@ extension Room: SignalClientDelegate {
             return
         }
 
-        publication.set(subscriptionAllowed: subscriptionPermission.allowed)
+        do {
+            let mustRetireRoom = try await publication.applySubscriptionPermission(
+                subscriptionPermission.allowed
+            )
+            if mustRetireRoom,
+               _state.read({ state in
+                   state.remoteParticipant(forSid: participantSid) === participant &&
+                       participant.trackPublications[trackSid] === publication
+               })
+            {
+                await disconnect()
+            }
+        } catch {
+            log("Failed to retire denied protected subscription: \(error)", .error)
+            await disconnect()
+        }
     }
 
     func signalClient(_: SignalClient, didUpdateTrackStreamStates trackStates: [Livekit_StreamStateInfo]) async {
