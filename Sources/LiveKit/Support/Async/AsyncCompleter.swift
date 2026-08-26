@@ -93,6 +93,9 @@ final class AsyncCompleter<T: Sendable>: @unchecked Sendable, Loggable {
     private var _defaultTimeout: DispatchTimeInterval
     private var _entries: [UUID: WaitEntry] = [:]
     private var _result: Result<T, Error>?
+    private var _resetGeneration: UInt64 = 0
+    private var _lastResetError = LiveKitError(.cancelled)
+    private var _beforeWaitRegistration: (@Sendable () -> Void)?
 
     private let _lock: some Lock = createLock()
 
@@ -115,10 +118,17 @@ final class AsyncCompleter<T: Sendable>: @unchecked Sendable, Loggable {
         }
     }
 
+    func setBeforeWaitRegistrationForTests(_ hook: (@Sendable () -> Void)?) {
+        _lock.sync { _beforeWaitRegistration = hook }
+    }
+
     func reset(throwing error: Error? = nil) {
+        let resetError = LiveKitError.from(error: error) ?? LiveKitError(.cancelled)
         _lock.sync {
+            _resetGeneration &+= 1
+            _lastResetError = resetError
             for entry in _entries.values {
-                entry.cancel(throwing: LiveKitError.from(error: error))
+                entry.cancel(throwing: resetError)
             }
             _entries.removeAll()
             _result = nil
@@ -157,8 +167,10 @@ final class AsyncCompleter<T: Sendable>: @unchecked Sendable, Loggable {
     }
 
     func wait(timeout: TimeInterval? = nil) async throws -> T {
-        // Read value
-        if let result = _lock.sync({ _result }) {
+        let initialState = _lock.sync {
+            (_result, _resetGeneration, _beforeWaitRegistration)
+        }
+        if let result = initialState.0 {
             // Already resolved...
             if case let .success(value) = result {
                 // resume(returning:) already called
@@ -170,8 +182,11 @@ final class AsyncCompleter<T: Sendable>: @unchecked Sendable, Loggable {
             }
         }
 
+        initialState.2?()
+
         // Create ids for continuation & timeoutBlock
         let entryId = UUID()
+        let cancellationObserved = StateSync(false)
 
         // Create a cancel-aware timed continuation
         return try await withTaskCancellationHandler {
@@ -188,17 +203,25 @@ final class AsyncCompleter<T: Sendable>: @unchecked Sendable, Loggable {
                     }
                 }
 
-                _lock.sync {
-                    // Schedule time-out block
-                    let computedTimeout = (timeout?.toDispatchTimeInterval ?? _defaultTimeout)
-                    _timerQueue.asyncAfter(deadline: .now() + computedTimeout, execute: timeoutBlock)
-                    // Store entry
-                    _entries[entryId] = WaitEntry(continuation: continuation, timeoutBlock: timeoutBlock)
+                let immediateResult: Result<T, Error>? = _lock.sync {
+                    if _resetGeneration != initialState.1 {
+                        return .failure(_lastResetError)
+                    }
+                    if let result = _result { return result }
+                    if cancellationObserved.copy() {
+                        return .failure(LiveKitError(.cancelled))
+                    }
 
+                    let computedTimeout = timeout?.toDispatchTimeInterval ?? _defaultTimeout
+                    _timerQueue.asyncAfter(deadline: .now() + computedTimeout, execute: timeoutBlock)
+                    _entries[entryId] = WaitEntry(continuation: continuation, timeoutBlock: timeoutBlock)
                     log("\(label) id: \(entryId) waiting for \(computedTimeout)")
+                    return nil
                 }
+                if let immediateResult { continuation.resume(with: immediateResult) }
             }
         } onCancel: {
+            cancellationObserved.mutate { $0 = true }
             // Cancel only this completer when Task gets cancelled
             _lock.sync {
                 if let entry = self._entries[entryId] {

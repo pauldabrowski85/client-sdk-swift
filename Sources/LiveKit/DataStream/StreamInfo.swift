@@ -70,6 +70,10 @@ public final class TextStreamInfo: NSObject, StreamInfo {
     /// delayed work from an earlier transport even when the server reuses a SID.
     @nonobjc public let dataPacketReceiveGeneration: UInt64?
 
+    /// Continuous monotonic time captured when the header entered the receive
+    /// pipeline, before buffering or handler scheduling. It advances through sleep.
+    @nonobjc let receivedAtContinuousTimeNanoseconds: UInt64
+
     init(
         id: String,
         topic: String,
@@ -84,6 +88,7 @@ public final class TextStreamInfo: NSObject, StreamInfo {
         generated: Bool,
         publisherParticipantSid: Participant.Sid? = nil,
         dataPacketReceiveGeneration: UInt64? = nil,
+        receivedAtContinuousTimeNanoseconds: UInt64 = RpcContinuousClock.nowNanoseconds(),
     ) {
         self.id = id
         self.topic = topic
@@ -98,6 +103,7 @@ public final class TextStreamInfo: NSObject, StreamInfo {
         self.generated = generated
         self.publisherParticipantSid = publisherParticipantSid
         self.dataPacketReceiveGeneration = dataPacketReceiveGeneration
+        self.receivedAtContinuousTimeNanoseconds = receivedAtContinuousTimeNanoseconds
     }
 }
 

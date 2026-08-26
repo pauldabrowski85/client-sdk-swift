@@ -26,7 +26,8 @@ protocol DataChannelDelegate: AnyObject, Sendable {
         _ dataChannelPair: DataChannelPair,
         didReceiveDataPacket dataPacket: Livekit_DataPacket,
         encryptionType: EncryptionType,
-        receiveGeneration: UInt64
+        receiveGeneration: UInt64,
+        receivedAtContinuousTimeNanoseconds: UInt64
     )
 
     func dataChannel(
@@ -309,6 +310,7 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
         from dataChannel: LKRTCDataChannel,
         kind: ChannelKind
     ) {
+        let receivedAtContinuousTimeNanoseconds = RpcContinuousClock.nowNanoseconds()
         guard let ownership = currentOwnership(for: dataChannel) else {
             log("Ignoring data message from a superseded data channel", .warning)
             return
@@ -337,7 +339,8 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
                     self,
                     didReceiveDataPacket: dataPacket,
                     encryptionType: .none,
-                    receiveGeneration: ownership.receiveGeneration
+                    receiveGeneration: ownership.receiveGeneration,
+                    receivedAtContinuousTimeNanoseconds: receivedAtContinuousTimeNanoseconds
                 )
             }
             return
@@ -357,7 +360,8 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
                     self,
                     didReceiveDataPacket: decrypted,
                     encryptionType: encryptionType,
-                    receiveGeneration: ownership.receiveGeneration
+                    receiveGeneration: ownership.receiveGeneration,
+                    receivedAtContinuousTimeNanoseconds: receivedAtContinuousTimeNanoseconds
                 )
             }
         } catch {

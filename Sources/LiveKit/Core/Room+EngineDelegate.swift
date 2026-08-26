@@ -353,22 +353,46 @@ extension Room {
         }
     }
 
-    func engine(_ engine: Room, didReceiveUserPacket packet: Livekit_UserPacket, encryptionType: EncryptionType) {
-        // participant could be null if data broadcasted from server
-        let identity = Participant.Identity(from: packet.participantIdentity)
-        let participant = _state.remoteParticipants[identity]
+    func engine(
+        _ engine: Room,
+        didReceiveUserPacket packet: Livekit_UserPacket,
+        from participantIdentity: String,
+        participantSid: Participant.Sid?,
+        dataPacketReceiveGeneration: UInt64,
+        encryptionType: EncryptionType
+    ) {
+        guard let publisher = UserDataPublisher.resolve(
+            in: engine,
+            identity: participantIdentity,
+            sid: participantSid,
+            dataPacketReceiveGeneration: dataPacketReceiveGeneration
+        ) else {
+            log("Ignoring user data packet with incomplete or stale publisher provenance", .warning)
+            return
+        }
 
-        if case .connected = engine._state.connectionState {
-            delegates.notify(label: { "room.didReceive data: \(packet.payload)" }) {
-                $0.room?(self, participant: participant, didReceiveData: packet.payload, forTopic: packet.topic, encryptionType: encryptionType)
-            }
+        delegates.notify(label: { "room.didReceive data: \(packet.payload)" }) {
+            guard publisher.isCurrent(in: engine) else { return }
+            $0.room?(
+                self,
+                participant: publisher.participant,
+                didReceiveData: packet.payload,
+                forTopic: packet.topic,
+                encryptionType: encryptionType
+            )
+        }
 
-            if let participant {
-                participant.delegates.notify(label: { "participant.didReceive data: \(packet.payload)" }) { [weak participant] delegate in
-                    guard let participant else { return }
-                    delegate.participant?(participant, didReceiveData: packet.payload, forTopic: packet.topic, encryptionType: encryptionType)
-                }
-            }
+        guard let participant = publisher.participant else { return }
+        participant.delegates.notify(label: { "participant.didReceive data: \(packet.payload)" }) { [weak participant] delegate in
+            guard let participant,
+                  publisher.isCurrent(in: engine)
+            else { return }
+            delegate.participant?(
+                participant,
+                didReceiveData: packet.payload,
+                forTopic: packet.topic,
+                encryptionType: encryptionType
+            )
         }
     }
 
@@ -459,13 +483,14 @@ extension Room {
         didReceiveRpcRequest request: Livekit_RpcRequest,
         from participantIdentity: String,
         participantSid: Participant.Sid?,
-        dataPacketReceiveGeneration: UInt64
+        dataPacketReceiveGeneration: UInt64,
+        receivedAtContinuousTimeNanoseconds: UInt64
     ) {
         let callerIdentity = Participant.Identity(from: participantIdentity)
         let requestId = request.id
         let method = request.method
         let payload = request.payload
-        let responseTimeout = TimeInterval(UInt64(request.responseTimeoutMs) / UInt64(msecPerSec))
+        let responseTimeout = TimeInterval(request.responseTimeoutMs) / TimeInterval(msecPerSec)
         let version = Int(request.version)
 
         Task.discarding { [rpcServer] in
@@ -476,7 +501,75 @@ extension Room {
                                                   method: method,
                                                   payload: payload,
                                                   responseTimeout: responseTimeout,
+                                                  receivedAtContinuousTimeNanoseconds: receivedAtContinuousTimeNanoseconds,
                                                   version: version)
+        }
+    }
+}
+
+private enum UserDataPublisher: Sendable {
+    case server(dataPacketReceiveGeneration: UInt64)
+    case participant(
+        identity: Participant.Identity,
+        sid: Participant.Sid,
+        dataPacketReceiveGeneration: UInt64,
+        participant: RemoteParticipant
+    )
+
+    var participant: RemoteParticipant? {
+        switch self {
+        case .server: nil
+        case let .participant(_, _, _, participant): participant
+        }
+    }
+
+    static func resolve(
+        in room: Room,
+        identity identityString: String,
+        sid: Participant.Sid?,
+        dataPacketReceiveGeneration: UInt64
+    ) -> UserDataPublisher? {
+        guard dataPacketReceiveGeneration == room.dataPacketReceiveGeneration else { return nil }
+        if identityString.isEmpty, sid == nil {
+            return room._state.read { state in
+                guard state.connectionState == .connected else { return nil }
+                return .server(dataPacketReceiveGeneration: dataPacketReceiveGeneration)
+            }
+        }
+        guard !identityString.isEmpty, let sid else { return nil }
+
+        let identity = Participant.Identity(from: identityString)
+        return room._state.read { state in
+            guard case .connected = state.connectionState,
+                  let participant = state.remoteParticipants[identity],
+                  participant.sid == sid,
+                  participant.dataPacketReceiveGeneration == dataPacketReceiveGeneration
+            else { return nil }
+            return .participant(
+                identity: identity,
+                sid: sid,
+                dataPacketReceiveGeneration: dataPacketReceiveGeneration,
+                participant: participant
+            )
+        }
+    }
+
+    func isCurrent(in room: Room) -> Bool {
+        switch self {
+        case let .server(dataPacketReceiveGeneration):
+            guard dataPacketReceiveGeneration == room.dataPacketReceiveGeneration else { return false }
+            return room._state.read { $0.connectionState == .connected }
+
+        case let .participant(identity, sid, dataPacketReceiveGeneration, participant):
+            guard dataPacketReceiveGeneration == room.dataPacketReceiveGeneration else { return false }
+            return room._state.read { state in
+                guard state.connectionState == .connected,
+                      let current = state.remoteParticipants[identity]
+                else { return false }
+                return current === participant &&
+                    current.sid == sid &&
+                    current.dataPacketReceiveGeneration == dataPacketReceiveGeneration
+            }
         }
     }
 }

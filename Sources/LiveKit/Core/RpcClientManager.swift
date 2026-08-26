@@ -61,6 +61,23 @@ actor RpcClientManager: Loggable {
                     responseTimeout: TimeInterval = RpcClientManager.defaultResponseTimeout,
                     maxRoundTripLatency: TimeInterval = RpcClientManager.defaultMaxRoundTripLatency) async throws -> String
     {
+        guard responseTimeout.isFinite,
+              responseTimeout > 0,
+              maxRoundTripLatency.isFinite,
+              maxRoundTripLatency >= 0
+        else {
+            throw LiveKitError(.invalidParameter, message: "RPC responseTimeout must be positive and finite, and maxRoundTripLatency must be finite and nonnegative")
+        }
+        let minEffectiveTimeout = maxRoundTripLatency + 1
+        let requestedEffectiveTimeout = max(responseTimeout, minEffectiveTimeout)
+        let responseTimeoutMillisecondsDouble = (requestedEffectiveTimeout * 1000).rounded(.up)
+        guard requestedEffectiveTimeout.isFinite,
+              responseTimeoutMillisecondsDouble <= TimeInterval(UInt32.max)
+        else {
+            throw LiveKitError(.invalidParameter, message: "RPC response timeout exceeds the wire protocol limit")
+        }
+        let responseTimeoutMilliseconds = UInt32(responseTimeoutMillisecondsDouble)
+
         let room = try requireRoom()
         guard let destinationConnection = RpcParticipantConnection.resolveCurrent(
             in: room,
@@ -73,9 +90,6 @@ actor RpcClientManager: Loggable {
         let useStreamTransport = remoteClientProtocol >= .v1 && Self.serverSupportsRpcV2(room.serverVersion)
 
         let requestId = UUID().uuidString
-        let minEffectiveTimeout: TimeInterval = maxRoundTripLatency + 1
-        let effectiveTimeout = max(responseTimeout, minEffectiveTimeout)
-
         // Pre-register pending state synchronously on the actor *before* publishing the
         // request. Prevents a race where a fast remote can ack/respond before registration
         // completes — the response would otherwise log "received for unexpected request" and
@@ -95,14 +109,14 @@ actor RpcClientManager: Loggable {
                                                requestId: requestId,
                                                method: method,
                                                payload: payload,
-                                               responseTimeout: effectiveTimeout)
+                                               responseTimeoutMilliseconds: responseTimeoutMilliseconds)
             } else {
                 try await publishRequest(in: room,
                                          destinationConnection: destinationConnection,
                                          requestId: requestId,
                                          method: method,
                                          payload: payload,
-                                         responseTimeout: effectiveTimeout)
+                                         responseTimeoutMilliseconds: responseTimeoutMilliseconds)
             }
         } catch {
             // Publish failed — clean up the registered state before re-throwing.
@@ -151,9 +165,8 @@ actor RpcClientManager: Loggable {
     }
 
     /// Watchdog terminal action: if `requestId` is still awaiting an ack, clear pending
-    /// state and resolve its completer with `connectionTimeout`. AsyncCompleter idempotency
-    /// makes this safe even if a real response has already resolved the completer between
-    /// the watchdog scheduling and this call running.
+    /// state and resolve its completer with `connectionTimeout`. Actor isolation and removing
+    /// `pendingResponses[requestId]` before resolution give exactly one terminal path ownership.
     func fireAckTimeoutIfPending(requestId: String) {
         guard pendingAcks.contains(requestId) else { return }
         pendingAcks.remove(requestId)
@@ -165,8 +178,8 @@ actor RpcClientManager: Loggable {
 
     /// Resolve a pending RPC call from a v1 `RpcResponse` packet. Note that `pendingAcks`
     /// is intentionally not cleared here — the watchdog's gate stays armed until either
-    /// `handleIncomingAck` or `fireAckTimeoutIfPending` clears it. Either path is safe
-    /// because the completer is idempotent.
+    /// `handleIncomingAck` or `fireAckTimeoutIfPending` clears it. A response removes the
+    /// pending entry before resolution, so a later watchdog cannot resolve it again.
     func handleIncomingResponse(requestId: String,
                                 payload: String?,
                                 error: RpcError?,
@@ -294,8 +307,8 @@ actor RpcClientManager: Loggable {
     /// Reject every in-flight RPC targeting `identity` with `recipientDisconnected`
     /// (1503). Called from `Room._onParticipantDidDisconnect(identity:)` so the caller
     /// learns immediately instead of waiting for the user-supplied `responseTimeout`.
-    /// AsyncCompleter idempotency makes this safe even if a real response races the
-    /// disconnect.
+    /// Actor isolation and removing each pending entry before resolution make this safe
+    /// when a real response races the disconnect.
     func handleParticipantDisconnected(
         identity: Participant.Identity,
         participantSid: Participant.Sid,
@@ -379,7 +392,7 @@ actor RpcClientManager: Loggable {
                                 requestId: String,
                                 method: String,
                                 payload: String,
-                                responseTimeout: TimeInterval) async throws
+                                responseTimeoutMilliseconds: UInt32) async throws
     {
         try requireCurrent(destinationConnection, in: room)
         guard payload.byteLength <= MAX_RPC_PAYLOAD_BYTES else {
@@ -393,7 +406,7 @@ actor RpcClientManager: Loggable {
                 $0.id = requestId
                 $0.method = method
                 $0.payload = payload
-                $0.responseTimeoutMs = UInt32(responseTimeout * 1000)
+                $0.responseTimeoutMs = responseTimeoutMilliseconds
                 $0.version = 1
             }
         }
@@ -413,7 +426,7 @@ actor RpcClientManager: Loggable {
                                       requestId: String,
                                       method: String,
                                       payload: String,
-                                      responseTimeout: TimeInterval) async throws
+                                      responseTimeoutMilliseconds: UInt32) async throws
     {
         try requireCurrent(destinationConnection, in: room)
         guard payload.byteLength <= RpcStreamLimits.maximumPayloadBytes else {
@@ -424,7 +437,7 @@ actor RpcClientManager: Loggable {
             attributes: [
                 RpcStreamAttribute.requestId: requestId,
                 RpcStreamAttribute.method: method,
-                RpcStreamAttribute.timeoutMs: String(UInt32(responseTimeout * 1000)),
+                RpcStreamAttribute.timeoutMs: String(responseTimeoutMilliseconds),
                 RpcStreamAttribute.version: RPC_STREAM_VERSION,
             ],
             destinationIdentities: [destinationConnection.identity],

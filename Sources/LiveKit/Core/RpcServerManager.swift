@@ -16,6 +16,97 @@
 
 import Foundation
 
+private struct RpcInvocationDeadlineExceeded: Error {}
+
+private final class RpcWeakParticipant: @unchecked Sendable {
+    weak var value: RemoteParticipant?
+
+    init(_ value: RemoteParticipant) {
+        self.value = value
+    }
+}
+
+private struct RpcCallerConnectionToken: Sendable {
+    let identity: Participant.Identity
+    let sid: Participant.Sid
+    let dataPacketReceiveGeneration: UInt64
+    let participant: RpcWeakParticipant
+
+    init(_ connection: RpcParticipantConnection) {
+        identity = connection.identity
+        sid = connection.sid
+        dataPacketReceiveGeneration = connection.dataPacketReceiveGeneration
+        participant = RpcWeakParticipant(connection.participant)
+    }
+
+    func isCurrent(in room: Room) -> Bool {
+        guard let expectedParticipant = participant.value,
+              room.dataPacketReceiveGeneration == dataPacketReceiveGeneration
+        else { return false }
+        return room._state.read { state in
+            guard let current = state.remoteParticipants[identity] else { return false }
+            return current === expectedParticipant &&
+                current.sid == sid &&
+                current.dataPacketReceiveGeneration == dataPacketReceiveGeneration
+        }
+    }
+}
+
+private struct RpcInvocationOwner: Hashable, Sendable {
+    let identity: Participant.Identity
+    let sid: Participant.Sid
+    let dataPacketReceiveGeneration: UInt64
+    let participantObjectIdentifier: ObjectIdentifier
+
+    init(_ connection: RpcParticipantConnection) {
+        identity = connection.identity
+        sid = connection.sid
+        dataPacketReceiveGeneration = connection.dataPacketReceiveGeneration
+        participantObjectIdentifier = ObjectIdentifier(connection.participant)
+    }
+
+}
+
+private struct RpcInvocationClock: Sendable {
+    let nowNanoseconds: @Sendable () -> UInt64
+    let sleepUntil: @Sendable (UInt64) async throws -> Void
+
+    static let live = RpcInvocationClock(
+        nowNanoseconds: RpcContinuousClock.nowNanoseconds,
+        sleepUntil: { deadline in
+            while true {
+                let now = RpcContinuousClock.nowNanoseconds()
+                guard deadline > now else { return }
+                // The legacy Darwin API is continuous across system sleep and
+                // back-deploys to every platform version supported by this SDK.
+                try await Task.sleep(nanoseconds: deadline - now)
+            }
+        }
+    )
+}
+
+private final class RpcInvocationLease: @unchecked Sendable {
+    private let released = StateSync(false)
+    private let onRelease: @Sendable () -> Void
+
+    init(onRelease: @escaping @Sendable () -> Void) {
+        self.onRelease = onRelease
+    }
+
+    func release() {
+        let shouldRelease = released.mutate { released in
+            guard !released else { return false }
+            released = true
+            return true
+        }
+        if shouldRelease { onRelease() }
+    }
+
+    deinit {
+        release()
+    }
+}
+
 /// Handler-side RPC.
 ///
 /// Owns the registered method-handler table and the wire-level handling of incoming
@@ -23,6 +114,10 @@ import Foundation
 /// `Room.unregisterRpcMethod` are one-line proxies that forward into this actor.
 actor RpcServerManager: Loggable {
     private weak var room: Room?
+    private var activeInvocationOwners: [UUID: RpcInvocationOwner] = [:]
+    private var afterRequestStreamRead: (@Sendable () async -> Void)?
+    private var beforeHandlerPreflight: (@Sendable () async -> Void)?
+    private var invocationClock = RpcInvocationClock.live
 
     /// Method-name → handler map. Persists across `Room.cleanUp` and reconnects so callers
     /// don't have to re-register on every transient disconnect; cleared only when this
@@ -31,6 +126,31 @@ actor RpcServerManager: Loggable {
 
     func attach(to room: Room) {
         self.room = room
+    }
+
+    func setAfterRequestStreamRead(_ hook: (@Sendable () async -> Void)?) {
+        afterRequestStreamRead = hook
+    }
+
+    func setBeforeHandlerPreflight(_ hook: (@Sendable () async -> Void)?) {
+        beforeHandlerPreflight = hook
+    }
+
+    func setContinuousTimeNanosecondsProvider(_ provider: @escaping @Sendable () -> UInt64) {
+        invocationClock = RpcInvocationClock(
+            nowNanoseconds: provider,
+            sleepUntil: invocationClock.sleepUntil
+        )
+    }
+
+    func setInvocationClock(
+        nowNanoseconds: @escaping @Sendable () -> UInt64,
+        sleepUntil: @escaping @Sendable (UInt64) async throws -> Void
+    ) {
+        invocationClock = RpcInvocationClock(
+            nowNanoseconds: nowNanoseconds,
+            sleepUntil: sleepUntil
+        )
     }
 
     // MARK: - Public handler registration
@@ -66,6 +186,7 @@ actor RpcServerManager: Loggable {
                                method: String,
                                payload: String,
                                responseTimeout: TimeInterval,
+                               receivedAtContinuousTimeNanoseconds: UInt64 = RpcContinuousClock.nowNanoseconds(),
                                version: Int) async
     {
         guard let room = try? requireRoom() else { return }
@@ -97,12 +218,47 @@ actor RpcServerManager: Loggable {
             }
             return
         }
+        guard payload.byteLength <= MAX_RPC_PAYLOAD_BYTES else {
+            do {
+                try await publishResponse(
+                    in: room,
+                    callerConnection: callerConnection,
+                    requestId: requestId,
+                    payload: nil,
+                    error: RpcError.builtIn(.requestPayloadTooLarge)
+                )
+            } catch {
+                log("[Rpc] Failed to publish oversized-request response for \(requestId)", .error)
+            }
+            return
+        }
+
+        guard let responseDeadlineContinuousTimeNanoseconds = Self.responseDeadlineContinuousTimeNanoseconds(
+            receivedAtContinuousTimeNanoseconds: receivedAtContinuousTimeNanoseconds,
+            responseTimeout: responseTimeout
+        ) else {
+            await publishInvalidRequest(
+                in: room,
+                callerConnection: callerConnection,
+                requestId: requestId
+            )
+            return
+        }
+        guard let invocationLease = admitInvocation(for: callerConnection) else {
+            await publishOverloadedRequest(
+                in: room,
+                callerConnection: callerConnection,
+                requestId: requestId
+            )
+            return
+        }
 
         let result = await dispatchToHandler(callerConnection: callerConnection,
                                              requestId: requestId,
                                              method: method,
                                              payload: payload,
-                                             responseTimeout: responseTimeout)
+                                             responseDeadlineContinuousTimeNanoseconds: responseDeadlineContinuousTimeNanoseconds,
+                                             invocationLease: invocationLease)
         do {
             try await publishResult(result,
                                     in: room,
@@ -122,13 +278,17 @@ actor RpcServerManager: Loggable {
     func handleIncomingRequestStream(reader: TextStreamReader,
                                      callerIdentity: Participant.Identity) async
     {
-        guard let room = try? requireRoom() else { return }
+        guard let room = try? requireRoom() else {
+            await reader.cancel()
+            return
+        }
         guard let callerConnection = RpcParticipantConnection.resolve(
             in: room,
             identity: callerIdentity,
             sid: reader.info.publisherParticipantSid,
             dataPacketReceiveGeneration: reader.info.dataPacketReceiveGeneration
         ) else {
+            await reader.cancel()
             log("[Rpc] Ignoring request stream with stale or missing caller provenance", .error)
             return
         }
@@ -137,6 +297,7 @@ actor RpcServerManager: Loggable {
         // requestId is the correlation key; without it we can't send a typed error back,
         // so log and bail (the caller will hit its own response timeout).
         guard let requestId = attrs[RpcStreamAttribute.requestId] else {
+            await reader.cancel()
             log("[Rpc] Incoming v2 RPC request stream is missing request id; cannot correlate", .error)
             return
         }
@@ -145,6 +306,7 @@ actor RpcServerManager: Loggable {
               let timeoutMs = UInt32(timeoutMsString),
               let version = attrs[RpcStreamAttribute.version]
         else {
+            await reader.cancel()
             log("[Rpc] Incoming v2 RPC request stream for \(requestId) is missing required attributes", .error)
             do {
                 try await publishResponse(in: room,
@@ -168,6 +330,7 @@ actor RpcServerManager: Loggable {
         }
 
         guard version == RPC_STREAM_VERSION else {
+            await reader.cancel()
             do {
                 try await publishResponse(in: room,
                                           callerConnection: callerConnection,
@@ -180,12 +343,40 @@ actor RpcServerManager: Loggable {
             return
         }
 
+        guard let responseDeadlineContinuousTimeNanoseconds = Self.responseDeadlineContinuousTimeNanoseconds(
+            receivedAtContinuousTimeNanoseconds: reader.info.receivedAtContinuousTimeNanoseconds,
+            responseTimeout: responseTimeout
+        ) else {
+            await reader.cancel()
+            await publishInvalidRequest(
+                in: room,
+                callerConnection: callerConnection,
+                requestId: requestId
+            )
+            return
+        }
+        guard let invocationLease = admitInvocation(for: callerConnection) else {
+            await reader.cancel()
+            await publishOverloadedRequest(
+                in: room,
+                callerConnection: callerConnection,
+                requestId: requestId
+            )
+            return
+        }
+
         let payload: String
         do {
-            payload = try await reader.readAll()
+            payload = try await readPayload(
+                from: reader,
+                responseDeadlineContinuousTimeNanoseconds: responseDeadlineContinuousTimeNanoseconds
+            )
         } catch {
+            invocationLease.release()
             log("[Rpc] Failed to read v2 RPC request payload for \(requestId): \(error)", .error)
-            let rpcError: RpcError = if case StreamError.streamSizeExceeded = error {
+            let rpcError: RpcError = if error is RpcInvocationDeadlineExceeded {
+                .builtIn(.responseTimeout)
+            } else if case StreamError.streamSizeExceeded = error {
                 .builtIn(.requestPayloadTooLarge)
             } else {
                 RpcError(code: RpcError.BuiltInError.applicationError.code,
@@ -204,12 +395,32 @@ actor RpcServerManager: Loggable {
             return
         }
 
-        guard callerConnection.isCurrent(in: room) else { return }
+        if let afterRequestStreamRead { await afterRequestStreamRead() }
+        guard callerConnection.isCurrent(in: room) else {
+            invocationLease.release()
+            return
+        }
+        guard invocationClock.nowNanoseconds() < responseDeadlineContinuousTimeNanoseconds else {
+            invocationLease.release()
+            do {
+                try await publishResponse(
+                    in: room,
+                    callerConnection: callerConnection,
+                    requestId: requestId,
+                    payload: nil,
+                    error: RpcError.builtIn(.responseTimeout)
+                )
+            } catch {
+                log("[Rpc] Failed to publish expired-request response for \(requestId)", .error)
+            }
+            return
+        }
         let result = await dispatchToHandler(callerConnection: callerConnection,
                                              requestId: requestId,
                                              method: method,
                                              payload: payload,
-                                             responseTimeout: responseTimeout)
+                                             responseDeadlineContinuousTimeNanoseconds: responseDeadlineContinuousTimeNanoseconds,
+                                             invocationLease: invocationLease)
         do {
             try await publishResult(result,
                                     in: room,
@@ -236,6 +447,8 @@ actor RpcServerManager: Loggable {
         let error: RpcError = switch rejection.error {
         case .streamSizeExceeded, .invalidDeclaredLength:
             .builtIn(.requestPayloadTooLarge)
+        case .tooManyOpenStreams:
+            .receiverOverloaded
         default:
             .builtIn(.applicationError)
         }
@@ -254,9 +467,119 @@ actor RpcServerManager: Loggable {
 
     // swiftlint:enable function_body_length
 
+    // MARK: - Admission and deadlines
+
+    var activeInvocationCount: Int { activeInvocationOwners.count }
+
+    private static func responseDeadlineContinuousTimeNanoseconds(
+        receivedAtContinuousTimeNanoseconds: UInt64,
+        responseTimeout: TimeInterval
+    ) -> UInt64? {
+        let timeoutNanosecondsDouble = (responseTimeout * 1_000_000_000).rounded(.up)
+        guard responseTimeout.isFinite,
+              responseTimeout > 0,
+              timeoutNanosecondsDouble <= Double(UInt64.max)
+        else { return nil }
+        let timeoutNanoseconds = UInt64(timeoutNanosecondsDouble)
+        let (deadline, overflow) = receivedAtContinuousTimeNanoseconds.addingReportingOverflow(timeoutNanoseconds)
+        return overflow ? nil : deadline
+    }
+
+    private func admitInvocation(for callerConnection: RpcParticipantConnection) -> RpcInvocationLease? {
+        guard activeInvocationOwners.count < RpcInvocationLimits.maximumInFlight else { return nil }
+        let owner = RpcInvocationOwner(callerConnection)
+        let ownerInvocationCount = activeInvocationOwners.values.lazy.filter { $0 == owner }.count
+        let identityInvocationCount = activeInvocationOwners.values.lazy
+            .filter { $0.identity == owner.identity }
+            .count
+        guard ownerInvocationCount < RpcInvocationLimits.maximumInFlightPerConnection,
+              identityInvocationCount < RpcInvocationLimits.maximumInFlightPerConnection
+        else { return nil }
+        let id = UUID()
+        activeInvocationOwners[id] = owner
+        return RpcInvocationLease { [weak self] in
+            Task { await self?.releaseInvocation(id) }
+        }
+    }
+
+    private func releaseInvocation(_ id: UUID) {
+        activeInvocationOwners.removeValue(forKey: id)
+    }
+
+    private func publishInvalidRequest(
+        in room: Room,
+        callerConnection: RpcParticipantConnection,
+        requestId: String
+    ) async {
+        do {
+            try await publishResponse(
+                in: room,
+                callerConnection: callerConnection,
+                requestId: requestId,
+                payload: nil,
+                error: RpcError.builtIn(.applicationError)
+            )
+        } catch {
+            log("[Rpc] Failed to publish rejected-request response for \(requestId)", .error)
+        }
+    }
+
+    private func publishOverloadedRequest(
+        in room: Room,
+        callerConnection: RpcParticipantConnection,
+        requestId: String
+    ) async {
+        do {
+            try await publishResponse(
+                in: room,
+                callerConnection: callerConnection,
+                requestId: requestId,
+                payload: nil,
+                error: .receiverOverloaded
+            )
+        } catch {
+            log("[Rpc] Failed to publish overloaded-request response for \(requestId)", .error)
+        }
+    }
+
+    private func readPayload(
+        from reader: TextStreamReader,
+        responseDeadlineContinuousTimeNanoseconds: UInt64
+    ) async throws -> String {
+        let now = invocationClock.nowNanoseconds()
+        guard responseDeadlineContinuousTimeNanoseconds > now else {
+            await reader.cancel()
+            throw RpcInvocationDeadlineExceeded()
+        }
+        let invocationClock = invocationClock
+        let payload = try await withThrowingTaskGroup(of: String.self) { group in
+            group.addTask { try await reader.readAll() }
+            group.addTask {
+                try await invocationClock.sleepUntil(responseDeadlineContinuousTimeNanoseconds)
+                throw RpcInvocationDeadlineExceeded()
+            }
+            do {
+                guard let first = try await group.next() else {
+                    throw RpcInvocationDeadlineExceeded()
+                }
+                group.cancelAll()
+                return first
+            } catch {
+                group.cancelAll()
+                await reader.cancel()
+                throw error
+            }
+        }
+        guard invocationClock.nowNanoseconds() < responseDeadlineContinuousTimeNanoseconds else {
+            await reader.cancel()
+            throw RpcInvocationDeadlineExceeded()
+        }
+        return payload
+    }
+
     // MARK: - Handler dispatch
 
-    private enum DispatchResult {
+    private enum DispatchResult: Sendable {
         case success(String)
         case failure(RpcError)
     }
@@ -268,27 +591,91 @@ actor RpcServerManager: Loggable {
                                    requestId: String,
                                    method: String,
                                    payload: String,
-                                   responseTimeout: TimeInterval) async -> DispatchResult
+                                   responseDeadlineContinuousTimeNanoseconds: UInt64,
+                                   invocationLease: RpcInvocationLease) async -> DispatchResult
     {
         guard let room, callerConnection.isCurrent(in: room) else {
+            invocationLease.release()
             return .failure(RpcError.builtIn(.recipientDisconnected))
         }
         guard let handler = handlers[method] else {
+            invocationLease.release()
             return .failure(RpcError.builtIn(.unsupportedMethod))
         }
+        let now = invocationClock.nowNanoseconds()
+        guard responseDeadlineContinuousTimeNanoseconds > now else {
+            invocationLease.release()
+            return .failure(RpcError.builtIn(.responseTimeout))
+        }
+        let remaining = TimeInterval(responseDeadlineContinuousTimeNanoseconds - now) / 1_000_000_000
+
+        let invocation = RpcInvocationData(
+            requestId: requestId,
+            callerIdentity: callerConnection.identity,
+            callerParticipantSid: callerConnection.sid,
+            callerDataPacketReceiveGeneration: callerConnection.dataPacketReceiveGeneration,
+            payload: payload,
+            responseTimeout: remaining,
+            responseDeadlineContinuousTimeNanoseconds: responseDeadlineContinuousTimeNanoseconds
+        )
+        let callerToken = RpcCallerConnectionToken(callerConnection)
+        let callerIsCurrent: @Sendable () -> Bool = { [weak room] in
+            guard let room else { return false }
+            return callerToken.isCurrent(in: room)
+        }
+        let result = AsyncCompleter<DispatchResult>(
+            label: "rpc-handler-\(requestId)",
+            defaultTimeout: remaining
+        )
+        let invocationClock = invocationClock
+        let beforeHandlerPreflight = beforeHandlerPreflight
+        let handlerTask = Task.detached { [handler, invocationLease] in
+            defer { invocationLease.release() }
+            if let beforeHandlerPreflight { await beforeHandlerPreflight() }
+            guard !Task.isCancelled,
+                  callerIsCurrent(),
+                  invocationClock.nowNanoseconds() < responseDeadlineContinuousTimeNanoseconds
+            else {
+                result.resume(returning: .failure(RpcError.builtIn(.responseTimeout)))
+                return
+            }
+
+            let dispatchResult: DispatchResult
+            do {
+                dispatchResult = .success(try await handler(invocation))
+            } catch let error as RpcError {
+                dispatchResult = .failure(error)
+            } catch {
+                RpcServerManager.log(
+                    "[Rpc] Uncaught error returned by RPC handler for \(method): \(error). Returning APPLICATION_ERROR instead.",
+                    .warning
+                )
+                dispatchResult = .failure(RpcError.builtIn(.applicationError))
+            }
+            result.resume(returning: dispatchResult)
+        }
+        let deadlineTask = Task.detached {
+            do {
+                try await invocationClock.sleepUntil(responseDeadlineContinuousTimeNanoseconds)
+            } catch {
+                return
+            }
+            result.resume(returning: .failure(RpcError.builtIn(.responseTimeout)))
+        }
+        defer { deadlineTask.cancel() }
 
         do {
-            let response = try await handler(RpcInvocationData(requestId: requestId,
-                                                               callerIdentity: callerConnection.identity,
-                                                               callerParticipantSid: callerConnection.sid,
-                                                               callerDataPacketReceiveGeneration: callerConnection.dataPacketReceiveGeneration,
-                                                               payload: payload,
-                                                               responseTimeout: responseTimeout))
-            return .success(response)
-        } catch let error as RpcError {
-            return .failure(error)
+            let dispatchResult = try await result.wait(timeout: remaining + 1)
+            guard invocationClock.nowNanoseconds() < responseDeadlineContinuousTimeNanoseconds else {
+                handlerTask.cancel()
+                return .failure(RpcError.builtIn(.responseTimeout))
+            }
+            return dispatchResult
+        } catch let error as LiveKitError where error.type == .timedOut {
+            handlerTask.cancel()
+            return .failure(RpcError.builtIn(.responseTimeout))
         } catch {
-            log("[Rpc] Uncaught error returned by RPC handler for \(method): \(error). Returning APPLICATION_ERROR instead.", .warning)
+            handlerTask.cancel()
             return .failure(RpcError.builtIn(.applicationError))
         }
     }

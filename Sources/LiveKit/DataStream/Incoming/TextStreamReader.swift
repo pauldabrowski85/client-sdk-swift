@@ -23,10 +23,16 @@ public final class TextStreamReader: NSObject, AsyncSequence, Sendable {
     public let info: TextStreamInfo
 
     let source: StreamReaderSource
+    private let cancelSource: @Sendable () async -> Void
 
-    init(info: TextStreamInfo, source: StreamReaderSource) {
+    init(
+        info: TextStreamInfo,
+        source: StreamReaderSource,
+        cancelSource: @escaping @Sendable () async -> Void = {}
+    ) {
         self.info = info
         self.source = source
+        self.cancelSource = cancelSource
     }
 
     /// Reads incoming chunks from the text stream, concatenating them into a single string which is returned
@@ -37,6 +43,10 @@ public final class TextStreamReader: NSObject, AsyncSequence, Sendable {
     ///
     public func readAll() async throws -> String {
         try await collect()
+    }
+
+    func cancel() async {
+        await cancelSource()
     }
 
     /// An asynchronous iterator of incoming chunks.
