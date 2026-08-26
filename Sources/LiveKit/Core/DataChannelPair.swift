@@ -78,7 +78,7 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
     struct PreparedSend: Sendable {
         let packet: Livekit_DataPacket
         let sendGeneration: UInt64
-        let admission: (@Sendable () -> Bool)?
+        let admission: DataChannelSendAdmission?
     }
 
     // MARK: - Private
@@ -405,6 +405,18 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
         expectedSendGeneration: UInt64,
         admission: @escaping @Sendable () -> Bool
     ) async throws {
+        try await send(
+            dataPacket: packet,
+            expectedSendGeneration: expectedSendGeneration,
+            admission: DataChannelSendAdmission(predicate: admission)
+        )
+    }
+
+    func send(
+        dataPacket packet: Livekit_DataPacket,
+        expectedSendGeneration: UInt64,
+        admission: DataChannelSendAdmission
+    ) async throws {
         try await send(prepared: prepareSend(
             dataPacket: packet,
             expectedSendGeneration: expectedSendGeneration,
@@ -424,7 +436,7 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
     private func prepareSend(
         dataPacket packet: Livekit_DataPacket,
         expectedSendGeneration: UInt64,
-        admission: (@Sendable () -> Bool)? = nil
+        admission: DataChannelSendAdmission? = nil
     ) throws -> PreparedSend {
         let generation = try currentSendGeneration()
         guard generation == expectedSendGeneration else {
@@ -468,7 +480,7 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
     private func makeSendAdmission(
         kind: ChannelKind,
         generation: UInt64,
-        additionalAdmission: (@Sendable () -> Bool)?
+        additionalAdmission: DataChannelSendAdmission?
     ) -> DrainSendAdmission {
         DrainSendAdmission(
             preflight: { [weak self] in
@@ -482,12 +494,7 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
                     guard !state.isResetting, state.sendGeneration == generation else {
                         return Self.staleSendError(from: state)
                     }
-                    guard additionalAdmission?() != false else {
-                        return LiveKitError(
-                            .cancelled,
-                            message: "Data channel send admission was revoked"
-                        )
-                    }
+                    if let error = additionalAdmission?.preflight() { return error }
                     return nil
                 }
             },
@@ -502,18 +509,17 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
                     guard !state.isResetting, state.sendGeneration == generation else {
                         return .rejected(Self.staleSendError(from: state))
                     }
-                    guard additionalAdmission?() != false else {
-                        return .rejected(LiveKitError(
-                            .cancelled,
-                            message: "Data channel send admission was revoked"
-                        ))
-                    }
                     let currentIdentifier = switch kind {
                     case .lossy: state.lossyChannelIdentifier
                     case .reliable: state.reliableChannelIdentifier
                     }
                     guard currentIdentifier == ObjectIdentifier(dataChannel) else {
                         return .unavailable
+                    }
+                    if let additionalAdmission {
+                        return additionalAdmission.attempt {
+                            send() ? .sent : .failed
+                        }
                     }
                     return send() ? .sent : .failed
                 }

@@ -79,8 +79,9 @@ final class DataChannelDrain<Stage: SendStage>: NSObject, LKRTCDataChannelDelega
         case submitted(
             Stage.Input,
             DrainSendAdmission?,
-            CheckedContinuation<Void, any Error>?
+            SendToken?
         )
+        case cancelled(SendToken)
         case commanded(Stage.Command, (@Sendable () -> Bool)?)
         case drained(UInt64)
         /// A channel was attached or swapped: the mirror starts over, and under
@@ -198,14 +199,14 @@ final class DataChannelDrain<Stage: SendStage>: NSObject, LKRTCDataChannelDelega
     /// Submits work. Under ``SendOverflow/park`` the continuation resumes when the input's last write
     /// reaches `sendData`; under ``SendOverflow/dropOldest`` an evicted group's waiter is resolved
     /// rather than stranded.
-    /// - Warning: Cancelling the submitting task does **not** withdraw a queued write; it stays
-    ///   queued until the channel takes it or ``reset(throwing:)`` fails it.
+    /// Cancelling the submitting task withdraws every queued write belonging to that exact
+    /// submission. A write already handed to WebRTC cannot be recalled.
     func submit(
         _ input: Stage.Input,
         admission: DrainSendAdmission? = nil,
         continuation: CheckedContinuation<Void, any Error>? = nil
     ) {
-        eventContinuation.yield(.submitted(input, admission, continuation))
+        eventContinuation.yield(.submitted(input, admission, continuation.map(SendToken.init)))
     }
 
     /// Submits work and suspends until its last write reaches the channel (or it is dropped,
@@ -217,8 +218,21 @@ final class DataChannelDrain<Stage: SendStage>: NSObject, LKRTCDataChannelDelega
         _ input: Stage.Input,
         admission: DrainSendAdmission? = nil
     ) async throws {
-        try await withCheckedThrowingContinuation { continuation in
-            submit(input, admission: admission, continuation: continuation)
+        let tokenState = StateSync<SendToken?>(nil)
+        try await withTaskCancellationHandler {
+            try await withCheckedThrowingContinuation { continuation in
+                let token = SendToken(continuation)
+                tokenState.mutate { $0 = token }
+                guard !Task.isCancelled else {
+                    token.settle(with: .failure(LiveKitError(.cancelled)))
+                    return
+                }
+                eventContinuation.yield(.submitted(input, admission, token))
+            }
+        } onCancel: {
+            guard let token = tokenState.copy() else { return }
+            token.settle(with: .failure(LiveKitError(.cancelled)))
+            eventContinuation.yield(.cancelled(token))
         }
     }
 
@@ -256,13 +270,17 @@ final class DataChannelDrain<Stage: SendStage>: NSObject, LKRTCDataChannelDelega
 
     private func process(_ event: Event, state: inout LoopState) {
         switch event {
-        case let .submitted(input, admission, continuation):
+        case let .submitted(input, admission, submissionToken):
             enqueue(
                 input,
                 admission: admission,
-                continuation: continuation,
+                submissionToken: submissionToken,
                 state: &state
             )
+        case let .cancelled(token):
+            for write in state.queue.remove(submission: token) {
+                write.settle(with: .failure(LiveKitError(.cancelled)))
+            }
         case let .commanded(command, admission):
             guard admission?() != false else { break }
             // Replays append synchronously, inside this event: routing them back through the
@@ -313,11 +331,12 @@ final class DataChannelDrain<Stage: SendStage>: NSObject, LKRTCDataChannelDelega
     private func enqueue(
         _ input: Stage.Input,
         admission: DrainSendAdmission?,
-        continuation: CheckedContinuation<Void, any Error>?,
+        submissionToken: SendToken?,
         state: inout LoopState,
     ) {
+        guard submissionToken?.isSettled != true else { return }
         if let error = admission?.preflight() {
-            continuation?.resume(throwing: error)
+            submissionToken?.settle(with: .failure(error))
             return
         }
         state.scratch.removeAll(keepingCapacity: true)
@@ -326,16 +345,16 @@ final class DataChannelDrain<Stage: SendStage>: NSObject, LKRTCDataChannelDelega
             try makeWrites(
                 from: state.scratch,
                 into: &state.writes,
-                continuation: continuation,
+                submissionToken: submissionToken,
                 admission: admission,
                 maxMessageSize: state.maxMessageSize,
             )
         } catch {
-            continuation?.resume(throwing: error)
+            submissionToken?.settle(with: .failure(error))
             return
         }
         guard !state.writes.isEmpty else {
-            continuation?.resume()
+            submissionToken?.settle(with: .success(()))
             return
         }
 
@@ -380,12 +399,7 @@ final class DataChannelDrain<Stage: SendStage>: NSObject, LKRTCDataChannelDelega
             state.queue.promoteIfIdle()
             guard let write = state.queue.next else { return }
             state.meter.willSend(write.byteCount)
-
-            let send: @Sendable () -> Bool = {
-                channel.send(write.payload)
-            }
-            let attempt = write.admission?.attempt(channel, send) ??
-                (send() ? DrainSendAttempt.sent : .failed)
+            let attempt = write.attempt(on: channel)
 
             switch attempt {
             case .sent:

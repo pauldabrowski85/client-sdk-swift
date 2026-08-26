@@ -354,6 +354,8 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
         await releaseHandler.open()
         await waitForRejection(observedReaderError)
         #expect(observedReaderError.copy() == .bufferOverflow)
+        await waitForNoActiveHandlers()
+        #expect(await manager.activeHandlerCount == 0)
     }
 
     @Test func receivedBytesAreRejectedBeforeYieldingPastLimit() async throws {
@@ -494,7 +496,61 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
         await manager.reset()
     }
 
-    @Test func perConnectionStreamAdmissionPreservesCapacityForAnotherCaller() async throws {
+    @Test func fastCloseFloodCannotOutrunHandlerAdmission() async throws {
+        let releaseHandlers = TestGate()
+        let handlerStarts = StateSync(0)
+        let rejections = StateSync<[IncomingStreamRejection]>([])
+        try await manager.registerTextStreamHandler(
+            for: topicName,
+            limits: IncomingStreamLimits(
+                maxStreamBytes: 64,
+                maxConcurrentStreams: 2,
+                maxBufferedChunks: 2
+            ),
+            onStreamRejected: { rejection in rejections.mutate { $0.append(rejection) } }
+        ) { _, _ in
+            handlerStarts.mutate { $0 += 1 }
+            await releaseHandlers.wait()
+        }
+
+        for index in 0 ..< 2 {
+            await sendTextHeader(streamID: "admitted-\(index)")
+            await sendTextTrailer(streamID: "admitted-\(index)")
+        }
+        let handlerDeadline = Date().addingTimeInterval(10)
+        while handlerStarts.copy() < 2, Date() < handlerDeadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        await waitForNoOpenStreams()
+        #expect(handlerStarts.copy() == 2)
+        #expect(await manager.activeHandlerCount == 2)
+
+        for index in 0 ..< 100 {
+            await sendTextHeader(streamID: "rejected-\(index)")
+            await sendTextTrailer(streamID: "rejected-\(index)")
+        }
+        let rejectionDeadline = Date().addingTimeInterval(10)
+        while rejections.copy().count < 100, Date() < rejectionDeadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        #expect(rejections.copy().count == 100)
+        #expect(rejections.copy().allSatisfy {
+            $0.error == .tooManyOpenStreams(maximum: 2) && !$0.handlerWasDispatched
+        })
+        #expect(handlerStarts.copy() == 2)
+        #expect(await manager.openStreamCount == 0)
+        #expect(await manager.activeHandlerCount == 2)
+
+        await releaseHandlers.open()
+        let completionDeadline = Date().addingTimeInterval(10)
+        while await manager.activeHandlerCount != 0, Date() < completionDeadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(await manager.activeHandlerCount == 0)
+    }
+
+    @Test func perConnectionStreamAdmissionIncludesHandlersAfterDescriptorClose() async throws {
         let releaseHandlers = TestGate()
         let rejections = StateSync<[IncomingStreamRejection]>([])
         try await manager.registerTextStreamHandler(
@@ -522,6 +578,20 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
             )
         }
         await waitForOpenStreams(RpcInvocationLimits.maximumInFlightPerConnection)
+        for index in 0 ..< RpcInvocationLimits.maximumInFlightPerConnection {
+            let trailer = Livekit_DataStream.Trailer.with {
+                $0.streamID = "caller-a-\(index)"
+            }
+            manager.handle(.trailer(
+                trailer,
+                callerA.stringValue,
+                callerASid,
+                receiveGeneration,
+                .none
+            ))
+        }
+        await waitForNoOpenStreams()
+        #expect(await manager.activeHandlerCount == RpcInvocationLimits.maximumInFlightPerConnection)
 
         sendTextHeader(
             streamID: "caller-a-over-cap",
@@ -543,7 +613,7 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
             publisherParticipantSid: callerBSid,
             dataPacketReceiveGeneration: receiveGeneration
         )
-        await waitForOpenStreams(RpcInvocationLimits.maximumInFlightPerConnection + 1)
+        await waitForOpenStreams(1)
 
         let rejection = try #require(rejections.copy().first)
         #expect(rejection.participantIdentity == callerA)
@@ -556,7 +626,8 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
                 maximum: RpcInvocationLimits.maximumInFlightPerConnection
             )
         )
-        #expect(await manager.openStreamCount == RpcInvocationLimits.maximumInFlightPerConnection + 1)
+        #expect(await manager.openStreamCount == 1)
+        #expect(await manager.activeHandlerCount == RpcInvocationLimits.maximumInFlightPerConnection + 1)
         await releaseHandlers.open()
         await manager.reset()
     }
@@ -894,6 +965,13 @@ extension IncomingStreamManagerTests {
         }
     }
 
+    private func waitForNoActiveHandlers() async {
+        let deadline = Date().addingTimeInterval(10)
+        while await manager.activeHandlerCount != 0, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
     private func waitForRejection(_ error: StateSync<StreamError?>) async {
         let deadline = Date().addingTimeInterval(10)
         while error.copy() == nil, Date() < deadline {
@@ -1131,6 +1209,9 @@ extension IncomingStreamManagerTests {
 
         #expect(received.copy() == ["after"])
         #expect(errors.copy() == [.terminated])
+        await waitForNoActiveHandlers()
+        #expect(await manager.openStreamCount == 0)
+        #expect(await manager.activeHandlerCount == 0)
         await manager.unregisterTextStreamHandler(for: topicName)
     }
 
@@ -1156,6 +1237,9 @@ extension IncomingStreamManagerTests {
         }
 
         #expect(received.copy() == ["after-reset"])
+        await waitForNoActiveHandlers()
+        #expect(await manager.openStreamCount == 0)
+        #expect(await manager.activeHandlerCount == 0)
         await manager.unregisterTextStreamHandler(for: topicName)
     }
 

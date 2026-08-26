@@ -106,7 +106,7 @@ extension Room {
     func send(
         dataPacket packet: consuming Livekit_DataPacket,
         expectedDataChannelSendGeneration: UInt64?,
-        admission: (@Sendable () -> Bool)? = nil
+        admission: DataChannelSendAdmission? = nil
     ) async throws {
         try await ensurePublisherConnected()
 

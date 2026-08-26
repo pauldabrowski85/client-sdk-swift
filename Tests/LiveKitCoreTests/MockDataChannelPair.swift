@@ -48,4 +48,26 @@ class MockDataChannelPair: DataChannelPair, @unchecked Sendable {
         }
         packetHandler(packet)
     }
+
+    override func send(
+        dataPacket packet: Livekit_DataPacket,
+        expectedSendGeneration: UInt64,
+        admission: DataChannelSendAdmission
+    ) async throws {
+        guard expectedSendGeneration == sendGeneration else {
+            throw LiveKitError(.invalidState, message: "Mock data-channel send generation changed")
+        }
+        if let error = admission.preflight() { throw error }
+        switch admission.attempt({ [self] in
+            packetHandler(packet)
+            return .sent
+        }) {
+        case .sent:
+            return
+        case .unavailable, .failed:
+            throw LiveKitError(.invalidState, message: "Mock data-channel send failed")
+        case let .rejected(error):
+            throw error
+        }
+    }
 }

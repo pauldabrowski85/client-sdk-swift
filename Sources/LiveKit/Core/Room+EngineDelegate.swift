@@ -493,17 +493,17 @@ extension Room {
         let responseTimeout = TimeInterval(request.responseTimeoutMs) / TimeInterval(msecPerSec)
         let version = Int(request.version)
 
-        Task.discarding { [rpcServer] in
-            await rpcServer.handleIncomingRequest(callerIdentity: callerIdentity,
-                                                  callerParticipantSid: participantSid,
-                                                  callerDataPacketReceiveGeneration: dataPacketReceiveGeneration,
-                                                  requestId: requestId,
-                                                  method: method,
-                                                  payload: payload,
-                                                  responseTimeout: responseTimeout,
-                                                  receivedAtContinuousTimeNanoseconds: receivedAtContinuousTimeNanoseconds,
-                                                  version: version)
-        }
+        rpcServer.enqueueIncomingRequest(
+            callerIdentity: callerIdentity,
+            callerParticipantSid: participantSid,
+            callerDataPacketReceiveGeneration: dataPacketReceiveGeneration,
+            requestId: requestId,
+            method: method,
+            payload: payload,
+            responseTimeout: responseTimeout,
+            receivedAtContinuousTimeNanoseconds: receivedAtContinuousTimeNanoseconds,
+            version: version
+        )
     }
 }
 

@@ -641,6 +641,785 @@ struct RpcClientTests {
     }
 }
 
+@Suite(.serialized, .tags(.rpc))
+struct RpcAbsoluteDeadlineTests {
+    @Test func destinationResolutionFailureAtDeadlineMapsToResponseTimeout() async throws {
+        let room = Room()
+        await room.rpcClient.attach(to: room)
+        let clockReads = StateSync(0)
+        await room.rpcClient.setClientClock(
+            nowNanoseconds: {
+                let read = clockReads.mutate { count in
+                    count += 1
+                    return count
+                }
+                return read == 1 ? 100 : 1_000_000_100
+            },
+            sleepUntil: { _ in }
+        )
+
+        await #expect {
+            _ = try await room.localParticipant.performRpc(
+                destinationIdentity: Participant.Identity(from: "missing-at-deadline"),
+                method: "resolution-deadline",
+                payload: "",
+                responseTimeout: 1,
+                maxRoundTripLatency: 0
+            )
+        } throws: { error in
+            (error as? RpcError)?.code == RpcError.BuiltInError.responseTimeout.code
+        }
+        #expect(clockReads.copy() >= 2)
+        #expect(await room.rpcClient.pendingCount == 0)
+    }
+
+    @Test func atomicPublicationAdmissionRejectsAfterSuccessfulPreflight() {
+        let now = StateSync<UInt64>(0)
+        let gate = RpcPublicationGate(
+            responseDeadlineContinuousTimeNanoseconds: 10,
+            nowNanoseconds: { now.copy() },
+            additionalAdmission: DataChannelSendAdmission(predicate: { true })
+        )
+        let admission = gate.sendAdmission
+        #expect(admission.preflight() == nil)
+
+        now.mutate { $0 = 10 }
+        gate.revoke()
+        let sent = StateSync(false)
+        let result = admission.attempt {
+            sent.mutate { $0 = true }
+            return .sent
+        }
+
+        guard case .rejected = result else {
+            Issue.record("Expected revoked admission to reject the final send attempt")
+            return
+        }
+        #expect(!sent.copy())
+    }
+
+    @Test(arguments: [ClientProtocol.v0, ClientProtocol.v1])
+    func deadlineWithdrawsBlockedRequestPublication(clientProtocol: ClientProtocol) async throws {
+        let room = Room()
+        await room.rpcClient.attach(to: room)
+        let destination = Participant.Identity(from: "blocked-publication-\(clientProtocol.rawValue)")
+        try await RpcTestSupport.installRemote(
+            in: room,
+            identity: destination,
+            clientProtocol: clientProtocol
+        )
+        let packets = StateSync<[Livekit_DataPacket]>([])
+        let channel = RpcBlockingDataChannelPair { packet in packets.mutate { $0.append(packet) } }
+        room.publisherDataChannel = channel
+        let clock = RpcManualClock(now: 100)
+        await room.rpcClient.setClientClock(
+            nowNanoseconds: clock.now,
+            sleepUntil: clock.sleepUntil
+        )
+
+        let call = Task {
+            try await room.localParticipant.performRpc(
+                destinationIdentity: destination,
+                method: "blocked-publication",
+                payload: "payload",
+                responseTimeout: 1,
+                maxRoundTripLatency: 0
+            )
+        }
+        _ = try await channel.sendStarted.wait()
+        clock.advance(to: 1_000_000_100, wakingSleepers: true)
+
+        await #expect {
+            try await call.value
+        } throws: { error in
+            (error as? RpcError)?.code == RpcError.BuiltInError.responseTimeout.code
+        }
+        channel.releaseSends()
+        await Task.yield()
+
+        #expect(packets.copy().isEmpty)
+        #expect(await room.rpcClient.pendingCount == 0)
+        #expect(await room.outgoingStreamManager.openStreamCount == 0)
+    }
+
+    @Test(arguments: RpcDeadlineTerminalSource.allCases, [UInt64(0), 1])
+    func deadlineWinsEveryConcurrentTerminalSource(
+        source: RpcDeadlineTerminalSource,
+        nanosecondsAfterDeadline: UInt64
+    ) async throws {
+        let room = Room()
+        await room.rpcClient.attach(to: room)
+        let destination = Participant.Identity(from: "terminal-source")
+        let participant = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: destination,
+            clientProtocol: .v0
+        )
+        let sid = try #require(participant.sid)
+        room.publisherDataChannel = MockDataChannelPair { _ in }
+        let clock = RpcManualClock(now: 200)
+        await room.rpcClient.setClientClock(
+            nowNanoseconds: clock.now,
+            sleepUntil: clock.sleepUntil
+        )
+        await room.rpcClient.setAfterPublish { requestId in
+            clock.advance(
+                to: 1_000_000_200 + nanosecondsAfterDeadline,
+                wakingSleepers: false
+            )
+            switch source {
+            case .ackTimeout:
+                await room.rpcClient.fireAckTimeoutIfPending(requestId: requestId)
+            case .participantDisconnected:
+                await RpcTestSupport.disconnectCurrent(in: room, identity: destination)
+            case .allDisconnected:
+                await room.rpcClient.handleAllPendingDisconnected()
+            case .response:
+                await RpcTestSupport.deliverResponse(
+                    in: room,
+                    requestId: requestId,
+                    payload: "late",
+                    error: nil,
+                    from: destination
+                )
+            case .streamRejection:
+                await room.rpcClient.handleIncomingResponseStreamRejection(
+                    IncomingStreamRejection(
+                        streamID: "late-rejection",
+                        topic: RpcStreamTopic.response,
+                        participantIdentity: destination,
+                        publisherParticipantSid: sid,
+                        dataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
+                        attributes: [RpcStreamAttribute.requestId: requestId],
+                        handlerWasDispatched: false,
+                        error: .tooManyOpenStreams(maximum: 1)
+                    )
+                )
+            case .streamReaderFailure:
+                let reader = RpcTestSupport.makeFailingResponseReader(
+                    requestId: requestId,
+                    publisherParticipantSid: sid,
+                    dataPacketReceiveGeneration: room.dataPacketReceiveGeneration
+                )
+                await room.rpcClient.handleIncomingResponseStream(
+                    reader: reader,
+                    senderIdentity: destination
+                )
+            case .callerCancellation:
+                withUnsafeCurrentTask { $0?.cancel() }
+            }
+        }
+
+        await #expect {
+            try await room.localParticipant.performRpc(
+                destinationIdentity: destination,
+                method: "terminal-source",
+                payload: "",
+                responseTimeout: 1,
+                maxRoundTripLatency: 0
+            )
+        } throws: { error in
+            (error as? RpcError)?.code == RpcError.BuiltInError.responseTimeout.code
+        }
+        #expect(await room.rpcClient.pendingCount == 0)
+    }
+
+    @Test(arguments: RpcPublicationTerminalSource.allCases)
+    func terminalResultWinsWhileV2RequestPublicationIsSuspended(
+        source: RpcPublicationTerminalSource
+    ) async throws {
+        let room = Room()
+        await room.rpcClient.attach(to: room)
+        let destination = Participant.Identity(from: "publication-terminal-\(source.testDescription)")
+        let participant = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: destination,
+            clientProtocol: .v1
+        )
+        let sid = try #require(participant.sid)
+        let packets = StateSync<[Livekit_DataPacket]>([])
+        let channel = RpcAdmissionPausedDataChannelPair(blockedAttempt: 2) { packet in
+            packets.mutate { $0.append(packet) }
+        }
+        room.publisherDataChannel = channel
+
+        let terminalOutcome = StateSync<RpcPublicationTerminalOutcome?>(nil)
+        let callFinished = AsyncCompleter<Void>(
+            label: "rpc-terminal-cancels-publication",
+            defaultTimeout: 1
+        )
+        let call = Task {
+            defer { callFinished.resume(returning: ()) }
+            do {
+                let response = try await room.localParticipant.performRpc(
+                    destinationIdentity: destination,
+                    method: "publication-terminal",
+                    payload: "payload",
+                    responseTimeout: 5,
+                    maxRoundTripLatency: 0
+                )
+                terminalOutcome.mutate { $0 = .success(response) }
+            } catch let error as RpcError {
+                terminalOutcome.mutate {
+                    $0 = .rpcError(code: error.code, message: error.message, data: error.data)
+                }
+            } catch {
+                terminalOutcome.mutate { $0 = .unexpected(String(describing: error)) }
+            }
+        }
+        _ = try await channel.preflightPassed.wait()
+        let requestId = try #require(packets.copy().compactMap { packet -> String? in
+            guard case let .streamHeader(header) = packet.value else { return nil }
+            return header.attributes[RpcStreamAttribute.requestId]
+        }.first)
+
+        switch source {
+        case .ackTimeout:
+            await room.rpcClient.fireAckTimeoutIfPending(requestId: requestId)
+        case .participantDisconnected:
+            await RpcTestSupport.disconnectCurrent(in: room, identity: destination)
+        case .allDisconnected:
+            await room.rpcClient.handleAllPendingDisconnected()
+        case .response:
+            await RpcTestSupport.deliverResponse(
+                in: room,
+                requestId: requestId,
+                payload: "terminal-response",
+                error: nil,
+                from: destination
+            )
+        case .overloadResponse:
+            await RpcTestSupport.deliverResponse(
+                in: room,
+                requestId: requestId,
+                payload: nil,
+                error: .receiverOverloaded,
+                from: destination
+            )
+        case .streamRejection:
+            await room.rpcClient.handleIncomingResponseStreamRejection(
+                IncomingStreamRejection(
+                    streamID: "publication-terminal-rejection",
+                    topic: RpcStreamTopic.response,
+                    participantIdentity: destination,
+                    publisherParticipantSid: sid,
+                    dataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
+                    attributes: [RpcStreamAttribute.requestId: requestId],
+                    handlerWasDispatched: false,
+                    error: .streamSizeExceeded(maximumBytes: 1)
+                )
+            )
+        case .streamReaderFailure:
+            let reader = RpcTestSupport.makeFailingResponseReader(
+                requestId: requestId,
+                publisherParticipantSid: sid,
+                dataPacketReceiveGeneration: room.dataPacketReceiveGeneration
+            )
+            await room.rpcClient.handleIncomingResponseStream(
+                reader: reader,
+                senderIdentity: destination
+            )
+        }
+
+        do {
+            _ = try await callFinished.wait(timeout: 1)
+        } catch {
+            await channel.releaseSends()
+            call.cancel()
+            _ = await call.result
+            Issue.record("Terminal result did not cancel suspended publication: \(error)")
+            return
+        }
+
+        let outcome = try #require(terminalOutcome.copy())
+        switch outcome {
+        case let .success(response):
+            #expect(source == .response)
+            #expect(response == "terminal-response")
+        case let .rpcError(code, message, data):
+            #expect(source != .response)
+            #expect(code == source.expectedErrorCode)
+            if source == .overloadResponse {
+                #expect(message == "RPC receiver overloaded")
+                #expect(data == "resource_exhausted")
+            }
+        case let .unexpected(error):
+            Issue.record("Expected the first RPC terminal result, got \(error)")
+        }
+
+        #expect(packets.copy().count == 1)
+        #expect(await room.rpcClient.pendingCount == 0)
+        #expect(await room.outgoingStreamManager.openStreamCount == 0)
+        #expect(await room.rpcClient.activePublicationTaskCount == 1)
+        await channel.releaseSends()
+        await waitUntil { await room.rpcClient.activePublicationTaskCount == 0 }
+        _ = await call.result
+        #expect(packets.copy().count == 1)
+        #expect(await room.outgoingStreamManager.openStreamCount == 0)
+    }
+
+    @Test(arguments: [ClientProtocol.v0, ClientProtocol.v1])
+    func callerCancellationWithdrawsSuspendedPublication(
+        clientProtocol: ClientProtocol
+    ) async throws {
+        let room = Room()
+        await room.rpcClient.attach(to: room)
+        let destination = Participant.Identity(from: "publication-cancellation-\(clientProtocol.rawValue)")
+        try await RpcTestSupport.installRemote(
+            in: room,
+            identity: destination,
+            clientProtocol: clientProtocol
+        )
+        let packets = StateSync<[Livekit_DataPacket]>([])
+        let channel = RpcAdmissionPausedDataChannelPair(blockedAttempt: 1) { packet in
+            packets.mutate { $0.append(packet) }
+        }
+        room.publisherDataChannel = channel
+        let observedCancellation = StateSync(false)
+        let callFinished = AsyncCompleter<Void>(
+            label: "rpc-caller-cancellation-withdraws-publication",
+            defaultTimeout: 1
+        )
+        let performRpc = room.localParticipant.performRpc
+        let call = Task {
+            defer { callFinished.resume(returning: ()) }
+            do {
+                _ = try await performRpc(
+                    destination,
+                    "publication-cancellation",
+                    "payload",
+                    5,
+                    0
+                )
+            } catch let error as LiveKitError {
+                observedCancellation.mutate { $0 = error.type == .cancelled }
+            } catch {}
+        }
+        _ = try await channel.preflightPassed.wait()
+        call.cancel()
+
+        do {
+            _ = try await callFinished.wait(timeout: 1)
+        } catch {
+            await channel.releaseSends()
+            _ = await call.result
+            Issue.record("Caller cancellation did not withdraw suspended publication: \(error)")
+            return
+        }
+
+        #expect(observedCancellation.copy())
+        #expect(packets.copy().isEmpty)
+        #expect(await room.rpcClient.pendingCount == 0)
+        #expect(await room.outgoingStreamManager.openStreamCount == 0)
+        #expect(await room.rpcClient.activePublicationTaskCount == 1)
+        await channel.releaseSends()
+        await waitUntil { await room.rpcClient.activePublicationTaskCount == 0 }
+        _ = await call.result
+        #expect(packets.copy().isEmpty)
+        #expect(await room.outgoingStreamManager.openStreamCount == 0)
+    }
+
+    private func waitUntil(_ condition: @Sendable () async -> Bool) async {
+        let deadline = Date().addingTimeInterval(2)
+        while !(await condition()), Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+}
+
+@Suite(.serialized, .tags(.rpc))
+struct RpcPublicationOwnershipTests {
+    @Test(arguments: [ClientProtocol.v0, ClientProtocol.v1], RpcConnectionInvalidation.allCases)
+    func clientPublicationRejectsOwnershipChangeAfterPreflight(
+        clientProtocol: ClientProtocol,
+        invalidation: RpcConnectionInvalidation
+    ) async throws {
+        let room = Room()
+        await room.rpcClient.attach(to: room)
+        let destination = Participant.Identity(
+            from: "client-publication-\(clientProtocol.rawValue)-\(invalidation.testDescription)"
+        )
+        let original = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: destination,
+            clientProtocol: clientProtocol
+        )
+        let packets = StateSync<[Livekit_DataPacket]>([])
+        let channel = RpcAdmissionPausedDataChannelPair(blockedAttempt: 1) { packet in
+            packets.mutate { $0.append(packet) }
+        }
+        room.publisherDataChannel = channel
+
+        let call = Task {
+            try await room.localParticipant.performRpc(
+                destinationIdentity: destination,
+                method: "ownership-race",
+                payload: "payload",
+                responseTimeout: 5,
+                maxRoundTripLatency: 0
+            )
+        }
+        _ = try await channel.preflightPassed.wait()
+        try await invalidation.apply(
+            to: room,
+            identity: destination,
+            original: original,
+            clientProtocol: clientProtocol
+        )
+        await channel.releaseSends()
+
+        do {
+            _ = try await call.value
+            Issue.record("Stale client publication unexpectedly completed")
+        } catch {}
+
+        #expect(packets.copy().isEmpty)
+        #expect(channel.sendAttemptCount.copy() == 1)
+        #expect(await room.rpcClient.pendingCount == 0)
+        #expect(await room.outgoingStreamManager.openStreamCount == 0)
+    }
+
+    @Test(arguments: RpcConnectionInvalidation.allCases, RpcStreamPublicationBoundary.allCases)
+    func clientV2PublicationCleansDescriptorWhenOwnershipChangesBetweenOperations(
+        invalidation: RpcConnectionInvalidation,
+        boundary: RpcStreamPublicationBoundary
+    ) async throws {
+        let room = Room()
+        await room.rpcClient.attach(to: room)
+        let destination = Participant.Identity(
+            from: "client-v2-boundary-\(invalidation.testDescription)-\(boundary.testDescription)"
+        )
+        let original = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: destination,
+            clientProtocol: .v1
+        )
+        let sid = try #require(original.sid)
+        let packets = StateSync<[Livekit_DataPacket]>([])
+        room.publisherDataChannel = MockDataChannelPair { packet in
+            packets.mutate { $0.append(packet) }
+        }
+        let didInvalidate = StateSync(false)
+        await room.outgoingStreamManager.setOperationObserver { operation in
+            guard operation == boundary.nextOperation else { return }
+            let shouldInvalidate = didInvalidate.mutate { invalidated in
+                guard !invalidated else { return false }
+                invalidated = true
+                return true
+            }
+            guard shouldInvalidate else { return }
+            invalidation.applySynchronously(
+                to: room,
+                identity: destination,
+                original: original,
+                sid: sid,
+                clientProtocol: .v1
+            )
+        }
+
+        await #expect(throws: (any Error).self) {
+            _ = try await room.localParticipant.performRpc(
+                destinationIdentity: destination,
+                method: "v2-boundary",
+                payload: "payload",
+                responseTimeout: 5,
+                maxRoundTripLatency: 0
+            )
+        }
+        await room.outgoingStreamManager.setOperationObserver(nil)
+
+        #expect(didInvalidate.copy())
+        #expect(packets.copy().count == boundary.clientPacketCount)
+        #expect(await room.rpcClient.pendingCount == 0)
+        #expect(await room.outgoingStreamManager.openStreamCount == 0)
+    }
+
+    @Test(arguments: RpcConnectionInvalidation.allCases)
+    func serverAckRejectsOwnershipChangeAfterPreflight(
+        invalidation: RpcConnectionInvalidation
+    ) async throws {
+        let room = Room()
+        await room.rpcServer.attach(to: room)
+        let caller = Participant.Identity(from: "server-ack-\(invalidation.testDescription)")
+        let original = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: caller,
+            clientProtocol: .v0
+        )
+        let sid = try #require(original.sid)
+        let invoked = StateSync(false)
+        let packets = StateSync<[Livekit_DataPacket]>([])
+        let channel = RpcAdmissionPausedDataChannelPair(blockedAttempt: 1) { packet in
+            packets.mutate { $0.append(packet) }
+        }
+        room.publisherDataChannel = channel
+        try await room.registerRpcMethod("ownership-ack") { _ in
+            invoked.mutate { $0 = true }
+            return "response"
+        }
+
+        let request = Task {
+            await room.rpcServer.handleIncomingRequest(
+                callerIdentity: caller,
+                callerParticipantSid: sid,
+                callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
+                requestId: "ownership-ack",
+                method: "ownership-ack",
+                payload: "",
+                responseTimeout: 5,
+                version: 1
+            )
+        }
+        _ = try await channel.preflightPassed.wait()
+        try await invalidation.apply(
+            to: room,
+            identity: caller,
+            original: original,
+            clientProtocol: .v0
+        )
+        await channel.releaseSends()
+        await request.value
+
+        #expect(packets.copy().isEmpty)
+        #expect(!invoked.copy())
+        #expect(room.rpcServer.activeInvocationCount == 0)
+    }
+
+    @Test(arguments: [ClientProtocol.v0, ClientProtocol.v1], RpcConnectionInvalidation.allCases)
+    func serverResponseRejectsOwnershipChangeAfterPreflight(
+        clientProtocol: ClientProtocol,
+        invalidation: RpcConnectionInvalidation
+    ) async throws {
+        let room = Room()
+        await room.rpcServer.attach(to: room)
+        let caller = Participant.Identity(
+            from: "server-response-\(clientProtocol.rawValue)-\(invalidation.testDescription)"
+        )
+        let original = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: caller,
+            clientProtocol: clientProtocol
+        )
+        let sid = try #require(original.sid)
+        let invoked = StateSync(false)
+        let packets = StateSync<[Livekit_DataPacket]>([])
+        let channel = RpcAdmissionPausedDataChannelPair(blockedAttempt: 2) { packet in
+            packets.mutate { $0.append(packet) }
+        }
+        room.publisherDataChannel = channel
+        try await room.registerRpcMethod("ownership-response") { _ in
+            invoked.mutate { $0 = true }
+            return "response"
+        }
+
+        let request = Task {
+            await room.rpcServer.handleIncomingRequest(
+                callerIdentity: caller,
+                callerParticipantSid: sid,
+                callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
+                requestId: "ownership-response",
+                method: "ownership-response",
+                payload: "",
+                responseTimeout: 5,
+                version: 1
+            )
+        }
+        _ = try await channel.preflightPassed.wait()
+        try await invalidation.apply(
+            to: room,
+            identity: caller,
+            original: original,
+            clientProtocol: clientProtocol
+        )
+        await channel.releaseSends()
+        await request.value
+
+        let sentPackets = packets.copy()
+        #expect(invoked.copy())
+        #expect(sentPackets.count == 1)
+        #expect(sentPackets.allSatisfy {
+            if case .rpcAck = $0.value { return true }
+            return false
+        })
+        #expect(await room.outgoingStreamManager.openStreamCount == 0)
+        #expect(room.rpcServer.activeInvocationCount == 0)
+    }
+
+    @Test(arguments: RpcConnectionInvalidation.allCases, RpcStreamPublicationBoundary.allCases)
+    func serverV2ResponseCleansDescriptorWhenOwnershipChangesBetweenOperations(
+        invalidation: RpcConnectionInvalidation,
+        boundary: RpcStreamPublicationBoundary
+    ) async throws {
+        let room = Room()
+        await room.rpcServer.attach(to: room)
+        let caller = Participant.Identity(
+            from: "server-v2-boundary-\(invalidation.testDescription)-\(boundary.testDescription)"
+        )
+        let original = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: caller,
+            clientProtocol: .v1
+        )
+        let sid = try #require(original.sid)
+        let packets = StateSync<[Livekit_DataPacket]>([])
+        room.publisherDataChannel = MockDataChannelPair { packet in
+            packets.mutate { $0.append(packet) }
+        }
+        let didInvalidate = StateSync(false)
+        await room.outgoingStreamManager.setOperationObserver { operation in
+            guard operation == boundary.nextOperation else { return }
+            let shouldInvalidate = didInvalidate.mutate { invalidated in
+                guard !invalidated else { return false }
+                invalidated = true
+                return true
+            }
+            guard shouldInvalidate else { return }
+            invalidation.applySynchronously(
+                to: room,
+                identity: caller,
+                original: original,
+                sid: sid,
+                clientProtocol: .v1
+            )
+        }
+        try await room.registerRpcMethod("v2-boundary") { _ in "response" }
+
+        await room.rpcServer.handleIncomingRequest(
+            callerIdentity: caller,
+            callerParticipantSid: sid,
+            callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
+            requestId: "server-v2-boundary",
+            method: "v2-boundary",
+            payload: "",
+            responseTimeout: 5,
+            version: 1
+        )
+        await room.outgoingStreamManager.setOperationObserver(nil)
+
+        #expect(didInvalidate.copy())
+        #expect(packets.copy().count == boundary.serverPacketCount)
+        #expect(await room.outgoingStreamManager.openStreamCount == 0)
+        #expect(room.rpcServer.activeInvocationCount == 0)
+    }
+
+    @Test(arguments: RpcConnectionInvalidation.allCases)
+    func boundedControlResponseRejectsOwnershipChangeAfterPreflight(
+        invalidation: RpcConnectionInvalidation
+    ) async throws {
+        let room = Room()
+        await room.rpcServer.attach(to: room)
+        let caller = Participant.Identity(from: "control-response-\(invalidation.testDescription)")
+        let original = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: caller,
+            clientProtocol: .v1
+        )
+        let sid = try #require(original.sid)
+        let receiveGeneration = room.dataPacketReceiveGeneration
+        let packets = StateSync<[Livekit_DataPacket]>([])
+        let channel = RpcAdmissionPausedDataChannelPair(blockedAttempt: 1) { packet in
+            packets.mutate { $0.append(packet) }
+        }
+        room.publisherDataChannel = channel
+
+        room.rpcServer.enqueueIncomingRequestStreamRejection(IncomingStreamRejection(
+            streamID: "ownership-control",
+            topic: RpcStreamTopic.request,
+            participantIdentity: caller,
+            publisherParticipantSid: sid,
+            dataPacketReceiveGeneration: receiveGeneration,
+            attributes: [RpcStreamAttribute.requestId: "ownership-control"],
+            handlerWasDispatched: false,
+            error: .streamSizeExceeded(maximumBytes: 1)
+        ))
+        _ = try await channel.preflightPassed.wait()
+        try await invalidation.apply(
+            to: room,
+            identity: caller,
+            original: original,
+            clientProtocol: .v1
+        )
+        await channel.releaseSends()
+        await waitUntil { room.rpcServer.activeControlReplyCount == 0 }
+
+        #expect(packets.copy().isEmpty)
+        #expect(room.rpcServer.activeControlReplyCount == 0)
+    }
+
+    @Test
+    func disconnectSignalRetiresExactParticipantBeforeAsyncCleanup() async throws {
+        let room = Room()
+        await room.rpcClient.attach(to: room)
+        let identity = Participant.Identity(from: "disconnect-window")
+        let original = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: identity,
+            clientProtocol: .v0
+        )
+        let originalSid = try #require(original.sid)
+        let cleanupEntered = AsyncCompleter<Void>(
+            label: "participant-retirement-cleanup-entered",
+            defaultTimeout: 2
+        )
+        let cleanupRelease = RpcNonCooperativeGate()
+        room.setAfterParticipantRetirementForTests {
+            cleanupEntered.resume(returning: ())
+            await cleanupRelease.wait()
+        }
+
+        let disconnectedInfo = Livekit_ParticipantInfo.with {
+            $0.identity = identity.stringValue
+            $0.sid = originalSid.stringValue
+            $0.state = .disconnected
+        }
+        let update = Task {
+            await room.signalClient(
+                room.signalClient,
+                didUpdateParticipants: [disconnectedInfo]
+            )
+        }
+        _ = try await cleanupEntered.wait()
+
+        #expect(room._state.remoteParticipants[identity] == nil)
+        #expect(RpcParticipantConnection.resolveCurrent(in: room, identity: identity) == nil)
+        let packets = StateSync<[Livekit_DataPacket]>([])
+        room.publisherDataChannel = MockDataChannelPair { packet in
+            packets.mutate { $0.append(packet) }
+        }
+        await #expect {
+            try await room.localParticipant.performRpc(
+                destinationIdentity: identity,
+                method: "disconnect-window",
+                payload: "",
+                responseTimeout: 1,
+                maxRoundTripLatency: 0
+            )
+        } throws: { error in
+            (error as? RpcError)?.code == RpcError.BuiltInError.recipientDisconnected.code
+        }
+        #expect(packets.copy().isEmpty)
+
+        let replacement = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: identity,
+            clientProtocol: .v0
+        )
+        await cleanupRelease.open()
+        _ = await update.result
+        room.setAfterParticipantRetirementForTests(nil)
+
+        #expect(room._state.remoteParticipants[identity] === replacement)
+        #expect(RpcParticipantConnection.resolveCurrent(in: room, identity: identity)?.participant === replacement)
+    }
+
+    private func waitUntil(_ condition: @Sendable () async -> Bool) async {
+        let deadline = Date().addingTimeInterval(10)
+        while !(await condition()), Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+}
+
 // MARK: - RpcServerTests
 
 /// Unit-level coverage of ``RpcServerManager``: handler registry, v1 dispatch,
@@ -1569,6 +2348,241 @@ struct RpcStreamResourceLimitTests {
         }
     }
 
+    @Test func unterminatedResponseStopsAtCallerDeadlineAndDrainsDescriptor() async throws {
+        let room = Room()
+        let participant = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: caller,
+            clientProtocol: .v1
+        )
+        let sid = try #require(participant.sid)
+        room.publisherDataChannel = MockDataChannelPair { _ in }
+        await room.setupRpc()
+        await room.rpcClient.setAfterPublish { requestId in
+            await RpcTestSupport.deliverAck(in: room, requestId: requestId, from: self.caller)
+            room.incomingStreamManager.handle(.header(
+                self.responseHeader(
+                    id: "unterminated-response",
+                    requestId: requestId,
+                    declaredLength: nil
+                ),
+                self.caller.stringValue,
+                sid,
+                room.dataPacketReceiveGeneration,
+                .none
+            ))
+            let admissionDeadline = Date().addingTimeInterval(2)
+            while await room.incomingStreamManager.openStreamCount != 1,
+                  Date() < admissionDeadline
+            {
+                await Task.yield()
+            }
+        }
+
+        await #expect {
+            try await room.localParticipant.performRpc(
+                destinationIdentity: caller,
+                method: "bounded",
+                payload: "request",
+                responseTimeout: 0.25,
+                maxRoundTripLatency: 0
+            )
+        } throws: { error in
+            (error as? RpcError)?.code == RpcError.BuiltInError.responseTimeout.code
+        }
+        await waitUntil { await room.incomingStreamManager.openStreamCount == 0 }
+
+        #expect(await room.incomingStreamManager.openStreamCount == 0)
+        #expect(await room.rpcClient.pendingCount == 0)
+    }
+
+    @Test func cancellingCallerDrainsUnterminatedResponseDescriptor() async throws {
+        let room = Room()
+        let participant = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: caller,
+            clientProtocol: .v1
+        )
+        let sid = try #require(participant.sid)
+        let responseAdmitted = AsyncCompleter<Void>(
+            label: "unterminated-response-admitted",
+            defaultTimeout: 2
+        )
+        room.publisherDataChannel = MockDataChannelPair { _ in }
+        await room.setupRpc()
+        await room.rpcClient.setAfterPublish { requestId in
+            await RpcTestSupport.deliverAck(in: room, requestId: requestId, from: self.caller)
+            room.incomingStreamManager.handle(.header(
+                self.responseHeader(
+                    id: "cancelled-unterminated-response",
+                    requestId: requestId,
+                    declaredLength: nil
+                ),
+                self.caller.stringValue,
+                sid,
+                room.dataPacketReceiveGeneration,
+                .none
+            ))
+            let admissionDeadline = Date().addingTimeInterval(2)
+            while await room.incomingStreamManager.openStreamCount != 1,
+                  Date() < admissionDeadline
+            {
+                await Task.yield()
+            }
+            responseAdmitted.resume(returning: ())
+        }
+
+        let call = Task {
+            try await room.localParticipant.performRpc(
+                destinationIdentity: caller,
+                method: "bounded",
+                payload: "request",
+                responseTimeout: 2,
+                maxRoundTripLatency: 0
+            )
+        }
+        defer { call.cancel() }
+        _ = try await responseAdmitted.wait()
+        let cancellationStartedAt = RpcContinuousClock.nowNanoseconds()
+        call.cancel()
+        await #expect {
+            try await call.value
+        } throws: { error in
+            (error as? LiveKitError)?.type == .cancelled
+        }
+        #expect(RpcContinuousClock.nowNanoseconds() - cancellationStartedAt < 1_000_000_000)
+        await waitUntil { await room.incomingStreamManager.openStreamCount == 0 }
+
+        #expect(await room.incomingStreamManager.openStreamCount == 0)
+        #expect(await room.rpcClient.pendingCount == 0)
+    }
+
+    @Test func responseDescriptorAdmissionPreservesCapacityForAnotherConnection() async throws {
+        let room = Room()
+        let firstSender = caller
+        let firstParticipant = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: firstSender,
+            clientProtocol: .v1
+        )
+        let secondSender = Participant.Identity(from: "second-response-sender")
+        let secondParticipant = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: secondSender,
+            clientProtocol: .v1
+        )
+        let firstSid = try #require(firstParticipant.sid)
+        let secondSid = try #require(secondParticipant.sid)
+        room.publisherDataChannel = MockDataChannelPair { _ in }
+        await room.setupRpc()
+
+        let requestIDs = TestStringCollector()
+        await room.rpcClient.setAfterPublish { requestId in
+            await requestIDs.append(requestId)
+        }
+        var firstSenderCalls: [Task<String, Error>] = []
+        var secondSenderCall: Task<String, Error>?
+        defer {
+            for call in firstSenderCalls { call.cancel() }
+            secondSenderCall?.cancel()
+        }
+        for index in 0 ... RpcInvocationLimits.maximumInFlightPerConnection {
+            firstSenderCalls.append(Task {
+                try await room.localParticipant.performRpc(
+                    destinationIdentity: firstSender,
+                    method: "response-admission-\(index)",
+                    payload: "",
+                    responseTimeout: 10,
+                    maxRoundTripLatency: 10
+                )
+            })
+            await waitUntil { await requestIDs.values.count == index + 1 }
+        }
+        let firstSenderRequestIDs = await requestIDs.values
+        #expect(firstSenderRequestIDs.count == RpcInvocationLimits.maximumInFlightPerConnection + 1)
+
+        for (index, requestId) in firstSenderRequestIDs
+            .prefix(RpcInvocationLimits.maximumInFlightPerConnection)
+            .enumerated()
+        {
+            room.incomingStreamManager.handle(.header(
+                responseHeader(
+                    id: "first-response-\(index)",
+                    requestId: requestId,
+                    declaredLength: nil
+                ),
+                firstSender.stringValue,
+                firstSid,
+                room.dataPacketReceiveGeneration,
+                .none
+            ))
+        }
+        await waitUntil {
+            await room.incomingStreamManager.openStreamCount == RpcInvocationLimits.maximumInFlightPerConnection
+        }
+
+        let rejectedRequestId = try #require(firstSenderRequestIDs.last)
+        room.incomingStreamManager.handle(.header(
+            responseHeader(
+                id: "first-response-over-cap",
+                requestId: rejectedRequestId,
+                declaredLength: nil
+            ),
+            firstSender.stringValue,
+            firstSid,
+            room.dataPacketReceiveGeneration,
+            .none
+        ))
+        await #expect {
+            try await firstSenderCalls[RpcInvocationLimits.maximumInFlightPerConnection].value
+        } throws: { error in
+            (error as? RpcError)?.code == RpcError.BuiltInError.applicationError.code
+        }
+
+        let admittedSecondSenderCall = Task {
+            try await room.localParticipant.performRpc(
+                destinationIdentity: secondSender,
+                method: "second-response-admission",
+                payload: "",
+                responseTimeout: 10,
+                maxRoundTripLatency: 10
+            )
+        }
+        secondSenderCall = admittedSecondSenderCall
+        await waitUntil {
+            await requestIDs.values.count == RpcInvocationLimits.maximumInFlightPerConnection + 2
+        }
+        let secondSenderRequestId = try #require(await requestIDs.values.last)
+        room.incomingStreamManager.handle(.header(
+            responseHeader(
+                id: "second-response-admitted",
+                requestId: secondSenderRequestId,
+                declaredLength: nil
+            ),
+            secondSender.stringValue,
+            secondSid,
+            room.dataPacketReceiveGeneration,
+            .none
+        ))
+        await waitUntil {
+            await room.incomingStreamManager.openStreamCount ==
+                RpcInvocationLimits.maximumInFlightPerConnection + 1
+        }
+
+        #expect(
+            await room.incomingStreamManager.openStreamCount ==
+                RpcInvocationLimits.maximumInFlightPerConnection + 1
+        )
+
+        await room.incomingStreamManager.reset()
+        for call in firstSenderCalls.prefix(RpcInvocationLimits.maximumInFlightPerConnection) {
+            _ = try? await call.value
+        }
+        _ = try? await admittedSecondSenderCall.value
+        await waitUntil { await room.rpcClient.pendingCount == 0 }
+        #expect(await room.rpcClient.pendingCount == 0)
+    }
+
     @Test func inboundV1OversizeRequestNeverReachesApplicationHandler() async throws {
         let room = Room()
         await room.rpcServer.attach(to: room)
@@ -1673,7 +2687,7 @@ struct RpcStreamResourceLimitTests {
         #expect(!invoked.copy())
         #expect(responseError.copy()?.code == UInt32(RpcError.BuiltInError.responseTimeout.code))
         let openStreamCount = await room.incomingStreamManager.openStreamCount
-        let activeInvocationCount = await room.rpcServer.activeInvocationCount
+        let activeInvocationCount = room.rpcServer.activeInvocationCount
         #expect(openStreamCount == 0)
         #expect(activeInvocationCount == 0)
     }
@@ -1722,7 +2736,7 @@ struct RpcStreamResourceLimitTests {
         #expect(responseError.copy()?.code == UInt32(RpcError.BuiltInError.applicationError.code))
         #expect(responseError.copy()?.message == "RPC data stream malformed")
         #expect(await room.incomingStreamManager.openStreamCount == 0)
-        #expect(await room.rpcServer.activeInvocationCount == 0)
+        #expect(room.rpcServer.activeInvocationCount == 0)
     }
 
     @Test func v2DeadlineExpiringAfterReadNeverDispatchesHandler() async throws {
@@ -1879,7 +2893,7 @@ struct RpcStreamResourceLimitTests {
         #expect(responseError.copy()?.code == UInt32(RpcError.BuiltInError.responseTimeout.code))
         handlerRelease.resume(returning: ())
         await waitForResourcesToDrain(in: room)
-        #expect(await room.rpcServer.activeInvocationCount == 0)
+        #expect(room.rpcServer.activeInvocationCount == 0)
     }
 
     @Test func timedOutPreflightDoesNotRetainRoomOrOriginalParticipant() async throws {
@@ -1959,10 +2973,10 @@ struct RpcStreamResourceLimitTests {
 
         await releasePreflight.open()
         let drainDeadline = Date().addingTimeInterval(1)
-        while await rpcServer.activeInvocationCount != 0, Date() < drainDeadline {
+        while rpcServer.activeInvocationCount != 0, Date() < drainDeadline {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
-        #expect(await rpcServer.activeInvocationCount == 0)
+        #expect(rpcServer.activeInvocationCount == 0)
         #expect(!invoked.copy())
         await rpcServer.setBeforeHandlerPreflight(nil)
     }
@@ -2019,7 +3033,7 @@ struct RpcStreamResourceLimitTests {
         #expect(!invoked.copy())
         #expect(responseError.copy()?.code == UInt32(RpcError.BuiltInError.responseTimeout.code))
         let openStreamCount = await room.incomingStreamManager.openStreamCount
-        let activeInvocationCount = await room.rpcServer.activeInvocationCount
+        let activeInvocationCount = room.rpcServer.activeInvocationCount
         #expect(openStreamCount == 0)
         #expect(activeInvocationCount == 0)
     }
@@ -2091,7 +3105,7 @@ struct RpcStreamResourceLimitTests {
                 enteredByCaller.copy()[caller] == RpcInvocationLimits.maximumInFlightPerConnection
             }
             #expect(enteredByCaller.copy()[caller] == RpcInvocationLimits.maximumInFlightPerConnection)
-            let activeInvocationCount = await room.rpcServer.activeInvocationCount
+            let activeInvocationCount = room.rpcServer.activeInvocationCount
             #expect(activeInvocationCount == RpcInvocationLimits.maximumInFlightPerConnection)
 
             group.addTask {
@@ -2169,7 +3183,7 @@ struct RpcStreamResourceLimitTests {
             }
             await waitUntil { enteredByCaller.copy()[secondCaller] == 1 }
             #expect(enteredByCaller.copy()[secondCaller] == 1)
-            let fairActiveInvocationCount = await room.rpcServer.activeInvocationCount
+            let fairActiveInvocationCount = room.rpcServer.activeInvocationCount
             #expect(fairActiveInvocationCount == RpcInvocationLimits.maximumInFlightPerConnection + 1)
 
             release.mutate { $0 = true }
@@ -2177,8 +3191,191 @@ struct RpcStreamResourceLimitTests {
         }
         await waitForResourcesToDrain(in: room)
 
-        let activeInvocationCount = await room.rpcServer.activeInvocationCount
+        let activeInvocationCount = room.rpcServer.activeInvocationCount
         #expect(activeInvocationCount == 0)
+    }
+
+    @Test(arguments: [ClientProtocol.v0, ClientProtocol.v1])
+    func fastHandlerResponsePublicationRemainsAdmissionBounded(
+        clientProtocol: ClientProtocol
+    ) async throws {
+        let room = Room()
+        await room.rpcServer.attach(to: room)
+        let participant = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: caller,
+            clientProtocol: clientProtocol
+        )
+        let sid = try #require(participant.sid)
+        let overloadResponses = StateSync<[Livekit_RpcError]>([])
+        let channel = RpcBlockedResponsePublicationDataChannelPair(
+            blockedTarget: RpcInvocationLimits.maximumInFlightPerConnection
+        ) { packet in
+            guard case let .rpcResponse(response) = packet.value,
+                  case let .error(error) = response.value,
+                  error.data == "resource_exhausted"
+            else { return }
+            overloadResponses.mutate { $0.append(error) }
+        }
+        room.publisherDataChannel = channel
+        try await room.registerRpcMethod("fast-response") { _ in "response" }
+
+        for index in 0 ..< RpcInvocationLimits.maximumInFlightPerConnection {
+            room.rpcServer.enqueueIncomingRequest(
+                callerIdentity: caller,
+                callerParticipantSid: sid,
+                callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
+                requestId: "fast-response-\(clientProtocol.rawValue)-\(index)",
+                method: "fast-response",
+                payload: "",
+                responseTimeout: 5,
+                receivedAtContinuousTimeNanoseconds: RpcContinuousClock.nowNanoseconds(),
+                version: 1
+            )
+        }
+        _ = try await channel.blockedTargetReached.wait()
+
+        #expect(channel.blockedResponseCount.copy() == RpcInvocationLimits.maximumInFlightPerConnection)
+        #expect(room.rpcServer.activeInvocationCount == RpcInvocationLimits.maximumInFlightPerConnection)
+        let expectedOpenStreamCount = clientProtocol == .v1
+            ? RpcInvocationLimits.maximumInFlightPerConnection
+            : 0
+        #expect(await room.outgoingStreamManager.openStreamCount == expectedOpenStreamCount)
+
+        room.rpcServer.enqueueIncomingRequest(
+            callerIdentity: caller,
+            callerParticipantSid: sid,
+            callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
+            requestId: "fast-response-overflow-\(clientProtocol.rawValue)",
+            method: "fast-response",
+            payload: "",
+            responseTimeout: 5,
+            receivedAtContinuousTimeNanoseconds: RpcContinuousClock.nowNanoseconds(),
+            version: 1
+        )
+        await waitUntil { overloadResponses.copy().count == 1 }
+
+        #expect(overloadResponses.copy().count == 1)
+        #expect(channel.blockedResponseCount.copy() == RpcInvocationLimits.maximumInFlightPerConnection)
+        #expect(room.rpcServer.activeInvocationCount == RpcInvocationLimits.maximumInFlightPerConnection)
+        #expect(await room.outgoingStreamManager.openStreamCount == expectedOpenStreamCount)
+
+        await channel.releaseResponses()
+        await waitUntil {
+            let openStreamCount = await room.outgoingStreamManager.openStreamCount
+            return room.rpcServer.activeInvocationCount == 0 &&
+                room.rpcServer.activeControlReplyCount == 0 &&
+                openStreamCount == 0
+        }
+        #expect(room.rpcServer.activeInvocationCount == 0)
+        #expect(await room.outgoingStreamManager.openStreamCount == 0)
+    }
+
+    @Test func ninthWireRequestReturnsOverloadAndPreservesAnotherConnection() async throws {
+        let room = Room()
+        let firstCaller = caller
+        let firstParticipant = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: firstCaller,
+            clientProtocol: .v1
+        )
+        let secondCaller = Participant.Identity(from: "second-wire-caller")
+        let secondParticipant = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: secondCaller,
+            clientProtocol: .v1
+        )
+        let firstSid = try #require(firstParticipant.sid)
+        let secondSid = try #require(secondParticipant.sid)
+        let overloadPacket = StateSync<Livekit_DataPacket?>(nil)
+        room.publisherDataChannel = MockDataChannelPair { packet in
+            guard case let .rpcResponse(response) = packet.value,
+                  response.requestID == "wire-over-cap"
+            else { return }
+            overloadPacket.mutate { $0 = packet }
+        }
+        await room.setupRpc()
+
+        for index in 0 ..< RpcInvocationLimits.maximumInFlightPerConnection {
+            room.incomingStreamManager.handle(.header(
+                requestHeader(
+                    id: "wire-first-\(index)",
+                    requestId: "wire-first-\(index)",
+                    declaredLength: nil,
+                    timeoutMs: "30000"
+                ),
+                firstCaller.stringValue,
+                firstSid,
+                room.dataPacketReceiveGeneration,
+                .none
+            ))
+        }
+        await waitUntil {
+            let openStreamCount = await room.incomingStreamManager.openStreamCount
+            let activeInvocationCount = room.rpcServer.activeInvocationCount
+            return openStreamCount == RpcInvocationLimits.maximumInFlightPerConnection &&
+                activeInvocationCount == RpcInvocationLimits.maximumInFlightPerConnection
+        }
+
+        room.incomingStreamManager.handle(.header(
+            requestHeader(
+                id: "wire-over-cap",
+                requestId: "wire-over-cap",
+                declaredLength: nil,
+                timeoutMs: "30000"
+            ),
+            firstCaller.stringValue,
+            firstSid,
+            room.dataPacketReceiveGeneration,
+            .none
+        ))
+        await waitUntil { overloadPacket.copy() != nil }
+
+        let packet = try #require(overloadPacket.copy())
+        #expect(packet.destinationIdentities == [firstCaller.stringValue])
+        guard case let .rpcResponse(response) = packet.value,
+              case let .error(error) = response.value
+        else {
+            Issue.record("Expected an RPC overload response packet")
+            return
+        }
+        #expect(response.requestID == "wire-over-cap")
+        #expect(error.code == UInt32(RpcError.BuiltInError.applicationError.code))
+        #expect(error.message == "RPC receiver overloaded")
+        #expect(error.data == "resource_exhausted")
+
+        room.incomingStreamManager.handle(.header(
+            requestHeader(
+                id: "wire-second-admitted",
+                requestId: "wire-second-admitted",
+                declaredLength: nil,
+                timeoutMs: "30000"
+            ),
+            secondCaller.stringValue,
+            secondSid,
+            room.dataPacketReceiveGeneration,
+            .none
+        ))
+        await waitUntil {
+            let openStreamCount = await room.incomingStreamManager.openStreamCount
+            let activeInvocationCount = room.rpcServer.activeInvocationCount
+            return openStreamCount == RpcInvocationLimits.maximumInFlightPerConnection + 1 &&
+                activeInvocationCount == RpcInvocationLimits.maximumInFlightPerConnection + 1
+        }
+
+        #expect(
+            await room.incomingStreamManager.openStreamCount ==
+                RpcInvocationLimits.maximumInFlightPerConnection + 1
+        )
+        #expect(
+            room.rpcServer.activeInvocationCount ==
+                RpcInvocationLimits.maximumInFlightPerConnection + 1
+        )
+
+        await room.incomingStreamManager.reset()
+        await waitForResourcesToDrain(in: room)
+        #expect(await room.incomingStreamManager.openStreamCount == 0)
+        #expect(room.rpcServer.activeInvocationCount == 0)
     }
 
     @Test func roomWideAdmissionCapsNonCooperativeHandlersAcrossCallers() async throws {
@@ -2232,7 +3429,7 @@ struct RpcStreamResourceLimitTests {
             }
             await waitUntil { entered.copy() == RpcInvocationLimits.maximumInFlight }
             #expect(entered.copy() == RpcInvocationLimits.maximumInFlight)
-            #expect(await room.rpcServer.activeInvocationCount == RpcInvocationLimits.maximumInFlight)
+            #expect(room.rpcServer.activeInvocationCount == RpcInvocationLimits.maximumInFlight)
 
             let overflowIdentity = identities[4]
             let overflowSid = sids[overflowIdentity]!
@@ -2258,7 +3455,56 @@ struct RpcStreamResourceLimitTests {
             await group.waitForAll()
         }
         await waitForResourcesToDrain(in: room)
-        #expect(await room.rpcServer.activeInvocationCount == 0)
+        #expect(room.rpcServer.activeInvocationCount == 0)
+    }
+
+    @Test func blockedAckAndControlFloodIsBoundedBeforeTaskSuspension() async throws {
+        let room = Room()
+        await room.rpcServer.attach(to: room)
+        let participant = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: caller,
+            clientProtocol: .v0
+        )
+        let sid = try #require(participant.sid)
+        let packets = StateSync<[Livekit_DataPacket]>([])
+        let channel = RpcBlockingDataChannelPair { packet in packets.mutate { $0.append(packet) } }
+        room.publisherDataChannel = channel
+        let requestCount = 100
+
+        for index in 0 ..< requestCount {
+            room.rpcServer.enqueueIncomingRequest(
+                callerIdentity: caller,
+                callerParticipantSid: sid,
+                callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
+                requestId: "blocked-ack-flood-\(index)",
+                method: "blocked",
+                payload: "",
+                responseTimeout: 30,
+                receivedAtContinuousTimeNanoseconds: RpcContinuousClock.nowNanoseconds(),
+                version: 1
+            )
+        }
+
+        #expect(room.rpcServer.activeInvocationCount == RpcInvocationLimits.maximumInFlightPerConnection)
+        #expect(room.rpcServer.activeControlReplyCount == RpcInvocationLimits.maximumInFlightPerConnection)
+        #expect(
+            room.rpcServer.droppedControlReplyCount ==
+                requestCount - (2 * RpcInvocationLimits.maximumInFlightPerConnection)
+        )
+        await waitUntil {
+            channel.sendAttemptCount.copy() == 2 * RpcInvocationLimits.maximumInFlightPerConnection
+        }
+        #expect(channel.sendAttemptCount.copy() == 2 * RpcInvocationLimits.maximumInFlightPerConnection)
+
+        _ = room.incrementDataPacketReceiveGeneration()
+        await waitUntil { room.rpcServer.activeControlReplyCount == 0 }
+        #expect(room.rpcServer.activeControlReplyCount == 0)
+
+        channel.releaseSends()
+        await waitUntil { room.rpcServer.activeInvocationCount == 0 }
+        #expect(room.rpcServer.activeInvocationCount == 0)
+        #expect(packets.copy().isEmpty)
     }
 
     private func requestHeader(
@@ -2312,7 +3558,7 @@ struct RpcStreamResourceLimitTests {
     private func waitForResourcesToDrain(in room: Room) async {
         await waitUntil {
             let openStreamCount = await room.incomingStreamManager.openStreamCount
-            let activeInvocationCount = await room.rpcServer.activeInvocationCount
+            let activeInvocationCount = room.rpcServer.activeInvocationCount
             return openStreamCount == 0 && activeInvocationCount == 0
         }
     }
@@ -2321,6 +3567,293 @@ struct RpcStreamResourceLimitTests {
         let deadline = Date().addingTimeInterval(10)
         while !(await condition()), Date() < deadline {
             try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+}
+
+enum RpcDeadlineTerminalSource: CaseIterable, Sendable {
+    case ackTimeout
+    case participantDisconnected
+    case allDisconnected
+    case response
+    case streamRejection
+    case streamReaderFailure
+    case callerCancellation
+}
+
+enum RpcPublicationTerminalOutcome: Sendable {
+    case success(String)
+    case rpcError(code: Int, message: String, data: String)
+    case unexpected(String)
+}
+
+enum RpcPublicationTerminalSource: CaseIterable, CustomTestStringConvertible, Sendable {
+    case ackTimeout
+    case participantDisconnected
+    case allDisconnected
+    case response
+    case overloadResponse
+    case streamRejection
+    case streamReaderFailure
+
+    var testDescription: String {
+        switch self {
+        case .ackTimeout: "ack-timeout"
+        case .participantDisconnected: "participant-disconnected"
+        case .allDisconnected: "all-disconnected"
+        case .response: "response"
+        case .overloadResponse: "overload-response"
+        case .streamRejection: "stream-rejection"
+        case .streamReaderFailure: "stream-reader-failure"
+        }
+    }
+
+    var expectedErrorCode: Int {
+        switch self {
+        case .ackTimeout:
+            RpcError.BuiltInError.connectionTimeout.code
+        case .participantDisconnected, .allDisconnected:
+            RpcError.BuiltInError.recipientDisconnected.code
+        case .response:
+            -1
+        case .overloadResponse, .streamReaderFailure:
+            RpcError.BuiltInError.applicationError.code
+        case .streamRejection:
+            RpcError.BuiltInError.responsePayloadTooLarge.code
+        }
+    }
+}
+
+enum RpcStreamPublicationBoundary: CaseIterable, CustomTestStringConvertible, Sendable {
+    case afterHeader
+    case afterPayload
+
+    var testDescription: String {
+        switch self {
+        case .afterHeader: "after-header"
+        case .afterPayload: "after-payload"
+        }
+    }
+
+    var nextOperation: OutgoingStreamManager.OperationKind {
+        switch self {
+        case .afterHeader: .write
+        case .afterPayload: .close
+        }
+    }
+
+    var clientPacketCount: Int {
+        switch self {
+        case .afterHeader: 1
+        case .afterPayload: 2
+        }
+    }
+
+    var serverPacketCount: Int { clientPacketCount + 1 }
+}
+
+enum RpcConnectionInvalidation: CaseIterable, CustomTestStringConvertible, Sendable {
+    case sameIdentityReplacement
+    case receiveGenerationIncrement
+
+    var testDescription: String {
+        switch self {
+        case .sameIdentityReplacement: "same-identity-replacement"
+        case .receiveGenerationIncrement: "receive-generation-increment"
+        }
+    }
+
+    func apply(
+        to room: Room,
+        identity: Participant.Identity,
+        original: RemoteParticipant,
+        clientProtocol: ClientProtocol
+    ) async throws {
+        let sid = try #require(original.sid)
+        applySynchronously(
+            to: room,
+            identity: identity,
+            original: original,
+            sid: sid,
+            clientProtocol: clientProtocol
+        )
+    }
+
+    func applySynchronously(
+        to room: Room,
+        identity: Participant.Identity,
+        original: RemoteParticipant,
+        sid: Participant.Sid,
+        clientProtocol: ClientProtocol
+    ) {
+        switch self {
+        case .sameIdentityReplacement:
+            let info = Livekit_ParticipantInfo.with {
+                $0.identity = identity.stringValue
+                $0.sid = sid.stringValue
+                $0.clientProtocol = Int32(clientProtocol.rawValue)
+            }
+            let replacement = RemoteParticipant(
+                info: info,
+                room: room,
+                connectionState: .connected
+            )
+            room._state.mutate { $0.remoteParticipants[identity] = replacement }
+            #expect(replacement !== original)
+        case .receiveGenerationIncrement:
+            _ = room.incrementDataPacketReceiveGeneration()
+        }
+    }
+}
+
+private final class RpcManualClock: @unchecked Sendable {
+    private let current: StateSync<UInt64>
+    private let wake = AsyncCompleter<Void>(label: "manual-rpc-clock", defaultTimeout: 10)
+
+    init(now: UInt64) {
+        current = StateSync(now)
+    }
+
+    func now() -> UInt64 {
+        current.copy()
+    }
+
+    func sleepUntil(_ deadline: UInt64) async throws {
+        while current.copy() < deadline {
+            _ = try await wake.wait()
+        }
+    }
+
+    func advance(to time: UInt64, wakingSleepers: Bool) {
+        current.mutate { $0 = time }
+        if wakingSleepers { wake.resume(returning: ()) }
+    }
+}
+
+private final class RpcBlockingDataChannelPair: MockDataChannelPair, @unchecked Sendable {
+    let sendStarted = AsyncCompleter<Void>(label: "rpc-send-started", defaultTimeout: 2)
+    private let sendRelease = AsyncCompleter<Void>(label: "rpc-send-release", defaultTimeout: 10)
+    private(set) var sendAttemptCount = StateSync(0)
+
+    override func send(
+        dataPacket packet: Livekit_DataPacket,
+        expectedSendGeneration: UInt64,
+        admission: DataChannelSendAdmission
+    ) async throws {
+        sendAttemptCount.mutate { $0 += 1 }
+        sendStarted.resume(returning: ())
+        _ = try await sendRelease.wait()
+        try await super.send(
+            dataPacket: packet,
+            expectedSendGeneration: expectedSendGeneration,
+            admission: admission
+        )
+    }
+
+    func releaseSends() {
+        sendRelease.resume(returning: ())
+    }
+}
+
+private final class RpcAdmissionPausedDataChannelPair: MockDataChannelPair, @unchecked Sendable {
+    let preflightPassed = AsyncCompleter<Void>(label: "rpc-preflight-passed", defaultTimeout: 2)
+    private let sendRelease = RpcNonCooperativeGate()
+    private let blockedAttempt: Int
+    private(set) var sendAttemptCount = StateSync(0)
+
+    init(
+        blockedAttempt: Int,
+        packetHandler: @escaping (Livekit_DataPacket) -> Void
+    ) {
+        self.blockedAttempt = blockedAttempt
+        super.init(packetHandler: packetHandler)
+    }
+
+    override func send(
+        dataPacket packet: Livekit_DataPacket,
+        expectedSendGeneration: UInt64,
+        admission: DataChannelSendAdmission
+    ) async throws {
+        guard expectedSendGeneration == sendGeneration else {
+            throw LiveKitError(.invalidState, message: "Mock data-channel send generation changed")
+        }
+        let attemptIndex = sendAttemptCount.mutate { count in
+            count += 1
+            return count
+        }
+        if let error = admission.preflight() { throw error }
+        if attemptIndex == blockedAttempt {
+            preflightPassed.resume(returning: ())
+            await sendRelease.wait()
+        }
+        switch admission.attempt({ [self] in
+            packetHandler(packet)
+            return .sent
+        }) {
+        case .sent:
+            return
+        case .unavailable, .failed:
+            throw LiveKitError(.invalidState, message: "Mock data-channel send failed")
+        case let .rejected(error):
+            throw error
+        }
+    }
+
+    func releaseSends() async {
+        await sendRelease.open()
+    }
+}
+
+private final class RpcBlockedResponsePublicationDataChannelPair: MockDataChannelPair, @unchecked Sendable {
+    let blockedTargetReached = AsyncCompleter<Void>(
+        label: "rpc-blocked-response-target",
+        defaultTimeout: 10
+    )
+    private let releaseGate = RpcNonCooperativeGate()
+    private let blockedTarget: Int
+    private(set) var blockedResponseCount = StateSync(0)
+
+    init(
+        blockedTarget: Int,
+        packetHandler: @escaping (Livekit_DataPacket) -> Void
+    ) {
+        self.blockedTarget = blockedTarget
+        super.init(packetHandler: packetHandler)
+    }
+
+    override func send(
+        dataPacket packet: Livekit_DataPacket,
+        expectedSendGeneration: UInt64,
+        admission: DataChannelSendAdmission
+    ) async throws {
+        if Self.isSuccessfulResponsePublication(packet) {
+            let count = blockedResponseCount.mutate { count in
+                count += 1
+                return count
+            }
+            if count == blockedTarget { blockedTargetReached.resume(returning: ()) }
+            await releaseGate.wait()
+        }
+        try await super.send(
+            dataPacket: packet,
+            expectedSendGeneration: expectedSendGeneration,
+            admission: admission
+        )
+    }
+
+    func releaseResponses() async {
+        await releaseGate.open()
+    }
+
+    private static func isSuccessfulResponsePublication(_ packet: Livekit_DataPacket) -> Bool {
+        switch packet.value {
+        case let .rpcResponse(response):
+            if case .payload = response.value { return true }
+            return false
+        case let .streamHeader(header):
+            return header.topic == RpcStreamTopic.response
+        default:
+            return false
         }
     }
 }

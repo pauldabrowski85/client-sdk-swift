@@ -19,6 +19,18 @@ import Foundation
 // Extending the generic builder needs the runtime module by name; the facades
 // themselves are re-exported through LiveKit.
 
+struct OutgoingStreamCancellation: Sendable {
+    private let action: @Sendable () async -> Void
+
+    fileprivate init(action: @escaping @Sendable () async -> Void) {
+        self.action = action
+    }
+
+    func cancel() async {
+        await action()
+    }
+}
+
 /// Manages state of outgoing data streams.
 actor OutgoingStreamManager: Loggable {
     enum OperationKind: Equatable, Sendable {
@@ -29,7 +41,7 @@ actor OutgoingStreamManager: Loggable {
     typealias PacketHandler = @Sendable (
         Livekit_DataPacket,
         UInt64,
-        (@Sendable () -> Bool)?
+        DataChannelSendAdmission?
     ) async throws -> Void
     typealias SendGenerationProvider = @Sendable () -> UInt64
     typealias EncryptionProvider = @Sendable () -> EncryptionType
@@ -105,7 +117,31 @@ actor OutgoingStreamManager: Loggable {
 
     func streamText(
         options: StreamTextOptions,
-        admission: (@Sendable () -> Bool)?
+        admission: DataChannelSendAdmission?
+    ) async throws -> TextStreamWriter {
+        try await streamText(
+            options: options,
+            admission: admission,
+            onReservation: nil
+        )
+    }
+
+    func streamText(
+        options: StreamTextOptions,
+        admission: DataChannelSendAdmission?,
+        onReservation: @escaping @Sendable (OutgoingStreamCancellation) -> Bool
+    ) async throws -> TextStreamWriter {
+        try await streamText(
+            options: options,
+            admission: admission,
+            onReservation: onReservation as (@Sendable (OutgoingStreamCancellation) -> Bool)?
+        )
+    }
+
+    private func streamText(
+        options: StreamTextOptions,
+        admission: DataChannelSendAdmission?,
+        onReservation: (@Sendable (OutgoingStreamCancellation) -> Bool)?
     ) async throws -> TextStreamWriter {
         let info = TextStreamInfo(
             id: options.id ?? Self.uniqueID(),
@@ -123,7 +159,8 @@ actor OutgoingStreamManager: Loggable {
         return try await openTextStream(
             with: info,
             sendingTo: options.destinationIdentities,
-            admission: admission
+            admission: admission,
+            onReservation: onReservation
         )
     }
 
@@ -147,12 +184,14 @@ actor OutgoingStreamManager: Loggable {
     private func openTextStream(
         with info: TextStreamInfo,
         sendingTo recipients: [Participant.Identity],
-        admission: (@Sendable () -> Bool)? = nil
+        admission: DataChannelSendAdmission? = nil,
+        onReservation: (@Sendable (OutgoingStreamCancellation) -> Bool)? = nil
     ) async throws -> TextStreamWriter {
         let descriptor = try await openStream(
             with: info,
             sendingTo: recipients,
-            admission: admission
+            admission: admission,
+            onReservation: onReservation
         )
         return TextStreamWriter(
             info: info,
@@ -186,7 +225,7 @@ actor OutgoingStreamManager: Loggable {
         let info: StreamInfo
         let generation = UUID()
         let dataChannelSendGeneration: UInt64
-        let admission: (@Sendable () -> Bool)?
+        let admission: DataChannelSendAdmission?
         let operationLane = SerialRunnerActor<Void>()
         var writtenLength: Int = 0
         var chunkIndex: UInt64 = 0
@@ -194,7 +233,7 @@ actor OutgoingStreamManager: Loggable {
         init(
             info: StreamInfo,
             dataChannelSendGeneration: UInt64,
-            admission: (@Sendable () -> Bool)?
+            admission: DataChannelSendAdmission?
         ) {
             self.info = info
             self.dataChannelSendGeneration = dataChannelSendGeneration
@@ -219,7 +258,8 @@ actor OutgoingStreamManager: Loggable {
     private func openStream(
         with info: StreamInfo,
         sendingTo recipients: [Participant.Identity],
-        admission: (@Sendable () -> Bool)? = nil
+        admission: DataChannelSendAdmission? = nil,
+        onReservation: (@Sendable (OutgoingStreamCancellation) -> Bool)? = nil
     ) async throws -> Descriptor {
         guard openStreams[info.id] == nil else {
             throw StreamError.alreadyOpened
@@ -235,6 +275,16 @@ actor OutgoingStreamManager: Loggable {
         )
         openStreams[info.id] = descriptor
 
+        if let onReservation {
+            let cancellation = OutgoingStreamCancellation { [weak self] in
+                await self?.removeStream(id: info.id, descriptor: descriptor)
+            }
+            guard onReservation(cancellation) else {
+                removeStream(id: info.id, descriptor: descriptor)
+                throw StreamError.terminated
+            }
+        }
+
         let header = Livekit_DataStream.Header(info)
         let packet = Livekit_DataPacket.with {
             $0.value = .streamHeader(header)
@@ -242,12 +292,16 @@ actor OutgoingStreamManager: Loggable {
         }
 
         do {
-            try await descriptor.operationLane.run { [packetHandler] in
-                try await packetHandler(
-                    packet,
-                    descriptor.dataChannelSendGeneration,
-                    descriptor.admission
-                )
+            try await withTaskCancellationHandler {
+                try await descriptor.operationLane.run { [packetHandler] in
+                    try await packetHandler(
+                        packet,
+                        descriptor.dataChannelSendGeneration,
+                        descriptor.admission
+                    )
+                }
+            } onCancel: { [weak self] in
+                Task { await self?.removeStream(id: info.id, descriptor: descriptor) }
             }
         } catch {
             removeStream(id: info.id, descriptor: descriptor)
@@ -267,11 +321,20 @@ actor OutgoingStreamManager: Loggable {
     ) async throws {
         let descriptor = try descriptor(for: id, generation: descriptorGeneration)
         operationObserver?(.write)
-        try await descriptor.operationLane.run { [weak self] in
-            guard let self else { throw StreamError.terminated }
-            for chunk in data.chunks(of: Self.chunkSize) {
-                try await self.sendChunk(chunk, to: id, descriptor: descriptor)
+        do {
+            try await withTaskCancellationHandler {
+                try await descriptor.operationLane.run { [weak self] in
+                    guard let self else { throw StreamError.terminated }
+                    for chunk in data.chunks(of: Self.chunkSize) {
+                        try await self.sendChunk(chunk, to: id, descriptor: descriptor)
+                    }
+                }
+            } onCancel: { [weak self] in
+                Task { await self?.removeStream(id: id, descriptor: descriptor) }
             }
+        } catch {
+            removeStream(id: id, descriptor: descriptor)
+            throw error
         }
     }
 
@@ -314,31 +377,40 @@ actor OutgoingStreamManager: Loggable {
     ) async throws {
         let descriptor = try descriptor(for: id, generation: descriptorGeneration)
         operationObserver?(.close)
-        try await descriptor.operationLane.run { [weak self] in
-            guard let self else { throw StreamError.terminated }
-            guard await self.owns(descriptor, for: id) else {
-                throw StreamError.terminated
-            }
+        do {
+            try await withTaskCancellationHandler {
+                try await descriptor.operationLane.run { [weak self] in
+                    guard let self else { throw StreamError.terminated }
+                    guard await self.owns(descriptor, for: id) else {
+                        throw StreamError.terminated
+                    }
 
-            let trailer = Livekit_DataStream.Trailer.with {
-                $0.streamID = id
-                $0.reason = reason ?? ""
-            }
-            let packet = Livekit_DataPacket.with {
-                $0.value = .streamTrailer(trailer)
-            }
+                    let trailer = Livekit_DataStream.Trailer.with {
+                        $0.streamID = id
+                        $0.reason = reason ?? ""
+                    }
+                    let packet = Livekit_DataPacket.with {
+                        $0.value = .streamTrailer(trailer)
+                    }
 
-            do {
-                try await self.packetHandler(
-                    packet,
-                    descriptor.dataChannelSendGeneration,
-                    descriptor.admission
-                )
-            } catch {
-                await self.removeStream(id: id, descriptor: descriptor)
-                throw error
+                    do {
+                        try await self.packetHandler(
+                            packet,
+                            descriptor.dataChannelSendGeneration,
+                            descriptor.admission
+                        )
+                    } catch {
+                        await self.removeStream(id: id, descriptor: descriptor)
+                        throw error
+                    }
+                    await self.removeStream(id: id, descriptor: descriptor)
+                }
+            } onCancel: { [weak self] in
+                Task { await self?.removeStream(id: id, descriptor: descriptor) }
             }
-            await self.removeStream(id: id, descriptor: descriptor)
+        } catch {
+            removeStream(id: id, descriptor: descriptor)
+            throw error
         }
     }
 

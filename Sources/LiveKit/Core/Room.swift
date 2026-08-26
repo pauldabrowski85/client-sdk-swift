@@ -175,8 +175,19 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
 
     let rpcClient = RpcClientManager()
     let rpcServer = RpcServerManager()
+    private let afterParticipantRetirementForTests = StateSync<(@Sendable () async -> Void)?>(nil)
 
     private let _dataPacketReceiveGeneration = StateSync<UInt64>(0)
+
+    func setAfterParticipantRetirementForTests(_ hook: (@Sendable () async -> Void)?) {
+        afterParticipantRetirementForTests.mutate { $0 = hook }
+    }
+
+    func runAfterParticipantRetirementForTests() async {
+        if let hook = afterParticipantRetirementForTests.copy() {
+            await hook()
+        }
+    }
     private struct FailedRemoteTrackRetirement: @unchecked Sendable {
         let publication: RemoteTrackPublication
         let generation: UInt64
@@ -783,14 +794,43 @@ extension Room {
 
     @discardableResult
     func incrementDataPacketReceiveGeneration() -> UInt64 {
-        let generation = _dataPacketReceiveGeneration.mutate { generation in
-            generation &+= 1
-            return generation
+        let snapshot = _state.read { state in
+            let generation = _dataPacketReceiveGeneration.mutate { generation in
+                generation &+= 1
+                return generation
+            }
+            return (generation, Array(state.remoteParticipants.values))
         }
-        for participant in _state.remoteParticipants.values {
+        for participant in snapshot.1 {
             participant.invalidateAllSubscriptionAdmissionsForOwnershipLoss()
         }
-        return generation
+        rpcServer.drainControlReplies(to: snapshot.0)
+        return snapshot.0
+    }
+
+    /// The RPC publication lock order is SendToken, data-channel state, optional deadline or
+    /// control gate, Room state, receive generation, then the irreversible channel send.
+    /// Ownership replacement and generation advancement take the last two locks in that order.
+    func attemptRpcPublication(
+        for connection: RpcParticipantConnection,
+        _ send: @Sendable () -> DrainSendAttempt
+    ) -> DrainSendAttempt {
+        _state.read { state in
+            _dataPacketReceiveGeneration.read { receiveGeneration in
+                guard receiveGeneration == connection.dataPacketReceiveGeneration,
+                      let current = state.remoteParticipants[connection.identity],
+                      current === connection.participant,
+                      current.sid == connection.sid,
+                      current.dataPacketReceiveGeneration == connection.dataPacketReceiveGeneration
+                else {
+                    return .rejected(LiveKitError(
+                        .cancelled,
+                        message: "RPC participant connection was replaced"
+                    ))
+                }
+                return send()
+            }
+        }
     }
 
     nonisolated func incomingStreamIngressDidOverflow(receiveGeneration: UInt64) {
@@ -826,7 +866,7 @@ extension Room {
             limits: RpcStreamLimits.incomingRequest,
             onStreamRejected: { [weak rpcServer] rejection in
                 guard !rejection.handlerWasDispatched else { return }
-                Task { await rpcServer?.handleIncomingRequestStreamRejection(rejection) }
+                rpcServer?.enqueueIncomingRequestStreamRejection(rejection)
             }
         ) { [weak rpcServer] reader, identity in
             await rpcServer?.handleIncomingRequestStream(reader: reader, callerIdentity: identity)

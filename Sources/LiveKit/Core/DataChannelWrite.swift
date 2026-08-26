@@ -35,6 +35,39 @@ enum DrainSendAttempt {
     case failed
 }
 
+/// An admission decision whose final attempt owns the operation it permits. This makes revocation
+/// and the irreversible `sendData` call one linearizable action instead of a check-then-send gap.
+struct DataChannelSendAdmission: Sendable {
+    let preflight: @Sendable () -> Error?
+    let attempt: @Sendable (_ send: @Sendable () -> DrainSendAttempt) -> DrainSendAttempt
+
+    init(
+        preflight: @escaping @Sendable () -> Error?,
+        attempt: @escaping @Sendable (_ send: @Sendable () -> DrainSendAttempt) -> DrainSendAttempt
+    ) {
+        self.preflight = preflight
+        self.attempt = attempt
+    }
+
+    init(predicate: @escaping @Sendable () -> Bool) {
+        preflight = {
+            predicate() ? nil : LiveKitError(
+                .cancelled,
+                message: "Data channel send admission was revoked"
+            )
+        }
+        attempt = { send in
+            guard predicate() else {
+                return .rejected(LiveKitError(
+                    .cancelled,
+                    message: "Data channel send admission was revoked"
+                ))
+            }
+            return send()
+        }
+    }
+}
+
 /// Rejects stale work before it can park, then runs the final send decision while the owner holds
 /// its generation/provenance lock. The attempt callback must invoke the send operation at most once.
 struct DrainSendAdmission: Sendable {
@@ -84,52 +117,126 @@ struct PreparedBytes {
 /// submitter from `deinit` rather than stranding it forever. Copies of a write share the one token,
 /// which is what makes both properties hold across evict/drop/teardown paths.
 ///
-/// `@unchecked Sendable`: created, settled and released only inside the drain's single-consumer
-/// event loop (it rides `ReadyWrite`, which never leaves the loop), so the mutable state needs no
-/// synchronization of its own.
+/// Settlement can race the drain's single-consumer event loop with task cancellation, so the
+/// continuation is lock-guarded and remains first-wins across both paths.
 final class SendToken: @unchecked Sendable {
-    private var continuation: CheckedContinuation<Void, any Error>?
+    private let continuation: StateSync<CheckedContinuation<Void, any Error>?>
 
     init(_ continuation: CheckedContinuation<Void, any Error>) {
-        self.continuation = continuation
+        self.continuation = StateSync(continuation)
     }
 
     func settle(with result: Result<Void, any Error>) {
+        let continuation = continuation.mutate { stored -> CheckedContinuation<Void, any Error>? in
+            defer { stored = nil }
+            return stored
+        }
         continuation?.resume(with: result)
-        continuation = nil
+    }
+
+    var isSettled: Bool { continuation.copy() == nil }
+
+    /// Runs the final irreversible send decision while cancellation/settlement is excluded.
+    /// Whichever acquires this token first wins: a cancellation that settles first prevents the
+    /// send closure from running, while a send already admitted here has crossed the point where
+    /// WebRTC can recall it.
+    func attempt(
+        settlingSubmission: Bool,
+        _ operation: @Sendable () -> DrainSendAttempt
+    ) -> DrainSendAttempt {
+        let outcome = continuation.mutate { stored -> (
+            attempt: DrainSendAttempt,
+            continuation: CheckedContinuation<Void, any Error>?,
+            result: Result<Void, any Error>?
+        ) in
+            guard stored != nil else {
+                return (.rejected(LiveKitError(
+                    .cancelled,
+                    message: "Data channel submission was cancelled"
+                )), nil, nil)
+            }
+            let attempt = operation()
+            guard settlingSubmission, let result = attempt.submissionResult else {
+                return (attempt, nil, nil)
+            }
+            let continuation = stored
+            stored = nil
+            return (attempt, continuation, result)
+        }
+        if let continuation = outcome.continuation, let result = outcome.result {
+            continuation.resume(with: result)
+        }
+        return outcome.attempt
     }
 
     deinit {
-        continuation?.resume(throwing: LiveKitError(.cancelled, message: "Write dropped without settlement"))
+        settle(with: .failure(LiveKitError(.cancelled, message: "Write dropped without settlement")))
     }
 }
 
 /// A write that has been serialized, stamped and size-checked, and so is ready for the channel.
-/// Carries its submitter's token if it has one — only the last write of a group does, and a
-/// replayed write never does.
+/// Every write in an awaited group carries the same submitter token so cancellation gates each
+/// irreversible send; only the last write settles the submission. A replayed write has no token.
 struct ReadyWrite {
     let payload: Data
     let sequence: UInt32
     let admission: DrainSendAdmission?
-    let token: SendToken?
+    let submissionToken: SendToken?
+    let settlesSubmission: Bool
 
     init(
         payload: Data,
         sequence: UInt32,
         admission: DrainSendAdmission? = nil,
-        token: SendToken? = nil
+        submissionToken: SendToken? = nil,
+        settlesSubmission: Bool = false
     ) {
         self.payload = payload
         self.sequence = sequence
         self.admission = admission
-        self.token = token
+        self.submissionToken = submissionToken
+        self.settlesSubmission = settlesSubmission
     }
 
     var byteCount: Int { payload.count }
 
     /// Resolves or fails the submitter, if one is waiting. Safe on every path: see ``SendToken``.
     func settle(with result: Result<Void, any Error>) {
-        token?.settle(with: result)
+        guard settlesSubmission else { return }
+        submissionToken?.settle(with: result)
+    }
+
+    func belongs(to token: SendToken) -> Bool { submissionToken === token }
+
+    /// Couples the submitter's cancellation token to the same final attempt that enforces
+    /// generation/deadline admission. This also covers ordinary writes with no extra admission.
+    func attempt(on channel: DrainSendChannel) -> DrainSendAttempt {
+        let send: @Sendable () -> Bool = {
+            channel.send(payload)
+        }
+        let operation: @Sendable () -> DrainSendAttempt = {
+            admission?.attempt(channel, send) ??
+                (send() ? DrainSendAttempt.sent : .failed)
+        }
+        return submissionToken?.attempt(
+            settlingSubmission: settlesSubmission,
+            operation
+        ) ?? operation()
+    }
+}
+
+private extension DrainSendAttempt {
+    var submissionResult: Result<Void, any Error>? {
+        switch self {
+        case .sent:
+            .success(())
+        case .unavailable:
+            nil
+        case let .rejected(error):
+            .failure(error)
+        case .failed:
+            .failure(LiveKitError(.invalidState, message: "sendData failed"))
+        }
     }
 }
 
@@ -162,12 +269,12 @@ struct RetainedWrite {
 /// tear the channel down — `sendData` reports success and the channel then closes, breaking every
 /// later send.
 ///
-/// Only the last write carries `continuation`, so a submitter resumes once its whole group has been
-/// handed over.
+/// Every write carries `submissionToken`, but only the last is marked to settle it, so a submitter
+/// resumes once its whole group has been handed over.
 func makeWrites(
     from prepared: [PreparedBytes],
     into group: inout [ReadyWrite],
-    continuation: CheckedContinuation<Void, any Error>?,
+    submissionToken: SendToken?,
     admission: DrainSendAdmission? = nil,
     maxMessageSize: UInt64,
 ) throws {
@@ -185,7 +292,8 @@ func makeWrites(
             payload: bytes.bytes,
             sequence: bytes.sequence,
             admission: admission,
-            token: index == prepared.count - 1 ? continuation.map(SendToken.init) : nil,
+            submissionToken: submissionToken,
+            settlesSubmission: submissionToken != nil && index == prepared.count - 1,
         ))
     }
 }
@@ -292,6 +400,31 @@ struct WriteQueue {
         pending = nil
         while !inFlight.isEmpty {
             removed.append(inFlight.removeFirst())
+        }
+        return removed
+    }
+
+    mutating func remove(submission token: SendToken) -> [ReadyWrite] {
+        var removed: [ReadyWrite] = []
+        var retained: Deque<ReadyWrite> = []
+        while !inFlight.isEmpty {
+            let write = inFlight.removeFirst()
+            if write.belongs(to: token) {
+                removed.append(write)
+            } else {
+                retained.append(write)
+            }
+        }
+        inFlight = retained
+        if let pending {
+            self.pending = pending.filter { write in
+                if write.belongs(to: token) {
+                    removed.append(write)
+                    return false
+                }
+                return true
+            }
+            if self.pending?.isEmpty == true { self.pending = nil }
         }
         return removed
     }

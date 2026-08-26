@@ -21,19 +21,19 @@ public extension LocalParticipant {
     ///
     /// Transport selection is automatic and invisible to the caller:
     /// - If the remote participant supports RPC v2 (`clientProtocol >= 1`), the request and
-    ///   any successful response are carried over data streams (no payload size limit).
+    ///   any successful response are carried over data streams, capped at 1 MiB per payload.
     /// - Otherwise the request is sent as a v1 `RpcRequest` packet, which is subject to a
     ///   15 KB payload size limit (otherwise rejected with `REQUEST_PAYLOAD_TOO_LARGE`).
     ///
-    /// ObjC: auto-generated as
+    /// Objective-C selector:
     /// `performRpcWithDestinationIdentity:method:payload:responseTimeout:maxRoundTripLatency:completionHandler:`.
     ///
     /// - Parameters:
     ///   - destinationIdentity: The identity of the destination participant
     ///   - method: The method name to call
     ///   - payload: The payload to pass to the method
-    ///   - responseTimeout: Caller-side deadline for receiving a response after the initial
-    ///     connection, in seconds. The caller stops waiting after this duration. The timeout
+    ///   - responseTimeout: Caller-side deadline for the entire request-response operation,
+    ///     in seconds. The caller stops waiting after this duration. The timeout
     ///     advertised to the receiver is separately floored to `maxRoundTripLatency + 1` so
     ///     network latency does not leave the remote handler with a negative budget. Default: 15s.
     ///   - maxRoundTripLatency: Upper bound on round-trip latency to the destination, in seconds.
@@ -42,7 +42,7 @@ public extension LocalParticipant {
     ///     the default is too tight. Default: 7s.
     /// - Returns: The response payload
     /// - Throws: RpcError on failure. Details in RpcError.message
-    func performRpc(destinationIdentity: Identity,
+    final func performRpc(destinationIdentity: Identity,
                     method: String,
                     payload: String,
                     responseTimeout: TimeInterval = 15,
