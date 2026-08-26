@@ -44,8 +44,10 @@ public extension AudioManager {
         guard mode != .unknown else {
             throw LiveKitError(.invalidState, message: "Unsupported mute mode specified")
         }
-        let result = RTC.audioDeviceModule.setMuteMode(mode.toRTCType())
-        try checkAdmResult(code: result)
+        try performAudioDeviceRecordingTransition {
+            let result = RTC.audioDeviceModule.setMuteMode(mode.toRTCType())
+            try checkAdmResult(code: result)
+        }
     }
 }
 
@@ -64,8 +66,10 @@ public extension AudioManager {
     @available(*, deprecated, message: "Use `set(muteMode:)` instead")
     func setLegacyMuteMode(_ enabled: Bool) throws {
         let mode: LKRTCAudioEngineMuteMode = enabled ? .restartEngine : .voiceProcessing
-        let result = RTC.audioDeviceModule.setMuteMode(mode)
-        try checkAdmResult(code: result)
+        try performAudioDeviceRecordingTransition {
+            let result = RTC.audioDeviceModule.setMuteMode(mode)
+            try checkAdmResult(code: result)
+        }
     }
 }
 

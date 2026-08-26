@@ -242,6 +242,120 @@ struct RemoteAudioPlayoutCoordinatorTests {
         #expect(!probe.snapshot.isEngineRunning)
     }
 
+    @Test func recordingStartRacingOwnedPlayoutStopCannotBeLostSilently() async throws {
+        let stopEntered = PlayoutTestGate()
+        let releaseStop = PlayoutTestGate()
+        let probe = PlayoutDriverProbe(
+            stopClearsRecording: true,
+            stopEntered: stopEntered,
+            releaseStop: releaseStop
+        )
+        let coordinator = RemoteAudioPlayoutCoordinator(driver: probe.driver)
+        let owner = makeOwner()
+        try await coordinator.acquire(
+            owner: owner,
+            admissionIsCurrent: { true },
+            onGlobalQuarantine: {}
+        )
+
+        let release = Task { try await coordinator.release(owner: owner) }
+        await stopEntered.wait()
+        probe.forceLifecycle(playing: true, recording: true, engineRunning: true)
+        await releaseStop.open()
+
+        await #expect(throws: (any Error).self) {
+            try await release.value
+        }
+        #expect(coordinator.failedOwnerCount == 1)
+        #expect(!probe.snapshot.isRecording)
+        #expect(!probe.snapshot.isEngineRunning)
+    }
+
+    @Test func recordingStartSerializesAfterAtomicPlayoutStopProof() async throws {
+        let lifecycle = AudioDeviceLifecycleCoordinator()
+        let state = StateSync(RemoteAudioDeviceLifecycleSnapshot(
+            isPlaying: true,
+            isRecording: false,
+            isEngineRunning: true
+        ))
+        let stopEntered = StateSync(false)
+        let recordingAttempted = StateSync(false)
+        let recordingEntered = StateSync(false)
+        let releaseStop = DispatchSemaphore(value: 0)
+
+        let stop = Task.detached {
+            try lifecycle.stopPlayoutWithRecordingProof(
+                snapshot: { state.copy() },
+                stopPlayout: {
+                    stopEntered.mutate { $0 = true }
+                    releaseStop.wait()
+                    state.mutate {
+                        $0 = RemoteAudioDeviceLifecycleSnapshot(
+                            isPlaying: false,
+                            isRecording: $0.isRecording,
+                            isEngineRunning: $0.isRecording
+                        )
+                    }
+                }
+            )
+        }
+        await waitUntil { stopEntered.copy() }
+
+        let recording = Task.detached {
+            recordingAttempted.mutate { $0 = true }
+            lifecycle.performRecordingTransition {
+                recordingEntered.mutate { $0 = true }
+                state.mutate {
+                    $0 = RemoteAudioDeviceLifecycleSnapshot(
+                        isPlaying: $0.isPlaying,
+                        isRecording: true,
+                        isEngineRunning: true
+                    )
+                }
+            }
+        }
+        await waitUntil { recordingAttempted.copy() }
+        #expect(!recordingEntered.copy())
+
+        releaseStop.signal()
+        let observation = try await stop.value
+        await recording.value
+
+        #expect(observation.recordingTransitionWasStable)
+        #expect(!observation.recordingBeforeStop)
+        #expect(!observation.afterStop.isRecording)
+        #expect(recordingEntered.copy())
+        #expect(state.isRecording)
+        #expect(state.isEngineRunning)
+    }
+
+    @Test func internalRecordingCallbackInvalidatesAtomicPlayoutStopProof() throws {
+        let lifecycle = AudioDeviceLifecycleCoordinator()
+        let state = StateSync(RemoteAudioDeviceLifecycleSnapshot(
+            isPlaying: true,
+            isRecording: false,
+            isEngineRunning: true
+        ))
+        lifecycle.observeRecordingState(false)
+
+        let observation = try lifecycle.stopPlayoutWithRecordingProof(
+            snapshot: { state.copy() },
+            stopPlayout: {
+                lifecycle.observeRecordingState(true)
+                state.mutate {
+                    $0 = RemoteAudioDeviceLifecycleSnapshot(
+                        isPlaying: false,
+                        isRecording: false,
+                        isEngineRunning: false
+                    )
+                }
+            }
+        )
+
+        #expect(!observation.recordingTransitionWasStable)
+        #expect(!observation.afterStop.isRecording)
+    }
+
     @Test func partialLegacyPlayoutStateFailsClosedWithoutChangingGlobalDemand() async throws {
         let probe = PlayoutDriverProbe(
             initialized: true,
@@ -471,38 +585,25 @@ struct RemoteAudioPlayoutCoordinatorTests {
 
     @Test func cancelledQueuedLegacyReleaseRetainsExactOwnerUntilRetry() async throws {
         let probe = PlayoutDriverProbe()
-        let coordinator = RemoteAudioPlayoutCoordinator(driver: probe.driver)
+        let releaseEntered = PlayoutTestGate()
+        let finishRelease = PlayoutTestGate()
+        let coordinator = RemoteAudioPlayoutCoordinator(
+            driver: probe.driver,
+            beforeLegacyDemandRelease: { _ in
+                await releaseEntered.open()
+                await finishRelease.wait()
+            }
+        )
         let legacy = try makeLegacyPublication(coordinator: coordinator, suffix: "cancelled-release")
         try await legacy.publication.set(subscribed: true)
         #expect(coordinator.legacyOwnerCount == 1)
 
-        let blockerEntered = StateSync(false)
-        let releaseBlocker = DispatchSemaphore(value: 0)
-        let blockerOwner = RemoteAudioLegacyDemandOwner(
-            publicationNonce: UUID(),
-            admissionGeneration: 1
-        )
-        let blockerTask = Task {
-            try await coordinator.reserveLegacyDemand(
-                owner: blockerOwner,
-                admissionIsCurrent: {
-                    blockerEntered.mutate { $0 = true }
-                    releaseBlocker.wait()
-                    return true
-                }
-            )
-        }
-        await waitUntil { blockerEntered.copy() }
-
         let revokeTask = Task {
             try await legacy.publication.set(subscribed: false)
         }
-        await waitUntil {
-            legacy.publication._state.remoteAudioLegacyDemandOwnerNeedsRelease
-        }
+        await releaseEntered.wait()
         revokeTask.cancel()
-        releaseBlocker.signal()
-        try await blockerTask.value
+        await finishRelease.open()
 
         await #expect(throws: CancellationError.self) {
             try await revokeTask.value
@@ -510,9 +611,8 @@ struct RemoteAudioPlayoutCoordinatorTests {
         #expect(legacy.publication._state.remoteAudioLegacyDemandOwner != nil)
         #expect(legacy.publication._state.remoteAudioLegacyDemandOwnerNeedsRelease)
         #expect(legacy.room.failedRemoteTrackRetirementCount == 1)
-        #expect(coordinator.legacyOwnerCount == 2)
+        #expect(coordinator.legacyOwnerCount == 1)
 
-        try await coordinator.releaseLegacyDemand(owner: blockerOwner)
         try await legacy.publication.set(subscribed: false)
         #expect(coordinator.legacyOwnerCount == 0)
         #expect(legacy.publication._state.remoteAudioLegacyDemandOwner == nil)
@@ -578,6 +678,29 @@ struct RemoteAudioPlayoutCoordinatorTests {
         #expect(fixture.publication.currentSubscriptionAdmissionSnapshot() == nil)
         #expect(coordinator.activeOwnerCount == 0)
         #expect(!fixture.publication.isDesired)
+    }
+
+    @Test func repeatedProtectedAdmissionCannotRotateAnActiveVideoTrackToken() async throws {
+        let fixture = try makeProtectedVideoPublication()
+        let admissionA = try fixture.publication.admitSubscription()
+        try await fixture.publication.set(subscribed: true, admission: admissionA)
+        await fixture.publication.set(track: fixture.track)
+        let snapshotA = try #require(
+            fixture.publication.currentSubscriptionAdmissionSnapshot()
+        )
+
+        #expect(throws: (any Error).self) {
+            _ = try fixture.publication.admitSubscription()
+        }
+
+        #expect(fixture.publication.currentSubscriptionAdmissionSnapshot() == snapshotA)
+        #expect(fixture.publication.track === fixture.track)
+        #expect(fixture.track.mediaTrack.isEnabled)
+
+        try await fixture.publication.revokeSubscription()
+        #expect(fixture.publication.track == nil)
+        #expect(!fixture.track.mediaTrack.isEnabled)
+        _ = try fixture.publication.admitSubscription()
     }
 
     @Test func revocationDuringSubscribeSignalCompensatesAndReleasesPlayout() async throws {
@@ -677,6 +800,7 @@ private final class PlayoutDriverProbe: @unchecked Sendable {
         var sessionReleaseCount = 0
         var stopFailures: Int
         var sessionReleaseFailures: Int
+        var recordingTransitionGeneration: UInt64 = 0
     }
 
     private let state: StateSync<State>
@@ -762,7 +886,13 @@ private final class PlayoutDriverProbe: @unchecked Sendable {
                     $0.isEngineRunning = acknowledgeEngineStart
                 }
             },
-            stopPlayout: { [self] in
+            stopPlayoutWithRecordingProof: { [self] in
+                let before = state.read {
+                    (
+                        generation: $0.recordingTransitionGeneration,
+                        isRecording: $0.isRecording
+                    )
+                }
                 await stopEntered?.open()
                 await releaseStop?.wait()
                 let shouldFail = state.mutate { state -> Bool in
@@ -780,6 +910,18 @@ private final class PlayoutDriverProbe: @unchecked Sendable {
                         $0.isRecording = false
                     }
                     $0.isEngineRunning = $0.isRecording
+                }
+                return state.read {
+                    RemoteAudioPlayoutStopObservation(
+                        recordingBeforeStop: before.isRecording,
+                        recordingTransitionWasStable:
+                            $0.recordingTransitionGeneration == before.generation,
+                        afterStop: RemoteAudioDeviceLifecycleSnapshot(
+                            isPlaying: $0.isPlaying,
+                            isRecording: $0.isRecording,
+                            isEngineRunning: $0.isEngineRunning
+                        )
+                    )
                 }
             }
         )
@@ -803,6 +945,9 @@ private final class PlayoutDriverProbe: @unchecked Sendable {
 
     func forceLifecycle(playing: Bool, recording: Bool, engineRunning: Bool) {
         state.mutate {
+            if $0.isRecording != recording {
+                $0.recordingTransitionGeneration &+= 1
+            }
             $0.isPlaying = playing
             $0.isRecording = recording
             $0.isEngineRunning = engineRunning
@@ -825,6 +970,13 @@ private struct LegacyPlayoutPublicationFixture {
     let participant: RemoteParticipant
     let publication: RemoteTrackPublication
     let subscribeSendCount: StateSync<Int>
+}
+
+private struct ProtectedVideoPublicationFixture {
+    let room: Room
+    let participant: RemoteParticipant
+    let publication: RemoteTrackPublication
+    let track: RemoteVideoTrack
 }
 
 private func makePublicationFixture(
@@ -885,6 +1037,52 @@ private func makePublicationFixture(
         admission: admission,
         track: track,
         rtcTrack: rtcTrack
+    )
+}
+
+private func makeProtectedVideoPublication() throws -> ProtectedVideoPublicationFixture {
+    let room = Room()
+    let participant = RemoteParticipant(
+        info: .with {
+            $0.sid = "PA_protected_video"
+            $0.identity = "protected-video-agent"
+            $0.tracks = [.with {
+                $0.sid = "TR_protected_video"
+                $0.name = "protected-video"
+                $0.type = .video
+                $0.source = .camera
+            }]
+        },
+        room: room,
+        connectionState: .connected
+    )
+    room._state.mutate {
+        $0.connectionState = .connected
+        $0.remoteParticipants[Participant.Identity(from: "protected-video-agent")] = participant
+    }
+    let publication = try #require(
+        participant.trackPublications[Track.Sid(from: "TR_protected_video")]
+            as? RemoteTrackPublication
+    )
+    publication.subscriptionRequestSender = { _, _, _, _, admission in
+        guard admission() else {
+            throw LiveKitError(.invalidState, message: "Injected stale video admission")
+        }
+    }
+    let rtcTrack = RTC.createVideoTrack(source: RTC.createVideoSource(forScreenShare: false))
+    let track = RemoteVideoTrack(
+        name: "protected-video",
+        source: .camera,
+        track: rtcTrack,
+        reportStatistics: false
+    )
+    track._state.mutate { $0.trackState = .started }
+    track.mediaTrack.isEnabled = true
+    return ProtectedVideoPublicationFixture(
+        room: room,
+        participant: participant,
+        publication: publication,
+        track: track
     )
 }
 
