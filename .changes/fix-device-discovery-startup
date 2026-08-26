@@ -1,0 +1,1 @@
+patch type="fixed" "Initialize camera discovery once on a utility queue without blocking Room construction"
