@@ -602,6 +602,7 @@ struct RpcServerTests {
         room.dataChannel(
             MockDataChannelPair { _ in },
             didReceiveDataPacket: packet,
+            encryptionType: .none,
             receiveGeneration: room.dataPacketReceiveGeneration
         )
         try? await Task.sleep(nanoseconds: 10_000_000)

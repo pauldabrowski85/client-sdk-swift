@@ -78,7 +78,7 @@ final class DataTracks: NSObject, @unchecked Sendable {
             lowWaterMark: Self.frameLowWaterMark,
             overflow: .dropOldest,
             stage: DataTrackStage(),
-            onMessage: { [weak self] data in self?.handlePacket(data) },
+            onMessage: { [weak self] data, _ in self?.handlePacket(data) },
             onStateChange: { [weak self] channel in self?.handlePublisherStateChange(channel) },
             onBufferStatusChange: { [weak room] isLow in room?.notify(bufferStatus: isLow, of: .dataTrack) },
         )
