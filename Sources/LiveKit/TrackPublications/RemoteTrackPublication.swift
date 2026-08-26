@@ -106,7 +106,17 @@ public class RemoteTrackPublication: TrackPublication, @unchecked Sendable {
     public func admitSubscription() throws -> RemoteTrackSubscriptionAdmission {
         try _state.mutate { state in
             let admission = state.subscriptionAdmission
+            let admissionIsInactive: Bool
+            switch admission.mode {
+            case .legacy, .revoked:
+                admissionIsInactive = true
+            case .admitted:
+                admissionIsInactive = false
+            }
             guard state.isSubscriptionAllowed,
+                  admissionIsInactive,
+                  state.isSubscribePreferred != true,
+                  state.track == nil,
                   admission.revocationInFlightCount == 0,
                   !admission.revocationNeedsRetry,
                   state.remoteAudioPlayoutOwner == nil,

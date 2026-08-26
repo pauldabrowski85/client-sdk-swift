@@ -41,31 +41,31 @@ extension AudioManager {
 
     @discardableResult
     func initPlayout() -> Int {
-        RTC.audioDeviceModule.initPlayout()
+        performAudioDeviceLifecycleOperation { RTC.audioDeviceModule.initPlayout() }
     }
 
     @discardableResult
     func startPlayout() -> Int {
-        RTC.audioDeviceModule.startPlayout()
+        performAudioDeviceLifecycleOperation { RTC.audioDeviceModule.startPlayout() }
     }
 
     @discardableResult
     func stopPlayout() -> Int {
-        RTC.audioDeviceModule.stopPlayout()
+        performAudioDeviceLifecycleOperation { RTC.audioDeviceModule.stopPlayout() }
     }
 
     @discardableResult
     func initRecording() -> Int {
-        RTC.audioDeviceModule.initRecording()
+        performAudioDeviceRecordingTransition { RTC.audioDeviceModule.initRecording() }
     }
 
     @discardableResult
     func startRecording() -> Int {
-        RTC.audioDeviceModule.startRecording()
+        performAudioDeviceRecordingTransition { RTC.audioDeviceModule.startRecording() }
     }
 
     @discardableResult
     func stopRecording() -> Int {
-        RTC.audioDeviceModule.stopRecording()
+        performAudioDeviceRecordingTransition { RTC.audioDeviceModule.stopRecording() }
     }
 }

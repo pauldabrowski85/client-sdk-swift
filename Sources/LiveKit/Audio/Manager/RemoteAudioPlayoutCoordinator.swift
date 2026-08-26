@@ -31,6 +31,88 @@ struct RemoteAudioLegacyDemandOwner: Hashable, Sendable {
     let admissionGeneration: UInt64
 }
 
+struct RemoteAudioDeviceLifecycleSnapshot: Sendable {
+    let isPlaying: Bool
+    let isRecording: Bool
+    let isEngineRunning: Bool
+}
+
+struct RemoteAudioPlayoutStopObservation: Sendable {
+    let recordingBeforeStop: Bool
+    let recordingTransitionWasStable: Bool
+    let afterStop: RemoteAudioDeviceLifecycleSnapshot
+}
+
+final class AudioDeviceLifecycleCoordinator: @unchecked Sendable {
+    private struct RecordingState {
+        var transitionGeneration: UInt64 = 0
+        var lastObservedIsRecording: Bool?
+    }
+
+    private let lock = NSRecursiveLock()
+    private let recordingState = StateSync(RecordingState())
+
+    func perform<Result>(_ operation: () throws -> Result) rethrows -> Result {
+        lock.lock()
+        defer { lock.unlock() }
+        return try operation()
+    }
+
+    func performRecordingTransition<Result>(
+        _ operation: () throws -> Result
+    ) rethrows -> Result {
+        lock.lock()
+        defer { lock.unlock() }
+        recordingState.mutate { $0.transitionGeneration &+= 1 }
+        return try operation()
+    }
+
+    func observeRecordingState(_ isRecording: Bool) {
+        recordingState.mutate { state in
+            if let previous = state.lastObservedIsRecording,
+               previous != isRecording
+            {
+                state.transitionGeneration &+= 1
+            }
+            state.lastObservedIsRecording = isRecording
+        }
+    }
+
+    func stopPlayoutWithRecordingProof(
+        snapshot: () -> RemoteAudioDeviceLifecycleSnapshot,
+        stopPlayout: () throws -> Void
+    ) throws -> RemoteAudioPlayoutStopObservation {
+        try perform {
+            let recordingBeforeStop = snapshot().isRecording
+            let generationBeforeStop = recordingState.mutate { state -> UInt64 in
+                if let previous = state.lastObservedIsRecording,
+                   previous != recordingBeforeStop
+                {
+                    state.transitionGeneration &+= 1
+                }
+                state.lastObservedIsRecording = recordingBeforeStop
+                return state.transitionGeneration
+            }
+            try stopPlayout()
+            let afterStop = snapshot()
+            let generationAfterStop = recordingState.mutate { state -> UInt64 in
+                if let previous = state.lastObservedIsRecording,
+                   previous != afterStop.isRecording
+                {
+                    state.transitionGeneration &+= 1
+                }
+                state.lastObservedIsRecording = afterStop.isRecording
+                return state.transitionGeneration
+            }
+            return RemoteAudioPlayoutStopObservation(
+                recordingBeforeStop: recordingBeforeStop,
+                recordingTransitionWasStable: generationAfterStop == generationBeforeStop,
+                afterStop: afterStop
+            )
+        }
+    }
+}
+
 struct RemoteAudioPlayoutDriver: Sendable {
     let acquirePlaybackSession: @Sendable () async throws -> SessionRequirementHandle
     let isPlayoutInitialized: @Sendable () async -> Bool
@@ -39,7 +121,8 @@ struct RemoteAudioPlayoutDriver: Sendable {
     let isRecording: @Sendable () async -> Bool
     let isEngineRunning: @Sendable () async -> Bool
     let startPlayout: @Sendable () async throws -> Void
-    let stopPlayout: @Sendable () async throws -> Void
+    let stopPlayoutWithRecordingProof:
+        @Sendable () async throws -> RemoteAudioPlayoutStopObservation
 
     static let live = RemoteAudioPlayoutDriver(
         acquirePlaybackSession: {
@@ -49,7 +132,11 @@ struct RemoteAudioPlayoutDriver: Sendable {
             RTC.audioDeviceModule.isPlayoutInitialized
         },
         initializePlayout: {
-            try AudioManager.shared.checkAdmResult(code: RTC.audioDeviceModule.initPlayout())
+            try AudioManager.shared.performAudioDeviceLifecycleOperation {
+                try AudioManager.shared.checkAdmResult(
+                    code: RTC.audioDeviceModule.initPlayout()
+                )
+            }
         },
         isPlaying: {
             RTC.audioDeviceModule.isPlaying
@@ -61,12 +148,51 @@ struct RemoteAudioPlayoutDriver: Sendable {
             RTC.audioDeviceModule.isEngineRunning
         },
         startPlayout: {
-            try AudioManager.shared.checkAdmResult(code: RTC.audioDeviceModule.startPlayout())
+            try AudioManager.shared.performAudioDeviceLifecycleOperation {
+                try AudioManager.shared.checkAdmResult(
+                    code: RTC.audioDeviceModule.startPlayout()
+                )
+            }
         },
-        stopPlayout: {
-            try AudioManager.shared.checkAdmResult(code: RTC.audioDeviceModule.stopPlayout())
+        stopPlayoutWithRecordingProof: {
+            try AudioManager.shared.stopRemoteAudioPlayoutWithRecordingProof()
         }
     )
+}
+
+extension AudioManager {
+    func performAudioDeviceLifecycleOperation<Result>(
+        _ operation: () throws -> Result
+    ) rethrows -> Result {
+        try _audioDeviceLifecycleCoordinator.perform(operation)
+    }
+
+    func performAudioDeviceRecordingTransition<Result>(
+        _ operation: () throws -> Result
+    ) rethrows -> Result {
+        try _audioDeviceLifecycleCoordinator.performRecordingTransition(operation)
+    }
+
+    func observeAudioDeviceRecordingState(_ isRecording: Bool) {
+        _audioDeviceLifecycleCoordinator.observeRecordingState(isRecording)
+    }
+
+    func stopRemoteAudioPlayoutWithRecordingProof() throws
+        -> RemoteAudioPlayoutStopObservation
+    {
+        try _audioDeviceLifecycleCoordinator.stopPlayoutWithRecordingProof(
+            snapshot: {
+                RemoteAudioDeviceLifecycleSnapshot(
+                    isPlaying: RTC.audioDeviceModule.isPlaying,
+                    isRecording: RTC.audioDeviceModule.isRecording,
+                    isEngineRunning: RTC.audioDeviceModule.isEngineRunning
+                )
+            },
+            stopPlayout: {
+                try self.checkAdmResult(code: RTC.audioDeviceModule.stopPlayout())
+            }
+        )
+    }
 }
 
 /// Owns the process-global ADM playout lifecycle for protected remote audio.
@@ -88,11 +214,17 @@ final class RemoteAudioPlayoutCoordinator: @unchecked Sendable {
     }
 
     private let driver: RemoteAudioPlayoutDriver
+    private let beforeLegacyDemandRelease: @Sendable (RemoteAudioLegacyDemandOwner) async -> Void
     private let operations = SerialRunnerActor<Void>()
     private let _state = StateSync(State())
 
-    init(driver: RemoteAudioPlayoutDriver) {
+    init(
+        driver: RemoteAudioPlayoutDriver,
+        beforeLegacyDemandRelease:
+            @escaping @Sendable (RemoteAudioLegacyDemandOwner) async -> Void = { _ in }
+    ) {
         self.driver = driver
+        self.beforeLegacyDemandRelease = beforeLegacyDemandRelease
     }
 
     func acquire(
@@ -165,7 +297,10 @@ final class RemoteAudioPlayoutCoordinator: @unchecked Sendable {
 
     func releaseLegacyDemand(owner: RemoteAudioLegacyDemandOwner) async throws {
         try await operations.run { [weak self] in
-            self?._state.mutate { $0.legacyOwners.remove(owner) }
+            guard let self else { return }
+            await beforeLegacyDemandRelease(owner)
+            try Task.checkCancellation()
+            _state.mutate { $0.legacyOwners.remove(owner) }
         }
     }
 
@@ -356,18 +491,19 @@ final class RemoteAudioPlayoutCoordinator: @unchecked Sendable {
     }
 
     private func stopPlayoutAndProveRecordingPreserved() async throws {
-        let recordingBeforeStop = await driver.isRecording()
+        let observation = try await driver.stopPlayoutWithRecordingProof()
         _state.mutate {
             $0.mustPreserveRecordingAcrossStop =
-                $0.mustPreserveRecordingAcrossStop || recordingBeforeStop
+                $0.mustPreserveRecordingAcrossStop
+                    || observation.recordingBeforeStop
+                    || !observation.recordingTransitionWasStable
         }
-        try await driver.stopPlayout()
-
-        let isPlaying = await driver.isPlaying()
-        let isRecording = await driver.isRecording()
-        let isEngineRunning = await driver.isEngineRunning()
+        let isPlaying = observation.afterStop.isPlaying
+        let isRecording = observation.afterStop.isRecording
+        let isEngineRunning = observation.afterStop.isEngineRunning
         let mustPreserveRecording = _state.mustPreserveRecordingAcrossStop
-        guard !isPlaying,
+        guard observation.recordingTransitionWasStable,
+              !isPlaying,
               isEngineRunning == isRecording,
               !mustPreserveRecording || isRecording
         else {

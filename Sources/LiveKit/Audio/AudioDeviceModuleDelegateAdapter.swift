@@ -45,24 +45,28 @@ class AudioDeviceModuleDelegateAdapter: NSObject, LKRTCAudioDeviceModuleDelegate
         // PR 275). Ignored for now, exposing it through AudioEngineObserver
         // is a separate API addition.
         guard let audioManager else { return 0 }
+        audioManager.observeAudioDeviceRecordingState(isRecordingEnabled)
         let entryPoint = audioManager.buildEngineObserverChain()
         return entryPoint?.engineWillEnable(engine, isPlayoutEnabled: isPlayoutEnabled, isRecordingEnabled: isRecordingEnabled) ?? 0
     }
 
     func audioDeviceModule(_: LKRTCAudioDeviceModule, willStartEngine engine: AVAudioEngine, isPlayoutEnabled: Bool, isRecordingEnabled: Bool) -> Int {
         guard let audioManager else { return 0 }
+        audioManager.observeAudioDeviceRecordingState(isRecordingEnabled)
         let entryPoint = audioManager.buildEngineObserverChain()
         return entryPoint?.engineWillStart(engine, isPlayoutEnabled: isPlayoutEnabled, isRecordingEnabled: isRecordingEnabled) ?? 0
     }
 
     func audioDeviceModule(_: LKRTCAudioDeviceModule, didStopEngine engine: AVAudioEngine, isPlayoutEnabled: Bool, isRecordingEnabled: Bool) -> Int {
         guard let audioManager else { return 0 }
+        audioManager.observeAudioDeviceRecordingState(isRecordingEnabled)
         let entryPoint = audioManager.buildEngineObserverChain()
         return entryPoint?.engineDidStop(engine, isPlayoutEnabled: isPlayoutEnabled, isRecordingEnabled: isRecordingEnabled) ?? 0
     }
 
     func audioDeviceModule(_: LKRTCAudioDeviceModule, didDisableEngine engine: AVAudioEngine, isPlayoutEnabled: Bool, isRecordingEnabled: Bool) -> Int {
         guard let audioManager else { return 0 }
+        audioManager.observeAudioDeviceRecordingState(isRecordingEnabled)
         let entryPoint = audioManager.buildEngineObserverChain()
         return entryPoint?.engineDidDisable(engine, isPlayoutEnabled: isPlayoutEnabled, isRecordingEnabled: isRecordingEnabled) ?? 0
     }
