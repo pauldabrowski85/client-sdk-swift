@@ -14,7 +14,23 @@
  * limitations under the License.
  */
 
+import Foundation
 internal import LiveKitWebRTC
+
+/// Opaque, publication-scoped authorization for one protected remote-track
+/// subscription generation.
+public struct RemoteTrackSubscriptionAdmission: Sendable {
+    fileprivate let publicationNonce: UUID
+    fileprivate let generation: UInt64
+    fileprivate let tokenNonce: UUID
+}
+
+struct RemoteTrackSubscriptionAdmissionSnapshot: Sendable, Equatable {
+    let publicationNonce: UUID
+    let generation: UInt64
+    let tokenNonce: UUID?
+    let isLegacy: Bool
+}
 
 @objc
 public enum SubscriptionState: Int, Codable {
@@ -25,6 +41,17 @@ public enum SubscriptionState: Int, Codable {
 
 @objcMembers
 public class RemoteTrackPublication: TrackPublication, @unchecked Sendable {
+    typealias SubscriptionRequestSender = @Sendable (
+        _ room: Room,
+        _ participantSid: Participant.Sid,
+        _ trackSid: Track.Sid,
+        _ isSubscribed: Bool,
+        _ admission: @escaping @Sendable () -> Bool
+    ) async throws -> Void
+
+    private let _subscriptionSerialRunner = SerialRunnerActor<Void>()
+    var subscriptionRequestSender: SubscriptionRequestSender?
+
     // MARK: - Public
 
     public var isSubscriptionAllowed: Bool { _state.isSubscriptionAllowed }
@@ -61,25 +88,65 @@ public class RemoteTrackPublication: TrackPublication, @unchecked Sendable {
 
     /// Subscribe or unsubscribe from this track.
     public func set(subscribed newValue: Bool) async throws {
-        guard _state.isSubscribePreferred != newValue else { return }
-
-        let participant = try await requireParticipant()
-        let room = try participant.requireRoom()
-
-        guard let participantSid = participant.sid else { return }
-
-        _state.mutate { $0.isSubscribePreferred = newValue }
-
         if !newValue {
-            // Proactively clear the track. In single PC mode the transceiver is
-            // reused (direction changes) rather than removed, so the WebRTC
-            // didRemove(rtpReceiver:) callback may never fire.
-            await set(track: nil)
+            try await revokeSubscription(requiresExplicitAdmission: false)
+            return
         }
 
-        try await room.signalClient.sendUpdateSubscription(participantSid: participantSid,
-                                                           trackSid: sid,
-                                                           isSubscribed: newValue)
+        guard _state.isSubscribePreferred != true else { return }
+        let snapshot = try beginLegacySubscription()
+        try await setSubscribed(snapshot: snapshot)
+    }
+
+    /// Creates an opaque authorization for a protected subscription attempt.
+    /// The token is valid only for this publication and is invalidated by any
+    /// revocation or participant/room ownership boundary.
+    @nonobjc
+    public func admitSubscription() throws -> RemoteTrackSubscriptionAdmission {
+        try _state.mutate { state in
+            let admission = state.subscriptionAdmission
+            guard admission.revocationInFlightCount == 0,
+                  !admission.revocationNeedsRetry
+            else {
+                throw LiveKitError(
+                    .invalidState,
+                    message: "Subscription revocation has not reached a confirmed signaling boundary"
+                )
+            }
+
+            let tokenNonce = UUID()
+            state.subscriptionAdmission.generation &+= 1
+            state.subscriptionAdmission.mode = .admitted(tokenNonce: tokenNonce)
+            state.subscriptionAdmission.requiresExplicitAdmission = true
+            return RemoteTrackSubscriptionAdmission(
+                publicationNonce: state.subscriptionAdmission.publicationNonce,
+                generation: state.subscriptionAdmission.generation,
+                tokenNonce: tokenNonce
+            )
+        }
+    }
+
+    /// Applies a protected subscription intent using an exact admission token.
+    @nonobjc
+    public func set(
+        subscribed newValue: Bool,
+        admission: RemoteTrackSubscriptionAdmission
+    ) async throws {
+        guard newValue else {
+            try await revokeSubscription()
+            return
+        }
+        let snapshot = try snapshot(for: admission)
+        try await setSubscribed(snapshot: snapshot)
+    }
+
+    /// Invalidates every outstanding protected subscription token, removes and
+    /// silences the exact attached track locally, then confirms the unsubscribe
+    /// request. Local revocation remains in force if signaling throws, and the
+    /// method can be retried safely.
+    @nonobjc
+    public func revokeSubscription() async throws {
+        try await revokeSubscription(requiresExplicitAdmission: true)
     }
 
     /// Enable or disable server from sending down data for this track.
@@ -192,6 +259,502 @@ public class RemoteTrackPublication: TrackPublication, @unchecked Sendable {
         }
 
         return oldValue
+    }
+
+    func replaceSubscribedTrack(expected: Track?, with newValue: Track?) async -> Bool {
+        await replaceSubscribedTrack(expected: expected, with: newValue, admission: nil)
+    }
+
+    func replaceSubscribedTrack(
+        expected: Track?,
+        with newValue: Track?,
+        admission: RemoteTrackSubscriptionAdmissionSnapshot?
+    ) async -> Bool {
+        newValue?.add(delegate: self)
+        let didReplace = _state.mutate { state -> Bool in
+            if let admission, !Self.matches(admission, state: state) {
+                return false
+            }
+            let ownsExpectedTrack = switch (state.track, expected) {
+            case (nil, nil): true
+            case let (current?, expected?): current === expected
+            default: false
+            }
+            guard ownsExpectedTrack else { return false }
+            if let expected, expected !== newValue {
+                Self.silenceAndDetach(expected)
+                state.failedRemoteRevocationTracks[ObjectIdentifier(expected)] = expected
+                state.subscriptionAdmission.revocationNeedsRetry = true
+            }
+            state.track = newValue
+            return true
+        }
+        guard didReplace else {
+            newValue?.remove(delegate: self)
+            return false
+        }
+
+        expected?.remove(delegate: self)
+        _asTimer.cancel()
+
+        if let newValue {
+            newValue._state.mutate {
+                $0.sid = sid
+                $0.dimensions = $0.dimensions == nil ? dimensions : $0.dimensions
+            }
+            resetTrackSettings()
+            if isAdaptiveStreamEnabled {
+                _asTimer.setTimerBlock { [weak self] in
+                    await self?.onAdaptiveStreamTimer()
+                }
+                _asTimer.restart()
+            }
+            newValue.set(muted: _state.isMetadataMuted, notify: false)
+        }
+
+        return true
+    }
+
+    /// Removes a track created by a superseded transport without emitting
+    /// unsubscribe events for a participant that no longer owns the room slot.
+    func removeStaleTrack(_ staleTrack: Track) async throws {
+        retainRemoteTrackForRetirement(staleTrack, detachIfCurrent: true)
+        try await retireRetainedRemoteTrack(staleTrack)
+    }
+
+    /// Stops and detaches an exact track already retained by a publication
+    /// mutation. A failure leaves the disabled object retained for a later
+    /// `revokeSubscription()` retry and blocks any new protected admission.
+    func retireRetainedRemoteTrack(_ track: Track) async throws {
+        do {
+            try await track.stop()
+            await track.set(transport: nil, rtpReceiver: nil)
+        } catch {
+            await track.set(transport: nil, rtpReceiver: nil)
+            throw error
+        }
+
+        _state.mutate { state in
+            state.failedRemoteRevocationTracks.removeValue(forKey: ObjectIdentifier(track))
+            if state.failedRemoteRevocationTracks.isEmpty,
+               state.subscriptionAdmission.revocationInFlightCount == 0
+            {
+                state.subscriptionAdmission.revocationNeedsRetry = false
+            }
+        }
+    }
+
+    /// Drains every exact displaced/removed track retained by this publication.
+    /// Safe to retry: successfully stopped tracks are removed atomically, while
+    /// failures remain disabled and strongly referenced.
+    func stopRetainedRemoteTracks() async throws {
+        let tracks = _state.read { Array($0.failedRemoteRevocationTracks.values) }
+        var firstError: Error?
+        for track in tracks {
+            do {
+                try await retireRetainedRemoteTrack(track)
+            } catch {
+                if firstError == nil { firstError = error }
+            }
+        }
+        if let firstError { throw firstError }
+    }
+
+    func currentSubscriptionAdmissionSnapshot() -> RemoteTrackSubscriptionAdmissionSnapshot? {
+        _state.read { state in
+            switch state.subscriptionAdmission.mode {
+            case .revoked:
+                return nil
+            case .legacy:
+                guard !state.subscriptionAdmission.requiresExplicitAdmission else { return nil }
+                return RemoteTrackSubscriptionAdmissionSnapshot(
+                    publicationNonce: state.subscriptionAdmission.publicationNonce,
+                    generation: state.subscriptionAdmission.generation,
+                    tokenNonce: nil,
+                    isLegacy: true
+                )
+            case let .admitted(tokenNonce):
+                return RemoteTrackSubscriptionAdmissionSnapshot(
+                    publicationNonce: state.subscriptionAdmission.publicationNonce,
+                    generation: state.subscriptionAdmission.generation,
+                    tokenNonce: tokenNonce,
+                    isLegacy: false
+                )
+            }
+        }
+    }
+
+    func isSubscriptionAdmissionCurrent(
+        _ snapshot: RemoteTrackSubscriptionAdmissionSnapshot,
+        track: Track? = nil
+    ) -> Bool {
+        _state.read { state in
+            guard Self.matches(snapshot, state: state) else { return false }
+            guard let track else { return true }
+            return state.track === track
+        }
+    }
+
+    func activateSubscribedTrack(
+        _ track: Track,
+        admission: RemoteTrackSubscriptionAdmissionSnapshot
+    ) -> Bool {
+        _state.mutate { state in
+            guard Self.matches(admission, state: state),
+                  !state.subscriptionAdmission.revocationNeedsRetry,
+                  state.track === track
+            else { return false }
+            // Enabled inside the admission lock so a revoked admission cannot race it. Like
+            // `RemoteAudioTrack.volume`, this is a blocking hop onto the RTC executor.
+            track.mediaTrack.blocking { $0.isEnabled = true }
+            track._state.mutate { $0.trackState = .started }
+            if let audioTrack = track as? RemoteAudioTrack, !admission.isLegacy {
+                audioTrack.volume = 1
+            }
+            return true
+        }
+    }
+
+    func invalidateSubscriptionAdmissionForOwnershipLoss() {
+        let detachedTrack = _state.mutate { state -> Track? in
+            state.subscriptionAdmission.generation &+= 1
+            state.subscriptionAdmission.mode = .revoked
+            state.subscriptionAdmission.requiresExplicitAdmission = true
+            state.subscriptionAdmission.revocationNeedsRetry = true
+            state.isSubscribePreferred = false
+            let detached = state.track
+            if let detached {
+                Self.silenceAndDetach(detached)
+                state.failedRemoteRevocationTracks[ObjectIdentifier(detached)] = detached
+                state.track = nil
+            }
+            for track in state.failedRemoteRevocationTracks.values {
+                Self.silenceAndDetach(track)
+            }
+            return detached
+        }
+        detachedTrack?.remove(delegate: self)
+        _asTimer.cancel()
+    }
+}
+
+private extension RemoteTrackPublication {
+    struct RevocationContext {
+        let tracks: [Track]
+        let detachedCurrentTrack: Track?
+        let participant: RemoteParticipant?
+        let participantSid: Participant.Sid?
+        let room: Room?
+    }
+
+    func beginLegacySubscription() throws -> RemoteTrackSubscriptionAdmissionSnapshot {
+        try _state.mutate { state in
+            guard !state.subscriptionAdmission.requiresExplicitAdmission else {
+                throw LiveKitError(
+                    .invalidState,
+                    message: "This publication requires an explicit subscription admission"
+                )
+            }
+            guard state.subscriptionAdmission.revocationInFlightCount == 0,
+                  !state.subscriptionAdmission.revocationNeedsRetry
+            else {
+                throw LiveKitError(
+                    .invalidState,
+                    message: "Subscription revocation has not reached a confirmed signaling boundary"
+                )
+            }
+            state.subscriptionAdmission.generation &+= 1
+            state.subscriptionAdmission.mode = .legacy
+            state.isSubscribePreferred = true
+            return RemoteTrackSubscriptionAdmissionSnapshot(
+                publicationNonce: state.subscriptionAdmission.publicationNonce,
+                generation: state.subscriptionAdmission.generation,
+                tokenNonce: nil,
+                isLegacy: true
+            )
+        }
+    }
+
+    func snapshot(
+        for admission: RemoteTrackSubscriptionAdmission
+    ) throws -> RemoteTrackSubscriptionAdmissionSnapshot {
+        try _state.read { state in
+            guard state.subscriptionAdmission.publicationNonce == admission.publicationNonce,
+                  state.subscriptionAdmission.generation == admission.generation,
+                  state.subscriptionAdmission.mode == .admitted(tokenNonce: admission.tokenNonce)
+            else {
+                throw LiveKitError(.invalidState, message: "Subscription admission is stale or belongs to another publication")
+            }
+            return RemoteTrackSubscriptionAdmissionSnapshot(
+                publicationNonce: admission.publicationNonce,
+                generation: admission.generation,
+                tokenNonce: admission.tokenNonce,
+                isLegacy: false
+            )
+        }
+    }
+
+    func setSubscribed(snapshot: RemoteTrackSubscriptionAdmissionSnapshot) async throws {
+        try await _subscriptionSerialRunner.run { [weak self] in
+            guard let self else { return }
+            let participant = try await requireParticipant()
+            guard let participant = participant as? RemoteParticipant else {
+                throw LiveKitError(.invalidState, message: "Remote participant is unavailable")
+            }
+            let room = try participant.requireRoom()
+            guard let participantSid = participant.sid else {
+                throw LiveKitError(.invalidState, message: "Remote participant SID is unavailable")
+            }
+
+            try requireCurrentSubscription(snapshot, participant: participant, in: room)
+            try _state.mutate { state in
+                guard Self.matches(snapshot, state: state) else {
+                    throw LiveKitError(.invalidState, message: "Subscription admission was revoked")
+                }
+                state.isSubscribePreferred = true
+            }
+
+            do {
+                try await sendSubscriptionRequest(
+                    room: room,
+                    participant: participant,
+                    participantSid: participantSid,
+                    isSubscribed: true,
+                    admission: {
+                        self.isCurrentSubscription(snapshot, participant: participant, in: room)
+                    }
+                )
+            } catch {
+                if !isCurrentSubscription(snapshot, participant: participant, in: room) {
+                    try await sendCompensatingUnsubscribe(
+                        room: room,
+                        participant: participant,
+                        participantSid: participantSid
+                    )
+                }
+                throw error
+            }
+
+            guard isCurrentSubscription(snapshot, participant: participant, in: room) else {
+                try await sendCompensatingUnsubscribe(
+                    room: room,
+                    participant: participant,
+                    participantSid: participantSid
+                )
+                throw LiveKitError(.invalidState, message: "Subscription admission was revoked during signaling")
+            }
+        }
+    }
+
+    func revokeSubscription(requiresExplicitAdmission: Bool) async throws {
+        let context = beginSubscriptionRevocation(
+            requiresExplicitAdmission: requiresExplicitAdmission
+        )
+        var confirmed = false
+        do {
+            try await _subscriptionSerialRunner.run { [weak self] in
+                guard let self else { return }
+                var firstTrackStopError: Error?
+                for track in context.tracks {
+                    do {
+                        try await retireRetainedRemoteTrack(track)
+                    } catch {
+                        if firstTrackStopError == nil { firstTrackStopError = error }
+                    }
+                }
+
+                if let participant = context.participant,
+                   let participantSid = context.participantSid,
+                   let room = context.room,
+                   owns(participant: participant, in: room)
+                {
+                    try await sendSubscriptionRequest(
+                        room: room,
+                        participant: participant,
+                        participantSid: participantSid,
+                        isSubscribed: false,
+                        admission: { self.owns(participant: participant, in: room) }
+                    )
+                }
+
+                if let firstTrackStopError { throw firstTrackStopError }
+            }
+            confirmed = true
+            finishSubscriptionRevocation(confirmed: true)
+        } catch {
+            finishSubscriptionRevocation(confirmed: confirmed)
+            throw error
+        }
+
+        if context.detachedCurrentTrack != nil,
+           let participant = context.participant,
+           let room = context.room
+        {
+            participant.delegates.notify(label: { "participant.didUnsubscribe \(self)" }) {
+                $0.participant?(participant, didUnsubscribeTrack: self)
+            }
+            room.delegates.notify(label: { "room.didUnsubscribe \(self)" }) {
+                $0.room?(room, participant: participant, didUnsubscribeTrack: self)
+            }
+        }
+    }
+
+    func beginSubscriptionRevocation(requiresExplicitAdmission: Bool) -> RevocationContext {
+        let participant = participant as? RemoteParticipant
+        let room = participant?._room
+        let participantSid = participant?.sid
+        let result = _state.mutate { state -> (tracks: [Track], detached: Track?) in
+            state.subscriptionAdmission.generation &+= 1
+            state.subscriptionAdmission.mode = .revoked
+            state.subscriptionAdmission.requiresExplicitAdmission =
+                state.subscriptionAdmission.requiresExplicitAdmission || requiresExplicitAdmission
+            state.subscriptionAdmission.revocationInFlightCount += 1
+            state.subscriptionAdmission.revocationNeedsRetry = true
+            state.isSubscribePreferred = false
+
+            let detached = state.track
+            if let detached {
+                Self.silenceAndDetach(detached)
+                state.track = nil
+                state.failedRemoteRevocationTracks[ObjectIdentifier(detached)] = detached
+            }
+            for track in state.failedRemoteRevocationTracks.values {
+                Self.silenceAndDetach(track)
+            }
+            return (Array(state.failedRemoteRevocationTracks.values), detached)
+        }
+
+        result.detached?.remove(delegate: self)
+        _asTimer.cancel()
+        return RevocationContext(
+            tracks: result.tracks,
+            detachedCurrentTrack: result.detached,
+            participant: participant,
+            participantSid: participantSid,
+            room: room
+        )
+    }
+
+    func finishSubscriptionRevocation(confirmed: Bool) {
+        _state.mutate { state in
+            state.subscriptionAdmission.revocationInFlightCount = max(
+                0,
+                state.subscriptionAdmission.revocationInFlightCount - 1
+            )
+            if confirmed {
+                state.subscriptionAdmission.revocationNeedsRetry =
+                    !state.failedRemoteRevocationTracks.isEmpty
+            }
+        }
+    }
+
+    func retainRemoteTrackForRetirement(
+        _ track: Track,
+        detachIfCurrent: Bool
+    ) {
+        let detachedCurrent = _state.mutate { state -> Bool in
+            Self.silenceAndDetach(track)
+            state.failedRemoteRevocationTracks[ObjectIdentifier(track)] = track
+            state.subscriptionAdmission.revocationNeedsRetry = true
+            guard detachIfCurrent, state.track === track else { return false }
+            state.track = nil
+            return true
+        }
+        if detachedCurrent {
+            track.remove(delegate: self)
+            _asTimer.cancel()
+        }
+    }
+
+    static func silenceAndDetach(_ track: Track) {
+        if let audioTrack = track as? RemoteAudioTrack {
+            audioTrack.volume = 0
+        }
+        track.mediaTrack.blocking { $0.isEnabled = false }
+        track.detachRemoteTransportSynchronously()
+    }
+
+    func sendCompensatingUnsubscribe(
+        room: Room,
+        participant: RemoteParticipant,
+        participantSid: Participant.Sid
+    ) async throws {
+        guard owns(participant: participant, in: room) else { return }
+        try await sendSubscriptionRequest(
+            room: room,
+            participant: participant,
+            participantSid: participantSid,
+            isSubscribed: false,
+            admission: { self.owns(participant: participant, in: room) }
+        )
+    }
+
+    func sendSubscriptionRequest(
+        room: Room,
+        participant _: RemoteParticipant,
+        participantSid: Participant.Sid,
+        isSubscribed: Bool,
+        admission: @escaping @Sendable () -> Bool
+    ) async throws {
+        if let subscriptionRequestSender {
+            try await subscriptionRequestSender(
+                room,
+                participantSid,
+                sid,
+                isSubscribed,
+                admission
+            )
+        } else {
+            try await room.signalClient.sendProtectedUpdateSubscription(
+                participantSid: participantSid,
+                trackSid: sid,
+                isSubscribed: isSubscribed,
+                admission: admission
+            )
+        }
+    }
+
+    func requireCurrentSubscription(
+        _ snapshot: RemoteTrackSubscriptionAdmissionSnapshot,
+        participant: RemoteParticipant,
+        in room: Room
+    ) throws {
+        guard isCurrentSubscription(snapshot, participant: participant, in: room) else {
+            throw LiveKitError(.invalidState, message: "Subscription admission is no longer current")
+        }
+    }
+
+    func isCurrentSubscription(
+        _ snapshot: RemoteTrackSubscriptionAdmissionSnapshot,
+        participant: RemoteParticipant,
+        in room: Room
+    ) -> Bool {
+        owns(participant: participant, in: room) &&
+            _state.read { Self.matches(snapshot, state: $0) }
+    }
+
+    func owns(participant: RemoteParticipant, in room: Room) -> Bool {
+        guard participant._room === room,
+              let identity = participant.identity,
+              room._state.read({ $0.remoteParticipants[identity] === participant }),
+              participant.trackPublications[sid] === self
+        else { return false }
+        return true
+    }
+
+    static func matches(
+        _ snapshot: RemoteTrackSubscriptionAdmissionSnapshot,
+        state: TrackPublication.State
+    ) -> Bool {
+        guard state.subscriptionAdmission.publicationNonce == snapshot.publicationNonce,
+              state.subscriptionAdmission.generation == snapshot.generation
+        else { return false }
+        if snapshot.isLegacy {
+            return state.subscriptionAdmission.mode == .legacy &&
+                !state.subscriptionAdmission.requiresExplicitAdmission
+        }
+        guard let tokenNonce = snapshot.tokenNonce else { return false }
+        return state.subscriptionAdmission.mode == .admitted(tokenNonce: tokenNonce)
     }
 }
 

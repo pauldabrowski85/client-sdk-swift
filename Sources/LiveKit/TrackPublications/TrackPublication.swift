@@ -20,6 +20,21 @@ import LiveKitNanopb
 import Combine
 import Foundation
 
+enum RemoteSubscriptionAdmissionMode: Equatable, Hashable {
+    case legacy
+    case admitted(tokenNonce: UUID)
+    case revoked
+}
+
+struct RemoteSubscriptionAdmissionState: Equatable, Hashable {
+    let publicationNonce = UUID()
+    var generation: UInt64 = 0
+    var mode: RemoteSubscriptionAdmissionMode = .legacy
+    var requiresExplicitAdmission = false
+    var revocationInFlightCount = 0
+    var revocationNeedsRetry = false
+}
+
 @objcMembers
 public class TrackPublication: NSObject, @unchecked Sendable, ObservableObject, Loggable {
     // MARK: - Public properties
@@ -79,6 +94,8 @@ public class TrackPublication: NSObject, @unchecked Sendable, ObservableObject, 
         // user's preference to subscribe or not
         var isSubscribePreferred: Bool?
         var isMetadataMuted: Bool = false
+        var subscriptionAdmission = RemoteSubscriptionAdmissionState()
+        var failedRemoteRevocationTracks: [ObjectIdentifier: Track] = [:]
         var encryptionType: EncryptionType = .none
 
         var latestInfo: Livekit_TrackInfo?

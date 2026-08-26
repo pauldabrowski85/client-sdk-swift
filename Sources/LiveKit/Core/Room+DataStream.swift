@@ -27,12 +27,22 @@ public extension Room {
     ///     ``ByteStreamReader`` for consuming the stream data and the identity of
     ///     the remote participant who initiated the stream.
     ///
-    func registerByteStreamHandler(for topic: String, onNewStream: @escaping ByteStreamHandler) async throws {
+    func registerByteStreamHandler(
+        for topic: String,
+        limits: IncomingStreamLimits = .default,
+        onStreamRejected: IncomingStreamRejectionHandler? = nil,
+        onNewStream: @escaping ByteStreamHandler
+    ) async throws {
         guard !topic.hasPrefix(Room.reservedTopicPrefix) else {
             throw LiveKitError(.invalidParameter,
                                message: "Stream topic prefix '\(Room.reservedTopicPrefix)' is reserved for internal SDK use")
         }
-        try await incomingStreamManager.registerByteStreamHandler(for: topic, onNewStream)
+        try await incomingStreamManager.registerByteStreamHandler(
+            for: topic,
+            limits: limits,
+            onStreamRejected: onStreamRejected,
+            onNewStream
+        )
     }
 
     /// Registers a handler for incoming text streams matching the given topic.
@@ -45,12 +55,22 @@ public extension Room {
     ///     ``TextStreamReader`` for consuming the stream data and the identity of
     ///     the remote participant who initiated the stream.
     ///
-    func registerTextStreamHandler(for topic: String, onNewStream: @escaping TextStreamHandler) async throws {
+    func registerTextStreamHandler(
+        for topic: String,
+        limits: IncomingStreamLimits = .default,
+        onStreamRejected: IncomingStreamRejectionHandler? = nil,
+        onNewStream: @escaping TextStreamHandler
+    ) async throws {
         guard !topic.hasPrefix(Room.reservedTopicPrefix) else {
             throw LiveKitError(.invalidParameter,
                                message: "Stream topic prefix '\(Room.reservedTopicPrefix)' is reserved for internal SDK use")
         }
-        try await incomingStreamManager.registerTextStreamHandler(for: topic, onNewStream)
+        try await incomingStreamManager.registerTextStreamHandler(
+            for: topic,
+            limits: limits,
+            onStreamRejected: onStreamRejected,
+            onNewStream
+        )
     }
 
     /// Unregisters a byte stream handler that was previously registered for the given topic.

@@ -88,6 +88,11 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
 
     public var disconnectError: LiveKitError? { _state.disconnectError }
 
+    /// Monotonic client-local generation for incoming data packets. The value
+    /// changes before any connection teardown, so delayed work from a prior
+    /// transport can be rejected even if the server reuses a participant SID.
+    public var dataPacketReceiveGeneration: UInt64 { _dataPacketReceiveGeneration.copy() }
+
     /// Timing data for the most recent connection attempt.
     public var connectSpan: Span? { _state.connectSpan }
 
@@ -136,9 +141,17 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
         self?.notify(bufferStatus: isLow, of: kind)
     })
 
-    let incomingStreamManager = IncomingStreamManager()
-    lazy var outgoingStreamManager = OutgoingStreamManager { [weak self] packet in
-        try await self?.send(dataPacket: packet)
+    lazy var incomingStreamManager = IncomingStreamManager { [weak self] receiveGeneration in
+        self?.incomingStreamIngressDidOverflow(receiveGeneration: receiveGeneration)
+    }
+    lazy var outgoingStreamManager = OutgoingStreamManager { [weak self] packet, sendGeneration, admission in
+        try await self?.send(
+            dataPacket: packet,
+            expectedDataChannelSendGeneration: sendGeneration,
+            admission: admission
+        )
+    } sendGenerationProvider: { [weak self] in
+        self?.publisherDataChannel.sendGeneration ?? 0
     } encryptionProvider: { [weak self] in
         self?.e2eeManager?.dataChannelEncryptionType ?? .none
     }
@@ -162,6 +175,8 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
 
     let rpcClient = RpcClientManager()
     let rpcServer = RpcServerManager()
+
+    private let _dataPacketReceiveGeneration = StateSync<UInt64>(0)
 
     // MARK: - State
 
@@ -244,8 +259,11 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
         @discardableResult
         mutating func updateRemoteParticipant(info: Livekit_ParticipantInfo, room: Room) -> RemoteParticipant {
             let identity = Participant.Identity(from: info.identity)
-            // Check if RemoteParticipant with same identity exists...
-            if let participant = remoteParticipants[identity] { return participant }
+            let sid = Participant.Sid(from: info.sid)
+            // A participant identity can be reused after a connection is
+            // replaced. Never mutate the former connection object into the
+            // replacement; queued work uses object identity as provenance.
+            if let participant = remoteParticipants[identity], participant.sid == sid { return participant }
             // Create new RemoteParticipant...
             let participant = RemoteParticipant(info: info, room: room, connectionState: connectionState)
             remoteParticipants[identity] = participant
@@ -594,6 +612,7 @@ extension Room {
     @nonobjc func cleanUp(withError disconnectError: Error? = nil,
                           isFullReconnect: Bool = false) async
     {
+        let nextDataPacketReceiveGeneration = incrementDataPacketReceiveGeneration()
         log("withError: \(String(describing: disconnectError)), isFullReconnect: \(isFullReconnect)")
 
         // Reap all in-flight RPCs with `recipientDisconnected` (1503). Runs before the
@@ -608,7 +627,7 @@ extension Room {
         await activeParticipantCompleters.reset(throwing: disconnectError)
         // Fail open data streams so their handlers return; a handler blocked on a
         // reader that will never finish would stall its topic's ordered queue.
-        await incomingStreamManager.reset()
+        await incomingStreamManager.reset(to: nextDataPacketReceiveGeneration)
 
         await signalClient.cleanUp(withError: disconnectError)
         // Cancel all track stats timers before closing transports to prevent
@@ -666,6 +685,35 @@ extension Room {
         }
     }
 
+    @discardableResult
+    func incrementDataPacketReceiveGeneration() -> UInt64 {
+        let generation = _dataPacketReceiveGeneration.mutate { generation in
+            generation &+= 1
+            return generation
+        }
+        for participant in _state.remoteParticipants.values {
+            participant.invalidateAllSubscriptionAdmissionsForOwnershipLoss()
+        }
+        return generation
+    }
+
+    nonisolated func incomingStreamIngressDidOverflow(receiveGeneration: UInt64) {
+        guard receiveGeneration == dataPacketReceiveGeneration else { return }
+        log("Incoming data-stream packet buffer overflowed; forcing a full reconnect", .error)
+        Task { [weak self] in
+            guard let self,
+                  receiveGeneration == dataPacketReceiveGeneration
+            else { return }
+            do {
+                try await startReconnect(reason: .transport, nextReconnectMode: .full)
+            } catch {
+                guard receiveGeneration == dataPacketReceiveGeneration else { return }
+                log("Unable to recover incoming data streams after overflow: \(error)", .error)
+                await disconnect()
+            }
+        }
+    }
+
     private func cancelTimers() {
         for (_, participant) in allParticipants {
             for (_, publication) in participant._state.trackPublications {
@@ -674,13 +722,27 @@ extension Room {
         }
     }
 
-    private func setupRpc() async {
+    func setupRpc() async {
         await rpcClient.attach(to: self)
         await rpcServer.attach(to: self)
-        await incomingStreamManager.registerTextStreamHandlerIfNeeded(for: RpcStreamTopic.request) { [weak rpcServer] reader, identity in
+        await incomingStreamManager.registerTextStreamHandlerIfNeeded(
+            for: RpcStreamTopic.request,
+            limits: RpcStreamLimits.incoming,
+            onStreamRejected: { [weak rpcServer] rejection in
+                guard !rejection.handlerWasDispatched else { return }
+                Task { await rpcServer?.handleIncomingRequestStreamRejection(rejection) }
+            }
+        ) { [weak rpcServer] reader, identity in
             await rpcServer?.handleIncomingRequestStream(reader: reader, callerIdentity: identity)
         }
-        await incomingStreamManager.registerTextStreamHandlerIfNeeded(for: RpcStreamTopic.response) { [weak rpcClient] reader, identity in
+        await incomingStreamManager.registerTextStreamHandlerIfNeeded(
+            for: RpcStreamTopic.response,
+            limits: RpcStreamLimits.incoming,
+            onStreamRejected: { [weak rpcClient] rejection in
+                guard !rejection.handlerWasDispatched else { return }
+                Task { await rpcClient?.handleIncomingResponseStreamRejection(rejection) }
+            }
+        ) { [weak rpcClient] reader, identity in
             await rpcClient?.handleIncomingResponseStream(reader: reader, senderIdentity: identity)
         }
     }
@@ -691,6 +753,10 @@ extension Room {
 extension Room {
     func cleanUpParticipants(isFullReconnect: Bool = false, notify _notify: Bool = true) async {
         log("notify: \(_notify)")
+
+        for participant in _state.remoteParticipants.values {
+            participant.invalidateAllSubscriptionAdmissionsForOwnershipLoss()
+        }
 
         // Stop all local & remote tracks
         var allParticipants: [Participant] = Array(_state.remoteParticipants.values)
@@ -714,15 +780,33 @@ extension Room {
         }
     }
 
-    func _onParticipantDidDisconnect(identity: Participant.Identity) async throws {
+    func _onParticipantDidDisconnect(
+        participant: RemoteParticipant,
+        identity: Participant.Identity,
+        sid: Participant.Sid,
+        receiveGeneration: UInt64
+    ) async throws {
+        participant.invalidateAllSubscriptionAdmissionsForOwnershipLoss()
         // Reap any in-flight RPCs targeting this participant before tearing them down,
         // so the caller sees `recipientDisconnected` (1503) immediately instead of
         // hanging until the user-supplied `responseTimeout`.
-        await rpcClient.handleParticipantDisconnected(identity)
-        await incomingStreamManager.closeStreams(from: identity)
+        await rpcClient.handleParticipantDisconnected(
+            identity: identity,
+            participantSid: sid,
+            dataPacketReceiveGeneration: receiveGeneration,
+            participant: participant
+        )
+        await incomingStreamManager.closeStreams(
+            from: identity,
+            participantSid: sid,
+            dataPacketReceiveGeneration: receiveGeneration
+        )
 
-        guard let participant = _state.mutate({ $0.remoteParticipants.removeValue(forKey: identity) }) else {
-            throw LiveKitError(.invalidState, message: "Participant not found for \(identity)")
+        _state.mutate { state in
+            guard state.remoteParticipants[identity] === participant,
+                  participant.sid == sid
+            else { return }
+            state.remoteParticipants[identity] = nil
         }
 
         await participant.cleanUp(notify: true)
@@ -816,37 +900,86 @@ public extension Room {
 // MARK: - DataChannelDelegate
 
 extension Room: DataChannelDelegate {
-    func dataChannel(_: DataChannelPair, didReceiveDataPacket dataPacket: Livekit_DataPacket, encryptionType: EncryptionType) {
+    func dataChannel(
+        _: DataChannelPair,
+        didReceiveDataPacket dataPacket: Livekit_DataPacket,
+        encryptionType: EncryptionType,
+        receiveGeneration: UInt64
+    ) {
+        guard receiveGeneration == dataPacketReceiveGeneration else {
+            log("Ignoring data packet from stale receive generation \(receiveGeneration)", .warning)
+            return
+        }
+
         switch dataPacket.value {
         case let .speaker(update): engine(self, didUpdateSpeakers: update.speakers)
         case let .user(userPacket): engine(self, didReceiveUserPacket: userPacket, encryptionType: encryptionType)
         case let .transcription(packet): room(didReceiveTranscriptionPacket: packet)
-        case let .rpcResponse(response): room(didReceiveRpcResponse: response)
-        case let .rpcAck(ack): room(didReceiveRpcAck: ack)
+        case let .rpcResponse(response):
+            room(
+                didReceiveRpcResponse: response,
+                from: dataPacket.participantIdentity,
+                participantSid: dataPacket.participantSid.isEmpty
+                    ? nil
+                    : Participant.Sid(from: dataPacket.participantSid),
+                dataPacketReceiveGeneration: receiveGeneration
+            )
+        case let .rpcAck(ack):
+            room(
+                didReceiveRpcAck: ack,
+                from: dataPacket.participantIdentity,
+                participantSid: dataPacket.participantSid.isEmpty
+                    ? nil
+                    : Participant.Sid(from: dataPacket.participantSid),
+                dataPacketReceiveGeneration: receiveGeneration
+            )
         case let .rpcRequest(request):
             room(
                 didReceiveRpcRequest: request,
                 from: dataPacket.participantIdentity,
                 participantSid: dataPacket.participantSid.isEmpty
                     ? nil
-                    : Participant.Sid(from: dataPacket.participantSid)
+                    : Participant.Sid(from: dataPacket.participantSid),
+                dataPacketReceiveGeneration: receiveGeneration
             )
         case let .streamHeader(header):
             incomingStreamManager.handle(.header(
                 header,
                 dataPacket.participantIdentity,
                 dataPacket.participantSid.isEmpty ? nil : Participant.Sid(from: dataPacket.participantSid),
+                receiveGeneration,
                 encryptionType
             ))
         case let .streamChunk(chunk):
-            incomingStreamManager.handle(.chunk(chunk, encryptionType))
+            incomingStreamManager.handle(.chunk(
+                chunk,
+                dataPacket.participantIdentity,
+                dataPacket.participantSid.isEmpty ? nil : Participant.Sid(from: dataPacket.participantSid),
+                receiveGeneration,
+                encryptionType
+            ))
         case let .streamTrailer(trailer):
-            incomingStreamManager.handle(.trailer(trailer, encryptionType))
+            incomingStreamManager.handle(.trailer(
+                trailer,
+                dataPacket.participantIdentity,
+                dataPacket.participantSid.isEmpty ? nil : Participant.Sid(from: dataPacket.participantSid),
+                receiveGeneration,
+                encryptionType
+            ))
         default: return
         }
     }
 
-    func dataChannel(_: DataChannelPair, didFailToDecryptDataPacket _: Livekit_DataPacket, error: LiveKitError) {
+    func dataChannel(
+        _: DataChannelPair,
+        didFailToDecryptDataPacket _: Livekit_DataPacket,
+        error: LiveKitError,
+        receiveGeneration: UInt64
+    ) {
+        guard receiveGeneration == dataPacketReceiveGeneration else {
+            log("Ignoring data decryption failure from stale receive generation \(receiveGeneration)", .warning)
+            return
+        }
         delegates.notify {
             $0.room?(self, didFailToDecryptDataWithEror: error)
         }

@@ -61,6 +61,7 @@ actor RpcServerManager: Loggable {
     /// Errors always use a v1 packet per spec.
     func handleIncomingRequest(callerIdentity: Participant.Identity,
                                callerParticipantSid: Participant.Sid? = nil,
+                               callerDataPacketReceiveGeneration: UInt64? = nil,
                                requestId: String,
                                method: String,
                                payload: String,
@@ -68,9 +69,18 @@ actor RpcServerManager: Loggable {
                                version: Int) async
     {
         guard let room = try? requireRoom() else { return }
+        guard let callerConnection = RpcParticipantConnection.resolve(
+            in: room,
+            identity: callerIdentity,
+            sid: callerParticipantSid,
+            dataPacketReceiveGeneration: callerDataPacketReceiveGeneration
+        ) else {
+            log("[Rpc] Ignoring request \(requestId) with stale or missing caller provenance", .error)
+            return
+        }
 
         do {
-            try await publishAck(in: room, destinationIdentity: callerIdentity, requestId: requestId)
+            try await publishAck(in: room, callerConnection: callerConnection, requestId: requestId)
         } catch {
             log("[Rpc] Failed to publish RPC ack for \(requestId)", .error)
         }
@@ -78,7 +88,7 @@ actor RpcServerManager: Loggable {
         guard version == 1 else {
             do {
                 try await publishResponse(in: room,
-                                          destinationIdentity: callerIdentity,
+                                          callerConnection: callerConnection,
                                           requestId: requestId,
                                           payload: nil,
                                           error: RpcError.builtIn(.unsupportedVersion))
@@ -88,8 +98,7 @@ actor RpcServerManager: Loggable {
             return
         }
 
-        let result = await dispatchToHandler(callerIdentity: callerIdentity,
-                                             callerParticipantSid: callerParticipantSid,
+        let result = await dispatchToHandler(callerConnection: callerConnection,
                                              requestId: requestId,
                                              method: method,
                                              payload: payload,
@@ -97,7 +106,7 @@ actor RpcServerManager: Loggable {
         do {
             try await publishResult(result,
                                     in: room,
-                                    destinationIdentity: callerIdentity,
+                                    callerConnection: callerConnection,
                                     requestId: requestId)
         } catch {
             log("[Rpc] Failed to publish RPC response for \(requestId)", .error)
@@ -114,6 +123,15 @@ actor RpcServerManager: Loggable {
                                      callerIdentity: Participant.Identity) async
     {
         guard let room = try? requireRoom() else { return }
+        guard let callerConnection = RpcParticipantConnection.resolve(
+            in: room,
+            identity: callerIdentity,
+            sid: reader.info.publisherParticipantSid,
+            dataPacketReceiveGeneration: reader.info.dataPacketReceiveGeneration
+        ) else {
+            log("[Rpc] Ignoring request stream with stale or missing caller provenance", .error)
+            return
+        }
 
         let attrs = reader.info.attributes
         // requestId is the correlation key; without it we can't send a typed error back,
@@ -130,7 +148,7 @@ actor RpcServerManager: Loggable {
             log("[Rpc] Incoming v2 RPC request stream for \(requestId) is missing required attributes", .error)
             do {
                 try await publishResponse(in: room,
-                                          destinationIdentity: callerIdentity,
+                                          callerConnection: callerConnection,
                                           requestId: requestId,
                                           payload: nil,
                                           error: RpcError(code: RpcError.BuiltInError.applicationError.code,
@@ -144,7 +162,7 @@ actor RpcServerManager: Loggable {
         let responseTimeout = TimeInterval(timeoutMs) / 1000
 
         do {
-            try await publishAck(in: room, destinationIdentity: callerIdentity, requestId: requestId)
+            try await publishAck(in: room, callerConnection: callerConnection, requestId: requestId)
         } catch {
             log("[Rpc] Failed to publish RPC ack for \(requestId)", .error)
         }
@@ -152,7 +170,7 @@ actor RpcServerManager: Loggable {
         guard version == RPC_STREAM_VERSION else {
             do {
                 try await publishResponse(in: room,
-                                          destinationIdentity: callerIdentity,
+                                          callerConnection: callerConnection,
                                           requestId: requestId,
                                           payload: nil,
                                           error: RpcError.builtIn(.unsupportedVersion))
@@ -167,22 +185,27 @@ actor RpcServerManager: Loggable {
             payload = try await reader.readAll()
         } catch {
             log("[Rpc] Failed to read v2 RPC request payload for \(requestId): \(error)", .error)
+            let rpcError: RpcError = if case StreamError.streamSizeExceeded = error {
+                .builtIn(.requestPayloadTooLarge)
+            } else {
+                RpcError(code: RpcError.BuiltInError.applicationError.code,
+                         message: "Error reading RPC request payload",
+                         data: "")
+            }
             do {
                 try await publishResponse(in: room,
-                                          destinationIdentity: callerIdentity,
+                                          callerConnection: callerConnection,
                                           requestId: requestId,
                                           payload: nil,
-                                          error: RpcError(code: RpcError.BuiltInError.applicationError.code,
-                                                          message: "Error reading RPC request payload",
-                                                          data: ""))
+                                          error: rpcError)
             } catch {
                 log("[Rpc] Failed to publish read-failure error response for \(requestId)", .error)
             }
             return
         }
 
-        let result = await dispatchToHandler(callerIdentity: callerIdentity,
-                                             callerParticipantSid: reader.info.publisherParticipantSid,
+        guard callerConnection.isCurrent(in: room) else { return }
+        let result = await dispatchToHandler(callerConnection: callerConnection,
                                              requestId: requestId,
                                              method: method,
                                              payload: payload,
@@ -190,10 +213,42 @@ actor RpcServerManager: Loggable {
         do {
             try await publishResult(result,
                                     in: room,
-                                    destinationIdentity: callerIdentity,
+                                    callerConnection: callerConnection,
                                     requestId: requestId)
         } catch {
             log("[Rpc] Failed to publish RPC response for \(requestId)", .error)
+        }
+    }
+
+    func handleIncomingRequestStreamRejection(_ rejection: IncomingStreamRejection) async {
+        guard let requestId = rejection.attributes[RpcStreamAttribute.requestId],
+              let room = try? requireRoom()
+        else {
+            log("[Rpc] Rejected v2 request stream is missing request id", .error)
+            return
+        }
+        guard let callerConnection = RpcParticipantConnection.resolve(
+            in: room,
+            identity: rejection.participantIdentity,
+            sid: rejection.publisherParticipantSid,
+            dataPacketReceiveGeneration: rejection.dataPacketReceiveGeneration
+        ) else { return }
+        let error: RpcError = switch rejection.error {
+        case .streamSizeExceeded, .invalidDeclaredLength:
+            .builtIn(.requestPayloadTooLarge)
+        default:
+            .builtIn(.applicationError)
+        }
+        do {
+            try await publishResponse(
+                in: room,
+                callerConnection: callerConnection,
+                requestId: requestId,
+                payload: nil,
+                error: error
+            )
+        } catch {
+            log("[Rpc] Failed to publish rejection response for \(requestId)", .error)
         }
     }
 
@@ -209,21 +264,24 @@ actor RpcServerManager: Loggable {
     /// Look up the handler for `method`, invoke it, and produce a payload-or-error result.
     /// Size-checking the response is the responsibility of the publisher: the v1 wire has
     /// a 15 KB cap (enforced in `publishResponse`), the v2 stream wire is unbounded.
-    private func dispatchToHandler(callerIdentity: Participant.Identity,
-                                   callerParticipantSid: Participant.Sid?,
+    private func dispatchToHandler(callerConnection: RpcParticipantConnection,
                                    requestId: String,
                                    method: String,
                                    payload: String,
                                    responseTimeout: TimeInterval) async -> DispatchResult
     {
+        guard let room, callerConnection.isCurrent(in: room) else {
+            return .failure(RpcError.builtIn(.recipientDisconnected))
+        }
         guard let handler = handlers[method] else {
             return .failure(RpcError.builtIn(.unsupportedMethod))
         }
 
         do {
             let response = try await handler(RpcInvocationData(requestId: requestId,
-                                                               callerIdentity: callerIdentity,
-                                                               callerParticipantSid: callerParticipantSid,
+                                                               callerIdentity: callerConnection.identity,
+                                                               callerParticipantSid: callerConnection.sid,
+                                                               callerDataPacketReceiveGeneration: callerConnection.dataPacketReceiveGeneration,
                                                                payload: payload,
                                                                responseTimeout: responseTimeout))
             return .success(response)
@@ -241,27 +299,38 @@ actor RpcServerManager: Loggable {
     /// responses always use a v1 packet per spec, regardless of caller transport.
     private func publishResult(_ result: DispatchResult,
                                in room: Room,
-                               destinationIdentity: Participant.Identity,
+                               callerConnection: RpcParticipantConnection,
                                requestId: String) async throws
     {
+        try requireCurrent(callerConnection, in: room)
         switch result {
         case let .success(payload):
-            let callerProtocol = room.remoteParticipants[destinationIdentity]?.clientProtocol ?? .v0
+            let callerProtocol = callerConnection.participant.clientProtocol
             if callerProtocol >= .v1 {
-                try await publishResponseStream(in: room,
-                                                destinationIdentity: destinationIdentity,
-                                                requestId: requestId,
-                                                payload: payload)
+                if payload.byteLength > RpcStreamLimits.maximumPayloadBytes {
+                    try await publishResponse(
+                        in: room,
+                        callerConnection: callerConnection,
+                        requestId: requestId,
+                        payload: nil,
+                        error: .builtIn(.responsePayloadTooLarge)
+                    )
+                } else {
+                    try await publishResponseStream(in: room,
+                                                    callerConnection: callerConnection,
+                                                    requestId: requestId,
+                                                    payload: payload)
+                }
             } else {
                 try await publishResponse(in: room,
-                                          destinationIdentity: destinationIdentity,
+                                          callerConnection: callerConnection,
                                           requestId: requestId,
                                           payload: payload,
                                           error: nil)
             }
         case let .failure(error):
             try await publishResponse(in: room,
-                                      destinationIdentity: destinationIdentity,
+                                      callerConnection: callerConnection,
                                       requestId: requestId,
                                       payload: nil,
                                       error: error)
@@ -275,11 +344,12 @@ actor RpcServerManager: Loggable {
     /// `responsePayloadTooLarge` error instead. v2 stream responses go through
     /// `publishResponseStream` and have no size limit.
     private func publishResponse(in room: Room,
-                                 destinationIdentity: Participant.Identity,
+                                 callerConnection: RpcParticipantConnection,
                                  requestId: String,
                                  payload: String?,
                                  error: RpcError?) async throws
     {
+        try requireCurrent(callerConnection, in: room)
         var outgoingPayload = payload
         var outgoingError = error
         if let p = payload, p.byteLength > MAX_RPC_PAYLOAD_BYTES {
@@ -289,7 +359,7 @@ actor RpcServerManager: Loggable {
         }
 
         let dataPacket = Livekit_DataPacket.with {
-            $0.destinationIdentities = [destinationIdentity.stringValue]
+            $0.destinationIdentities = [callerConnection.identity.stringValue]
             $0.kind = .reliable
             $0.rpcResponse = Livekit_RpcResponse.with {
                 $0.requestID = requestId
@@ -301,37 +371,55 @@ actor RpcServerManager: Loggable {
             }
         }
 
-        try await room.send(dataPacket: dataPacket)
+        try requireCurrent(callerConnection, in: room)
+        let sendGeneration = room.publisherDataChannel.sendGeneration
+        try await room.send(
+            dataPacket: dataPacket,
+            expectedDataChannelSendGeneration: sendGeneration,
+            admission: { callerConnection.isCurrent(in: room) }
+        )
     }
 
     private func publishResponseStream(in room: Room,
-                                       destinationIdentity: Participant.Identity,
+                                       callerConnection: RpcParticipantConnection,
                                        requestId: String,
                                        payload: String) async throws
     {
+        try requireCurrent(callerConnection, in: room)
         let options = StreamTextOptions(
             topic: RpcStreamTopic.response,
             attributes: [RpcStreamAttribute.requestId: requestId],
-            destinationIdentities: [destinationIdentity],
+            destinationIdentities: [callerConnection.identity],
         )
-        let writer = try await room.localParticipant.streamText(options: options)
+        let writer = try await room.outgoingStreamManager.streamText(
+            options: options,
+            admission: { callerConnection.isCurrent(in: room) }
+        )
+        try requireCurrent(callerConnection, in: room)
         try await writer.write(payload)
+        try requireCurrent(callerConnection, in: room)
         try await writer.close()
     }
 
     private func publishAck(in room: Room,
-                            destinationIdentity: Participant.Identity,
+                            callerConnection: RpcParticipantConnection,
                             requestId: String) async throws
     {
+        try requireCurrent(callerConnection, in: room)
         let dataPacket = Livekit_DataPacket.with {
-            $0.destinationIdentities = [destinationIdentity.stringValue]
+            $0.destinationIdentities = [callerConnection.identity.stringValue]
             $0.kind = .reliable
             $0.rpcAck = Livekit_RpcAck.with {
                 $0.requestID = requestId
             }
         }
 
-        try await room.send(dataPacket: dataPacket)
+        let sendGeneration = room.publisherDataChannel.sendGeneration
+        try await room.send(
+            dataPacket: dataPacket,
+            expectedDataChannelSendGeneration: sendGeneration,
+            admission: { callerConnection.isCurrent(in: room) }
+        )
     }
 
     // MARK: - Helpers
@@ -339,5 +427,14 @@ actor RpcServerManager: Loggable {
     private func requireRoom() throws -> Room {
         guard let room else { throw LiveKitError(.invalidState, message: "Room is nil") }
         return room
+    }
+
+    private func requireCurrent(
+        _ connection: RpcParticipantConnection,
+        in room: Room
+    ) throws {
+        guard connection.isCurrent(in: room) else {
+            throw RpcError.builtIn(.recipientDisconnected)
+        }
     }
 }

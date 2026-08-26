@@ -40,6 +40,7 @@ extension Room {
 
     // Resets state of transports
     func cleanUpRTC(withError disconnectError: Error? = nil) async {
+        await outgoingStreamManager.reset()
         // Close data channels
         publisherDataChannel.reset(throwing: disconnectError)
         subscriberDataChannel.reset(throwing: disconnectError)
@@ -95,6 +96,18 @@ extension Room {
     }
 
     func send(dataPacket packet: consuming Livekit_DataPacket) async throws {
+        try await send(
+            dataPacket: packet,
+            expectedDataChannelSendGeneration: nil,
+            admission: nil
+        )
+    }
+
+    func send(
+        dataPacket packet: consuming Livekit_DataPacket,
+        expectedDataChannelSendGeneration: UInt64?,
+        admission: (@Sendable () -> Bool)? = nil
+    ) async throws {
         try await ensurePublisherConnected()
 
         // At this point publisher should be .connected and dc should be .open
@@ -118,7 +131,22 @@ extension Room {
             }
         }
 
-        try await publisherDataChannel.send(dataPacket: stamped)
+        if let expectedDataChannelSendGeneration {
+            if let admission {
+                try await publisherDataChannel.send(
+                    dataPacket: stamped,
+                    expectedSendGeneration: expectedDataChannelSendGeneration,
+                    admission: admission
+                )
+            } else {
+                try await publisherDataChannel.send(
+                    dataPacket: stamped,
+                    expectedSendGeneration: expectedDataChannelSendGeneration
+                )
+            }
+        } else {
+            try await publisherDataChannel.send(dataPacket: stamped)
+        }
     }
 }
 
@@ -291,7 +319,7 @@ extension Room {
             throw LiveKitError(.invalidState)
         }
 
-        guard _state.transport != nil else {
+        guard _state.transport != nil || nextReconnectMode == .full else {
             log("[Connect] Transport is nil", .error)
             throw LiveKitError(.invalidState)
         }

@@ -25,6 +25,9 @@ public struct SessionOptions: Sendable {
     /// Use ``LocalMedia`` or ``AudioManager/setRecordingAlwaysPreparedMode(_:)``
     /// to request microphone permissions early in the app lifecycle.
     public var preConnectAudio: Bool
+    /// Whether the session automatically enables the microphone after a
+    /// non-buffered connection completes.
+    public var enableMicrophoneOnConnect: Bool
     /// The timeout for the agent to connect, in seconds.
     /// If exceeded, the ``Agent`` will transition to a failed state.
     public var agentConnectTimeout: TimeInterval
@@ -32,10 +35,12 @@ public struct SessionOptions: Sendable {
     public init(
         room: Room = .init(),
         preConnectAudio: Bool = true,
+        enableMicrophoneOnConnect: Bool = true,
         agentConnectTimeout: TimeInterval = 20,
     ) {
         self.room = room
         self.preConnectAudio = preConnectAudio
+        self.enableMicrophoneOnConnect = enableMicrophoneOnConnect
         self.agentConnectTimeout = agentConnectTimeout
     }
 
@@ -51,15 +56,19 @@ public struct SessionOptions: Sendable {
     /// - Parameters:
     ///   - encryption: The end-to-end encryption configuration.
     ///   - preConnectAudio: Whether to enable audio pre-connect.
+    ///   - enableMicrophoneOnConnect: Whether to automatically enable the
+    ///     microphone after a non-buffered connection completes.
     ///   - agentConnectTimeout: Timeout for the agent to connect, in seconds.
     public init(
         encryption: EncryptionOptions,
         preConnectAudio: Bool = true,
+        enableMicrophoneOnConnect: Bool = true,
         agentConnectTimeout: TimeInterval = 20,
     ) {
         self.init(
             room: Room(roomOptions: RoomOptions(encryptionOptions: encryption)),
             preConnectAudio: preConnectAudio,
+            enableMicrophoneOnConnect: enableMicrophoneOnConnect,
             agentConnectTimeout: agentConnectTimeout,
         )
     }

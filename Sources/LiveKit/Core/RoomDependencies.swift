@@ -86,6 +86,7 @@ final class JoinDependencies: Sendable {
     {
         let isSinglePC = singlePeerConnection
         let isSubscriberPrimary = isSinglePC ? false : joinResponse.subscriberPrimary
+        let dataPacketReceiveGeneration = room.dataPacketReceiveGeneration
         room.log("subscriberPrimary: \(isSubscriberPrimary), singlePeerConnection: \(isSinglePC)")
 
         // Publisher always created; is primary in single PC mode
@@ -93,6 +94,7 @@ final class JoinDependencies: Sendable {
                                             target: .publisher,
                                             primary: isSinglePC || !isSubscriberPrimary,
                                             singlePCMode: isSinglePC,
+                                            dataPacketReceiveGeneration: dataPacketReceiveGeneration,
                                             delegate: room)
 
         await publisher.set { [weak room] offer, offerId in
@@ -110,8 +112,14 @@ final class JoinDependencies: Sendable {
         let lossyDataChannel = await publisher.dataChannel(for: LKRTCDataChannel.Labels.lossy,
                                                            configuration: RTC.createDataChannelConfiguration(ordered: false, maxRetransmits: 0))
 
-        room.publisherDataChannel.set(reliable: reliableDataChannel)
-        room.publisherDataChannel.set(lossy: lossyDataChannel)
+        room.publisherDataChannel.set(
+            reliable: reliableDataChannel,
+            receiveGeneration: dataPacketReceiveGeneration
+        )
+        room.publisherDataChannel.set(
+            lossy: lossyDataChannel,
+            receiveGeneration: dataPacketReceiveGeneration
+        )
 
         // Data track channel (unordered, unreliable — DTP handles its own sequencing).
         let dataTrackChannel = await publisher.dataChannel(for: LKRTCDataChannel.Labels.dataTrack,
@@ -128,6 +136,7 @@ final class JoinDependencies: Sendable {
             try await Transport(config: rtcConfiguration,
                                 target: .subscriber,
                                 primary: isSubscriberPrimary,
+                                dataPacketReceiveGeneration: dataPacketReceiveGeneration,
                                 delegate: room)
         }
 

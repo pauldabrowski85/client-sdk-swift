@@ -20,6 +20,12 @@ import Foundation
 
 /// Manages state of incoming data streams.
 actor IncomingStreamManager: Loggable {
+    private struct IngressState {
+        var receiveGeneration: UInt64 = 0
+        var overflowToken: UInt64 = 0
+        var overflowGeneration: UInt64?
+    }
+
     /// Information about an open data stream.
     private struct Descriptor {
         /// Distinguishes this descriptor from others that reuse the same stream
@@ -27,19 +33,45 @@ actor IncomingStreamManager: Loggable {
         let generation = UUID()
         let info: StreamInfo
         let identity: Participant.Identity
+        let participantSid: Participant.Sid?
+        let dataPacketReceiveGeneration: UInt64
         let continuation: StreamReaderSource.Continuation
+        let limits: IncomingStreamLimits
+        let onStreamRejected: IncomingStreamRejectionHandler?
         var readLength = 0
+    }
+
+    private struct ByteHandlerRegistration {
+        let handler: ByteStreamHandler
+        let limits: IncomingStreamLimits
+        let onStreamRejected: IncomingStreamRejectionHandler?
+    }
+
+    private struct TextHandlerRegistration {
+        let handler: TextStreamHandler
+        let limits: IncomingStreamLimits
+        let onStreamRejected: IncomingStreamRejectionHandler?
+    }
+
+    private struct ResolvedHandler {
+        let handler: AnyStreamHandler
+        let limits: IncomingStreamLimits
+        let onStreamRejected: IncomingStreamRejectionHandler?
     }
 
     /// Mapping between stream ID and descriptor for open streams.
     private var openStreams: [String: Descriptor] = [:]
 
     var openStreamCount: Int { openStreams.count }
+    var failedTopicDiagnosticCount: Int { failedToOpenStreams.count }
+    nonisolated var hasIngressOverflowed: Bool { ingressState.overflowGeneration != nil }
+    nonisolated var ingressOverflowTokenForTests: UInt64 { ingressState.overflowToken }
     /// Stream topics without a registered handler.
     private var failedToOpenStreams: Set<String> = []
 
-    private var byteStreamHandlers: [String: ByteStreamHandler] = [:]
-    private var textStreamHandlers: [String: TextStreamHandler] = [:]
+    private var byteStreamHandlers: [String: ByteHandlerRegistration] = [:]
+    private var textStreamHandlers: [String: TextHandlerRegistration] = [:]
+    private let ingressState = StateSync(IngressState())
 
     /// Topics whose handlers preserve wire order (see `registerTextStreamHandler`).
     private var orderedTopics: Set<String> = []
@@ -53,16 +85,37 @@ actor IncomingStreamManager: Loggable {
 
     /// Events are processed in a serial (FIFO) order
     enum StreamEvent {
-        case header(Livekit_DataStream.Header, String, Participant.Sid?, EncryptionType)
-        case chunk(Livekit_DataStream.Chunk, EncryptionType)
-        case trailer(Livekit_DataStream.Trailer, EncryptionType)
+        case header(Livekit_DataStream.Header, String, Participant.Sid?, UInt64, EncryptionType)
+        case chunk(Livekit_DataStream.Chunk, String, Participant.Sid?, UInt64, EncryptionType)
+        case trailer(Livekit_DataStream.Trailer, String, Participant.Sid?, UInt64, EncryptionType)
+
+        var receiveGeneration: UInt64 {
+            switch self {
+            case let .header(_, _, _, receiveGeneration, _),
+                 let .chunk(_, _, _, receiveGeneration, _),
+                 let .trailer(_, _, _, receiveGeneration, _):
+                receiveGeneration
+            }
+        }
     }
 
     private let eventContinuation: AsyncStream<StreamEvent>.Continuation
     private var eventLoopTask: AnyTaskCancellable?
+    private nonisolated let onIngressOverflow: (@Sendable (UInt64) -> Void)?
+    private nonisolated let onEventAdmittedBeforeYield: (@Sendable () -> Void)?
 
-    init() {
-        let (stream, continuation) = AsyncStream.makeStream(of: StreamEvent.self)
+    init(
+        eventBufferCapacity: Int = 1_024,
+        onIngressOverflow: (@Sendable (UInt64) -> Void)? = nil,
+        onEventAdmittedBeforeYield: (@Sendable () -> Void)? = nil
+    ) {
+        precondition(eventBufferCapacity > 0)
+        self.onIngressOverflow = onIngressOverflow
+        self.onEventAdmittedBeforeYield = onEventAdmittedBeforeYield
+        let (stream, continuation) = AsyncStream.makeStream(
+            of: StreamEvent.self,
+            bufferingPolicy: .bufferingNewest(eventBufferCapacity)
+        )
         eventContinuation = continuation
 
         Task {
@@ -77,32 +130,91 @@ actor IncomingStreamManager: Loggable {
     }
 
     nonisolated func handle(_ event: StreamEvent) {
-        eventContinuation.yield(event)
+        let receiveGeneration = event.receiveGeneration
+        let overflow = ingressState.mutate { state -> (token: UInt64, dropped: StreamEvent)? in
+            guard state.receiveGeneration == receiveGeneration,
+                  state.overflowGeneration == nil
+            else { return nil }
+
+            // Admission and yield are one critical section. Without this, a
+            // stale event can pass admission, pause while reset installs a new
+            // generation, then evict a current event from the bounded stream.
+            onEventAdmittedBeforeYield?()
+            guard case let .dropped(droppedEvent) = eventContinuation.yield(event) else {
+                return nil
+            }
+
+            // A generation reset can leave old events in AsyncStream's fixed
+            // buffer. A current event may displace one of those stale events;
+            // only loss of an event owned by the currently installed
+            // generation trips overflow.
+            guard droppedEvent.receiveGeneration == state.receiveGeneration else {
+                return nil
+            }
+            state.overflowToken &+= 1
+            state.overflowGeneration = receiveGeneration
+            return (state.overflowToken, droppedEvent)
+        }
+        guard let overflow else { return }
+        onIngressOverflow?(receiveGeneration)
+        Task {
+            await failForIngressOverflow(
+                receiveGeneration: receiveGeneration,
+                overflowToken: overflow.token,
+                droppedEvent: overflow.dropped
+            )
+        }
     }
 
     private func process(_ event: StreamEvent) {
+        guard !hasIngressOverflowed else { return }
         switch event {
-        case let .header(header, identityString, participantSid, encryptionType):
+        case let .header(header, identityString, participantSid, receiveGeneration, encryptionType):
+            guard receiveGeneration == ingressState.receiveGeneration else { return }
             handle(
                 header: header,
                 from: identityString,
                 participantSid: participantSid,
+                dataPacketReceiveGeneration: receiveGeneration,
                 encryptionType: encryptionType
             )
-        case let .chunk(chunk, encryptionType):
-            handle(chunk: chunk, encryptionType: encryptionType)
-        case let .trailer(trailer, encryptionType):
-            handle(trailer: trailer, encryptionType: encryptionType)
+        case let .chunk(chunk, identity, participantSid, receiveGeneration, encryptionType):
+            guard receiveGeneration == ingressState.receiveGeneration else { return }
+            handle(
+                chunk: chunk,
+                from: identity,
+                participantSid: participantSid,
+                dataPacketReceiveGeneration: receiveGeneration,
+                encryptionType: encryptionType
+            )
+        case let .trailer(trailer, identity, participantSid, receiveGeneration, encryptionType):
+            guard receiveGeneration == ingressState.receiveGeneration else { return }
+            handle(
+                trailer: trailer,
+                from: identity,
+                participantSid: participantSid,
+                dataPacketReceiveGeneration: receiveGeneration,
+                encryptionType: encryptionType
+            )
         }
     }
 
     // MARK: - Handler registration
 
-    func registerByteStreamHandler(for topic: String, _ onNewStream: @escaping ByteStreamHandler) throws {
+    func registerByteStreamHandler(
+        for topic: String,
+        limits: IncomingStreamLimits = .default,
+        onStreamRejected: IncomingStreamRejectionHandler? = nil,
+        _ onNewStream: @escaping ByteStreamHandler
+    ) throws {
         guard byteStreamHandlers[topic] == nil else {
             throw StreamError.handlerAlreadyRegistered
         }
-        byteStreamHandlers[topic] = onNewStream
+        byteStreamHandlers[topic] = ByteHandlerRegistration(
+            handler: onNewStream,
+            limits: limits,
+            onStreamRejected: onStreamRejected
+        )
     }
 
     /// When `ordered` is true, handlers for streams that do not overlap on the
@@ -115,11 +227,21 @@ actor IncomingStreamManager: Loggable {
     /// Contract: an ordered handler should return promptly once its reader ends —
     /// work it keeps doing after its stream closed delays every later
     /// non-overlapping stream on the topic.
-    func registerTextStreamHandler(for topic: String, ordered: Bool = false, _ onNewStream: @escaping TextStreamHandler) throws {
+    func registerTextStreamHandler(
+        for topic: String,
+        ordered: Bool = false,
+        limits: IncomingStreamLimits = .default,
+        onStreamRejected: IncomingStreamRejectionHandler? = nil,
+        _ onNewStream: @escaping TextStreamHandler
+    ) throws {
         guard textStreamHandlers[topic] == nil else {
             throw StreamError.handlerAlreadyRegistered
         }
-        textStreamHandlers[topic] = onNewStream
+        textStreamHandlers[topic] = TextHandlerRegistration(
+            handler: onNewStream,
+            limits: limits,
+            onStreamRejected: onStreamRejected
+        )
         if ordered { orderedTopics.insert(topic) }
     }
 
@@ -127,9 +249,18 @@ actor IncomingStreamManager: Loggable {
     /// otherwise no-op. Used by idempotent wiring paths (e.g. RPC v2 setup runs on every
     /// connect) that don't want the duplicate-registration throw from the public API.
     @discardableResult
-    func registerTextStreamHandlerIfNeeded(for topic: String, _ onNewStream: @escaping TextStreamHandler) -> Bool {
+    func registerTextStreamHandlerIfNeeded(
+        for topic: String,
+        limits: IncomingStreamLimits = .default,
+        onStreamRejected: IncomingStreamRejectionHandler? = nil,
+        _ onNewStream: @escaping TextStreamHandler
+    ) -> Bool {
         guard textStreamHandlers[topic] == nil else { return false }
-        textStreamHandlers[topic] = onNewStream
+        textStreamHandlers[topic] = TextHandlerRegistration(
+            handler: onNewStream,
+            limits: limits,
+            onStreamRejected: onStreamRejected
+        )
         return true
     }
 
@@ -149,6 +280,7 @@ actor IncomingStreamManager: Loggable {
         header: Livekit_DataStream.Header,
         from identityString: String,
         participantSid: Participant.Sid?,
+        dataPacketReceiveGeneration: UInt64,
         encryptionType: EncryptionType
     ) {
         let identity = Participant.Identity(from: identityString)
@@ -156,36 +288,99 @@ actor IncomingStreamManager: Loggable {
         guard let streamInfo = Self.streamInfo(
             from: header,
             participantSid: participantSid,
+            dataPacketReceiveGeneration: dataPacketReceiveGeneration,
             encryptionType: encryptionType
         ) else {
+            rejectionHandler(for: header)?(IncomingStreamRejection(
+                streamID: header.streamID,
+                topic: header.topic,
+                participantIdentity: identity,
+                publisherParticipantSid: participantSid,
+                dataPacketReceiveGeneration: dataPacketReceiveGeneration,
+                attributes: header.attributes,
+                handlerWasDispatched: false,
+                error: .invalidDeclaredLength
+            ))
             return
         }
-        openStream(with: streamInfo, from: identity)
+        openStream(
+            with: streamInfo,
+            from: identity,
+            participantSid: participantSid,
+            dataPacketReceiveGeneration: dataPacketReceiveGeneration
+        )
     }
 
-    private func openStream(with info: StreamInfo, from identity: Participant.Identity) {
+    private func openStream(
+        with info: StreamInfo,
+        from identity: Participant.Identity,
+        participantSid: Participant.Sid?,
+        dataPacketReceiveGeneration: UInt64
+    ) {
         guard openStreams[info.id] == nil else {
             log("Ignoring stream \(info.id) from \(identity): a stream with this ID is already open", .warning)
             return
         }
-        guard let handler = handler(for: info) else {
+        guard let registration = handler(for: info) else {
             let topic = info.topic
             if !failedToOpenStreams.contains(topic) {
-                log("Unable to find handler for incoming stream: \(info.id), topic: \(topic), opened by: \(identity)", .warning)
-                failedToOpenStreams.insert(topic)
+                if failedToOpenStreams.count < Self.maximumFailedTopicDiagnostics {
+                    log("Unable to find handler for incoming stream: \(info.id), topic: \(topic), opened by: \(identity)", .warning)
+                    failedToOpenStreams.insert(topic)
+                }
             }
             return
         }
 
+        if let totalLength = info.totalLength,
+           let maxStreamBytes = registration.limits.maxStreamBytes,
+           totalLength > maxStreamBytes
+        {
+            registration.onStreamRejected?(IncomingStreamRejection(
+                streamID: info.id,
+                topic: info.topic,
+                participantIdentity: identity,
+                publisherParticipantSid: participantSid,
+                dataPacketReceiveGeneration: dataPacketReceiveGeneration,
+                attributes: info.attributes,
+                handlerWasDispatched: false,
+                error: .streamSizeExceeded(maximumBytes: maxStreamBytes)
+            ))
+            return
+        }
+
+        let openStreamCountForTopic = openStreams.values.lazy
+            .filter { $0.info.topic == info.topic }
+            .count
+        guard openStreamCountForTopic < registration.limits.maxConcurrentStreams else {
+            registration.onStreamRejected?(IncomingStreamRejection(
+                streamID: info.id,
+                topic: info.topic,
+                participantIdentity: identity,
+                publisherParticipantSid: participantSid,
+                dataPacketReceiveGeneration: dataPacketReceiveGeneration,
+                attributes: info.attributes,
+                handlerWasDispatched: false,
+                error: .tooManyOpenStreams(maximum: registration.limits.maxConcurrentStreams)
+            ))
+            return
+        }
+
         var continuation: StreamReaderSource.Continuation!
-        let source = StreamReaderSource {
+        let source = StreamReaderSource(
+            bufferingPolicy: .bufferingOldest(registration.limits.maxBufferedChunks)
+        ) {
             continuation = $0
         }
 
         let descriptor = Descriptor(
             info: info,
             identity: identity,
+            participantSid: participantSid,
+            dataPacketReceiveGeneration: dataPacketReceiveGeneration,
             continuation: continuation,
+            limits: registration.limits,
+            onStreamRejected: registration.onStreamRejected,
         )
         openStreams[info.id] = descriptor
 
@@ -212,7 +407,7 @@ actor IncomingStreamManager: Loggable {
                     await predecessor.value
                 }
                 do {
-                    try await handler(source, identity)
+                    try await registration.handler(source, identity)
                 } catch {
                     self?.log("Text stream handler for topic '\(topic)' threw: \(error)", .warning)
                 }
@@ -221,7 +416,7 @@ actor IncomingStreamManager: Loggable {
             runningHandlers[topic, default: [:]][generation] = task
         } else {
             Task.detachedDiscarding {
-                try await handler(source, identity)
+                try await registration.handler(source, identity)
             }
         }
     }
@@ -247,10 +442,18 @@ actor IncomingStreamManager: Loggable {
         openStreams[id] = nil
     }
 
-    /// Fails all open streams from the given participant, whose trailers can no
-    /// longer arrive; their readers throw and their handlers return.
-    func closeStreams(from identity: Participant.Identity) {
-        for (id, descriptor) in openStreams where descriptor.identity == identity {
+    /// Fails open streams owned by one exact participant connection. Identity
+    /// alone is not sufficient because it can be reused by a replacement.
+    func closeStreams(
+        from identity: Participant.Identity,
+        participantSid: Participant.Sid,
+        dataPacketReceiveGeneration: UInt64
+    ) {
+        for (id, descriptor) in openStreams
+            where descriptor.identity == identity
+                && descriptor.participantSid == participantSid
+                && descriptor.dataPacketReceiveGeneration == dataPacketReceiveGeneration
+        {
             openStreams[id] = nil
             streamDidClose(descriptor)
             descriptor.continuation.finish(throwing: StreamError.terminated)
@@ -259,7 +462,18 @@ actor IncomingStreamManager: Loggable {
 
     /// Fails all open streams. Handler registrations survive so streams arriving
     /// after a reconnect are still handled.
-    func reset() {
+    func reset(to nextDataPacketReceiveGeneration: UInt64? = nil) {
+        if let nextDataPacketReceiveGeneration {
+            let didAdvance = ingressState.mutate { state -> Bool in
+                guard nextDataPacketReceiveGeneration >= state.receiveGeneration else { return false }
+                state.receiveGeneration = nextDataPacketReceiveGeneration
+                state.overflowToken &+= 1
+                state.overflowGeneration = nil
+                return true
+            }
+            guard didAdvance else { return }
+            failedToOpenStreams.removeAll()
+        }
         for descriptor in openStreams.values {
             streamDidClose(descriptor)
             descriptor.continuation.finish(throwing: StreamError.terminated)
@@ -268,8 +482,22 @@ actor IncomingStreamManager: Loggable {
     }
 
     /// Handles a data stream chunk.
-    private func handle(chunk: Livekit_DataStream.Chunk, encryptionType: EncryptionType) {
-        guard !chunk.content.isEmpty, let descriptor = openStreams[chunk.streamID] else { return }
+    private func handle(
+        chunk: Livekit_DataStream.Chunk,
+        from identityString: String,
+        participantSid: Participant.Sid?,
+        dataPacketReceiveGeneration: UInt64,
+        encryptionType: EncryptionType
+    ) {
+        guard !chunk.content.isEmpty,
+              let descriptor = openStreams[chunk.streamID],
+              descriptor.dataPacketReceiveGeneration == dataPacketReceiveGeneration else { return }
+
+        guard descriptor.identity == Participant.Identity(from: identityString),
+              descriptor.participantSid == participantSid else {
+            reject(descriptor, streamID: chunk.streamID, error: .senderMismatch)
+            return
+        }
 
         // Error paths remove the descriptor synchronously for the same reason as
         // the trailer path: a header reusing this stream ID may be the next event.
@@ -284,7 +512,12 @@ actor IncomingStreamManager: Loggable {
             return
         }
 
-        let readLength = descriptor.readLength + chunk.content.count
+        let lengthAddition = descriptor.readLength.addingReportingOverflow(chunk.content.count)
+        guard !lengthAddition.overflow else {
+            reject(descriptor, streamID: chunk.streamID, error: .streamSizeExceeded(maximumBytes: Int.max))
+            return
+        }
+        let readLength = lengthAddition.partialValue
 
         if let totalLength = descriptor.info.totalLength {
             guard readLength <= totalLength else {
@@ -294,13 +527,38 @@ actor IncomingStreamManager: Loggable {
                 return
             }
         }
+        if let maxStreamBytes = descriptor.limits.maxStreamBytes,
+           readLength > maxStreamBytes
+        {
+            reject(
+                descriptor,
+                streamID: chunk.streamID,
+                error: .streamSizeExceeded(maximumBytes: maxStreamBytes)
+            )
+            return
+        }
         openStreams[chunk.streamID]!.readLength = readLength
-        descriptor.continuation.yield(chunk.content)
+        if case .dropped = descriptor.continuation.yield(chunk.content) {
+            reject(descriptor, streamID: chunk.streamID, error: .bufferOverflow)
+        }
     }
 
     /// Handles a data stream trailer.
-    private func handle(trailer: Livekit_DataStream.Trailer, encryptionType: EncryptionType) {
-        guard let descriptor = openStreams[trailer.streamID] else {
+    private func handle(
+        trailer: Livekit_DataStream.Trailer,
+        from identityString: String,
+        participantSid: Participant.Sid?,
+        dataPacketReceiveGeneration: UInt64,
+        encryptionType: EncryptionType
+    ) {
+        guard let descriptor = openStreams[trailer.streamID],
+              descriptor.dataPacketReceiveGeneration == dataPacketReceiveGeneration else {
+            return
+        }
+
+        guard descriptor.identity == Participant.Identity(from: identityString),
+              descriptor.participantSid == participantSid else {
+            reject(descriptor, streamID: trailer.streamID, error: .senderMismatch)
             return
         }
 
@@ -341,19 +599,99 @@ actor IncomingStreamManager: Loggable {
     private typealias AnyStreamHandler = @Sendable (StreamReaderSource, Participant.Identity) async throws -> Void
 
     /// Finds a registered handler suitable for handling the stream with the given info.
-    private func handler(for info: StreamInfo) -> AnyStreamHandler? {
+    private func handler(for info: StreamInfo) -> ResolvedHandler? {
         if let info = info as? ByteStreamInfo,
-           let registerdHandler = byteStreamHandlers[info.topic]
+           let registration = byteStreamHandlers[info.topic]
         {
-            return { try await registerdHandler(ByteStreamReader(info: info, source: $0), $1) }
+            return ResolvedHandler(
+                handler: { try await registration.handler(ByteStreamReader(info: info, source: $0), $1) },
+                limits: registration.limits,
+                onStreamRejected: registration.onStreamRejected
+            )
         }
         if let info = info as? TextStreamInfo,
-           let registerdHandler = textStreamHandlers[info.topic]
+           let registration = textStreamHandlers[info.topic]
         {
-            return { try await registerdHandler(TextStreamReader(info: info, source: $0), $1) }
+            return ResolvedHandler(
+                handler: { try await registration.handler(TextStreamReader(info: info, source: $0), $1) },
+                limits: registration.limits,
+                onStreamRejected: registration.onStreamRejected
+            )
         }
         return nil
     }
+
+    private func reject(_ descriptor: Descriptor, streamID: String, error: StreamError) {
+        guard openStreams[streamID]?.generation == descriptor.generation else { return }
+        openStreams[streamID] = nil
+        streamDidClose(descriptor)
+        descriptor.onStreamRejected?(IncomingStreamRejection(
+            streamID: descriptor.info.id,
+            topic: descriptor.info.topic,
+            participantIdentity: descriptor.identity,
+            publisherParticipantSid: descriptor.participantSid,
+            dataPacketReceiveGeneration: descriptor.dataPacketReceiveGeneration,
+            attributes: descriptor.info.attributes,
+            handlerWasDispatched: true,
+            error: error
+        ))
+        descriptor.continuation.finish(throwing: error)
+    }
+
+    func failForIngressOverflow(
+        receiveGeneration: UInt64,
+        overflowToken: UInt64,
+        droppedEvent: StreamEvent? = nil
+    ) {
+        guard ingressState.read({ state in
+            state.receiveGeneration == receiveGeneration &&
+                state.overflowGeneration == receiveGeneration &&
+                state.overflowToken == overflowToken
+        }) else { return }
+        if case let .header(header, identityString, participantSid, _, _) = droppedEvent {
+            rejectionHandler(for: header)?(IncomingStreamRejection(
+                streamID: header.streamID,
+                topic: header.topic,
+                participantIdentity: Participant.Identity(from: identityString),
+                publisherParticipantSid: participantSid,
+                dataPacketReceiveGeneration: receiveGeneration,
+                attributes: header.attributes,
+                handlerWasDispatched: false,
+                error: .ingressBufferOverflow
+            ))
+        }
+        let descriptors = Array(openStreams.values)
+        openStreams.removeAll()
+        for descriptor in descriptors {
+            streamDidClose(descriptor)
+            descriptor.onStreamRejected?(IncomingStreamRejection(
+                streamID: descriptor.info.id,
+                topic: descriptor.info.topic,
+                participantIdentity: descriptor.identity,
+                publisherParticipantSid: descriptor.participantSid,
+                dataPacketReceiveGeneration: descriptor.dataPacketReceiveGeneration,
+                attributes: descriptor.info.attributes,
+                handlerWasDispatched: true,
+                error: .ingressBufferOverflow
+            ))
+            descriptor.continuation.finish(throwing: StreamError.ingressBufferOverflow)
+        }
+    }
+
+    private func rejectionHandler(
+        for header: Livekit_DataStream.Header
+    ) -> IncomingStreamRejectionHandler? {
+        return switch header.contentHeader {
+        case .byteHeader:
+            byteStreamHandlers[header.topic]?.onStreamRejected
+        case .textHeader:
+            textStreamHandlers[header.topic]?.onStreamRejected
+        default:
+            nil
+        }
+    }
+
+    private static let maximumFailedTopicDiagnostics = 64
 
     // MARK: - Clean up
 
@@ -380,14 +718,21 @@ extension IncomingStreamManager {
     static func streamInfo(
         from header: Livekit_DataStream.Header,
         participantSid: Participant.Sid?,
+        dataPacketReceiveGeneration: UInt64,
         encryptionType: EncryptionType
     ) -> StreamInfo? {
-        switch header.contentHeader {
+        if header.hasTotalLength,
+           Int(exactly: header.totalLength) == nil
+        {
+            return nil
+        }
+        return switch header.contentHeader {
         case let .byteHeader(byteHeader): ByteStreamInfo(header, byteHeader, encryptionType)
         case let .textHeader(textHeader): TextStreamInfo(
             header,
             textHeader,
             participantSid,
+            dataPacketReceiveGeneration,
             encryptionType
         )
         default: nil
@@ -405,7 +750,7 @@ extension ByteStreamInfo {
             id: header.streamID,
             topic: header.topic,
             timestamp: header.timestampDate,
-            totalLength: header.hasTotalLength ? Int(header.totalLength) : nil,
+            totalLength: header.hasTotalLength ? Int(exactly: header.totalLength) : nil,
             attributes: header.attributes,
             encryptionType: encryptionType,
             // ---
@@ -420,13 +765,14 @@ extension TextStreamInfo {
         _ header: Livekit_DataStream.Header,
         _ textHeader: Livekit_DataStream.TextHeader,
         _ publisherParticipantSid: Participant.Sid?,
+        _ dataPacketReceiveGeneration: UInt64,
         _ encryptionType: EncryptionType,
     ) {
         self.init(
             id: header.streamID,
             topic: header.topic,
             timestamp: header.timestampDate,
-            totalLength: header.hasTotalLength ? Int(header.totalLength) : nil,
+            totalLength: header.hasTotalLength ? Int(exactly: header.totalLength) : nil,
             attributes: header.attributes,
             encryptionType: encryptionType,
             // ---
@@ -436,6 +782,7 @@ extension TextStreamInfo {
             attachedStreamIDs: textHeader.attachedStreamIds,
             generated: textHeader.generated,
             publisherParticipantSid: publisherParticipantSid,
+            dataPacketReceiveGeneration: dataPacketReceiveGeneration,
         )
     }
 }

@@ -30,6 +30,7 @@ public class LocalParticipant: Participant, @unchecked Sendable {
     private var allParticipantsAllowed: Bool = true
 
     private var trackPermissions: [ParticipantTrackPermission] = []
+    private let failedPublishTracks = StateSync<[ObjectIdentifier: LocalTrack]>([:])
 
     /// publish a new audio track to the Room
     @discardableResult
@@ -61,7 +62,38 @@ public class LocalParticipant: Participant, @unchecked Sendable {
                 log("Failed to unpublish track \(publication.sid) with error \(error)", .error)
             }
         }
+        do {
+            try await stopFailedPublishTracks()
+        } catch {
+            log("Failed to stop an unpublished local track during teardown: \(error)", .error)
+        }
     }
+
+    /// Stops local tracks whose publish or unpublish operation failed. Tracks
+    /// remain retained until their capturer confirms a successful stop, so
+    /// callers can block replacement-room admission on this barrier instead of
+    /// losing the only exact capture handle.
+    @nonobjc
+    public func stopFailedPublishTracks() async throws {
+        let tracks = failedPublishTracks.copy()
+        var firstError: Error?
+        for (identifier, track) in tracks {
+            do {
+                if track.trackState != .stopped {
+                    try await Task.detached { try await track.stop() }.value
+                }
+                failedPublishTracks.mutate { retained in
+                    guard retained[identifier] === track else { return }
+                    retained[identifier] = nil
+                }
+            } catch {
+                if firstError == nil { firstError = error }
+            }
+        }
+        if let firstError { throw firstError }
+    }
+
+    var failedPublishTrackCount: Int { failedPublishTracks.copy().count }
 
     /// unpublish an existing published track
     /// this will also stop the track
@@ -82,37 +114,49 @@ public class LocalParticipant: Participant, @unchecked Sendable {
             }
         }
 
-        // Remove the publication
-        _state.mutate { $0.trackPublications.removeValue(forKey: publication.sid) }
-
         // If track is nil, only notify unpublish and return
         guard let track = publication.track as? LocalTrack else {
+            _state.mutate { $0.trackPublications.removeValue(forKey: publication.sid) }
             return await _notifyDidUnpublish()
         }
 
-        if let publisher = room._state.transport?.publisher, let sender = track._state.rtpSender {
-            // Remove all simulcast senders...
-            let simulcastSenders = track._state.read { Array($0.rtpSenderForCodec.values) }
-            for simulcastSender in simulcastSenders {
-                try await publisher.remove(track: simulcastSender)
+        let trackIdentifier = ObjectIdentifier(track)
+        failedPublishTracks.mutate { $0[trackIdentifier] = track }
+        _state.mutate { $0.trackPublications.removeValue(forKey: publication.sid) }
+
+        do {
+            if let publisher = room._state.transport?.publisher, let sender = track._state.rtpSender {
+                // Remove all simulcast senders...
+                let simulcastSenders = track._state.read { Array($0.rtpSenderForCodec.values) }
+                for simulcastSender in simulcastSenders {
+                    try await publisher.remove(track: simulcastSender)
+                }
+                // Remove main sender...
+                try await publisher.remove(track: sender)
+                // Mark re-negotiation required...
+                try await room.publisherShouldNegotiate()
             }
-            // Remove main sender...
-            try await publisher.remove(track: sender)
-            // Mark re-negotiation required...
-            try await room.publisherShouldNegotiate()
+            // Clear the sender so a later publish of this same track starts clean.
+            await track.set(transport: nil, rtpSender: nil)
+
+            track._state.mutate { $0.rtpSenderForCodec.removeAll() }
+
+            // Wait for track to stop (if required)
+            if stopTrack, room._state.roomOptions.stopLocalTrackOnUnpublish {
+                try await track.stop()
+            }
+
+            try await track.onUnpublish()
+            failedPublishTracks.mutate { retained in
+                guard retained[trackIdentifier] === track else { return }
+                retained[trackIdentifier] = nil
+            }
+
+            await _notifyDidUnpublish()
+        } catch {
+            await stopTrackAfterFailedPublish(track)
+            throw error
         }
-        await track.set(transport: nil, rtpSender: nil)
-
-        track._state.mutate { $0.rtpSenderForCodec.removeAll() }
-
-        // Wait for track to stop (if required)
-        if stopTrack, room._state.roomOptions.stopLocalTrackOnUnpublish {
-            try await track.stop()
-        }
-
-        try await track.onUnpublish()
-
-        await _notifyDidUnpublish()
     }
 
     /// Publish data to the other participants in the room
@@ -611,13 +655,15 @@ extension LocalParticipant {
             throw LiveKitError(.invalidState, message: "Unknown LocalTrack type")
         }
 
-        // Try to start the Track
-        try await track.start()
-        // Starting the Track could be time consuming especially for camera etc.
-        // Check cancellation after track starts.
-        try Task.checkCancellation()
+        failedPublishTracks.mutate { $0[ObjectIdentifier(track)] = track }
 
         do {
+            // Try to start the Track
+            try await track.start()
+            // Starting the Track could be time consuming especially for camera etc.
+            // Check cancellation after track starts.
+            try Task.checkCancellation()
+
             var dimensions: Dimensions? // Only for Video
             var publishName: String?
 
@@ -791,15 +837,45 @@ extension LocalParticipant {
                 }
             }
 
-            // Store publishOptions used for this track...
-            track._state.mutate { $0.lastPublishOptions = options }
+            return try await commitPublishedTrack(
+                track,
+                trackInfo: trackInfo,
+                options: options,
+                room: room
+            )
+        } catch {
+            log("[publish] failed \(track), error: \(error)", .error)
+            // Upstream #1102: detach a sender that AddTrack already attached, so the SFU drops the
+            // track and capture does not keep streaming with no publication to mute (#1098).
+            if let sender = track._state.read({ $0.transport === publisher ? $0.rtpSender : nil }) {
+                await rollback(sender: sender, publisher: publisher, room: room)
+                await track.set(transport: nil, rtpSender: nil)
+            }
+            await stopTrackAfterFailedPublish(track)
+            throw error
+        }
+    }
 
+    func commitPublishedTrack(
+        _ track: LocalTrack,
+        trackInfo: Livekit_TrackInfo,
+        options: TrackPublishOptions?,
+        room: Room
+    ) async throws -> LocalTrackPublication {
+        var pendingPublication: LocalTrackPublication?
+        do {
+            try Task.checkCancellation()
+
+            track._state.mutate { $0.lastPublishOptions = options }
             let publication = LocalTrackPublication(info: trackInfo, participant: self)
+            pendingPublication = publication
             await publication.set(track: track)
+            try Task.checkCancellation()
 
             add(publication: publication)
+            pendingPublication = nil
+            failedPublishTracks.mutate { $0[ObjectIdentifier(track)] = nil }
 
-            // Notify didPublish
             delegates.notify(label: { "localParticipant.didPublish \(publication)" }) {
                 $0.participant?(self, didPublishTrack: publication)
             }
@@ -808,17 +884,11 @@ extension LocalParticipant {
             }
 
             log("[publish] success \(publication)", .info)
-
             return publication
         } catch {
-            log("[publish] failed \(track), error: \(error)", .error)
-            if let sender = track._state.read({ $0.transport === publisher ? $0.rtpSender : nil }) {
-                await rollback(sender: sender, publisher: publisher, room: room)
-                await track.set(transport: nil, rtpSender: nil)
+            if let pendingPublication {
+                await pendingPublication.set(track: nil)
             }
-            // Stop track when publish fails
-            try await track.stop()
-            // Rethrow
             throw error
         }
     }
@@ -832,6 +902,26 @@ extension LocalParticipant {
             try await room.publisherShouldNegotiate()
         } catch {
             log("[publish] failed to roll back sender, error: \(error)", .warning)
+        }
+    }
+
+    private func stopTrackAfterFailedPublish(_ track: LocalTrack) async {
+        let identifier = ObjectIdentifier(track)
+        guard track.trackState != .stopped else {
+            failedPublishTracks.mutate { retained in
+                guard retained[identifier] === track else { return }
+                retained[identifier] = nil
+            }
+            return
+        }
+        do {
+            try await Task.detached { try await track.stop() }.value
+            failedPublishTracks.mutate { retained in
+                guard retained[identifier] === track else { return }
+                retained[identifier] = nil
+            }
+        } catch {
+            log("[publish] failed to stop rejected track \(track), error: \(error)", .error)
         }
     }
 

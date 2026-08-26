@@ -56,4 +56,12 @@ struct RTCMediaTrack: Sendable {
     func park(_ teardown: @escaping @Sendable (LKRTCMediaStreamTrack) -> Void) {
         box.park(teardown)
     }
+
+    /// Whether `other` is a copy of this same delivered track, not merely a track with the same id.
+    ///
+    /// Copies of one `RTCMediaTrack` share its box, so this is the identity of one `didAdd`
+    /// delivery. It reads no proxy member, so it needs no RTC hop.
+    func isSameDelivery(as other: RTCMediaTrack) -> Bool {
+        box === other.box
+    }
 }

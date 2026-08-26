@@ -67,7 +67,8 @@ extension Room {
 
         if state.connectionState == .connected,
            oldState.connectionState == .reconnecting,
-           oldState.isReconnectingWithMode == .full
+           oldState.isReconnectingWithMode == .full,
+           state.roomOptions.autoRepublishLocalTracksOnFullReconnect
         {
             // Did complete a full reconnect
             log("Re-publishing local tracks...")
@@ -170,22 +171,51 @@ extension Room {
         }
     }
 
-    func engine(_: Room, didAddTrack track: RTCMediaTrack, rtpReceiver: RTCReceiver, streamId: String) async {
+    func engine(
+        _: Room,
+        didAddTrack track: RTCMediaTrack,
+        rtpReceiver: RTCReceiver,
+        streamId: String,
+        sourceTransport: Transport,
+        receiveGeneration: UInt64
+    ) async {
         let parseResult = parse(streamId: streamId)
         let trackId = parseResult.trackId ?? Track.Sid(from: track.trackId)
 
-        let participant = _state.read {
-            $0.remoteParticipants.values.first { $0.sid == parseResult.participantSid }
-        }
+        let participant = currentRemoteParticipant(
+            forSid: parseResult.participantSid,
+            sourceTransport: sourceTransport,
+            receiveGeneration: receiveGeneration
+        )
 
         guard let participant else {
             log("RemoteParticipant not found for sid: \(parseResult.participantSid), remoteParticipants: \(remoteParticipants)", .warning)
             return
         }
 
+        // No admitted publication: leave the track as `Transport` delivered it, silenced at ingress.
+        guard let publication = participant.trackPublications[trackId] as? RemoteTrackPublication,
+              let subscriptionAdmission = publication.currentSubscriptionAdmissionSnapshot()
+        else {
+            return
+        }
+
         let task = Task.retrying(retryDelay: 0.2) { _, _ in
+            guard self.isCurrentMediaSource(
+                sourceTransport,
+                participant: participant,
+                receiveGeneration: receiveGeneration
+            ) else { return }
+
             // TODO: Only retry for TrackError.state = error
-            try await participant.addSubscribedMediaTrack(mediaTrack: track, rtpReceiver: rtpReceiver, trackSid: trackId)
+            try await participant.addSubscribedMediaTrack(
+                mediaTrack: track,
+                rtpReceiver: rtpReceiver,
+                trackSid: trackId,
+                sourceTransport: sourceTransport,
+                receiveGeneration: receiveGeneration,
+                subscriptionAdmission: subscriptionAdmission
+            )
         }
 
         do {
@@ -195,12 +225,122 @@ extension Room {
         }
     }
 
-    func engine(_: Room, didRemoveTrackWithId trackId: String) async {
-        // Find the publication
+    func engine(
+        _: Room,
+        didRemoveTrackWithId trackId: String,
+        sourceTransport: Transport,
+        receiveGeneration: UInt64
+    ) async throws {
         let trackSid = Track.Sid(from: trackId)
-        guard let publication = _state.remoteParticipants.values.map(\._state.trackPublications.values).joined()
-            .first(where: { $0.sid == trackSid }) else { return }
-        await publication.set(track: nil)
+        guard let publication = currentRemotePublication(
+            forSid: trackSid,
+            sourceTransport: sourceTransport,
+            receiveGeneration: receiveGeneration
+        ) else { return }
+
+        guard isCurrentMediaSource(
+            sourceTransport,
+            publication: publication,
+            receiveGeneration: receiveGeneration
+        ) else { return }
+
+        // Only the id crosses the delegate pipeline (the raw proxy stays on the signaling
+        // thread), so the removed track is matched by its WebRTC track id. The transport and
+        // receive-generation guards above already bind it to the current subscriber.
+        guard let subscribedTrack = publication.track,
+              subscribedTrack.mediaTrack.trackId == trackId
+        else { return }
+
+        guard await publication.replaceSubscribedTrack(expected: subscribedTrack, with: nil) else {
+            return
+        }
+
+        do {
+            try await publication.retireRetainedRemoteTrack(subscribedTrack)
+        } catch {
+            publication.invalidateSubscriptionAdmissionForOwnershipLoss()
+            throw error
+        }
+    }
+
+    private func currentRemoteParticipant(
+        forSid participantSid: Participant.Sid,
+        sourceTransport: Transport,
+        receiveGeneration: UInt64
+    ) -> RemoteParticipant? {
+        guard receiveGeneration == dataPacketReceiveGeneration else { return nil }
+
+        return _state.read { state in
+            guard state.transport?.subscriber === sourceTransport,
+                  sourceTransport.dataPacketReceiveGeneration == receiveGeneration
+            else { return nil }
+            return state.remoteParticipant(forSid: participantSid)
+        }
+    }
+
+    private func currentRemotePublication(
+        forSid trackSid: Track.Sid,
+        sourceTransport: Transport,
+        receiveGeneration: UInt64
+    ) -> RemoteTrackPublication? {
+        guard receiveGeneration == dataPacketReceiveGeneration else { return nil }
+
+        return _state.read { state in
+            guard state.transport?.subscriber === sourceTransport,
+                  sourceTransport.dataPacketReceiveGeneration == receiveGeneration
+            else { return nil }
+            return state.remoteParticipants.values
+                .lazy
+                .compactMap { $0._state.trackPublications[trackSid] as? RemoteTrackPublication }
+                .first
+        }
+    }
+
+    func isCurrentMediaSource(
+        _ sourceTransport: Transport,
+        participant: RemoteParticipant,
+        publication: RemoteTrackPublication? = nil,
+        track: Track? = nil,
+        rtcTrack: RTCMediaTrack? = nil,
+        receiveGeneration: UInt64
+    ) -> Bool {
+        guard receiveGeneration == dataPacketReceiveGeneration else { return false }
+
+        return _state.read { state in
+            guard state.transport?.subscriber === sourceTransport,
+                  sourceTransport.dataPacketReceiveGeneration == receiveGeneration,
+                  let participantSid = participant.sid
+            else { return false }
+
+            guard state.remoteParticipant(forSid: participantSid) === participant else { return false }
+            guard let publication else { return true }
+            guard (participant._state.trackPublications[publication.sid] as? RemoteTrackPublication) === publication else {
+                return false
+            }
+            if let track, publication.track !== track { return false }
+            if let rtcTrack {
+                guard let mediaTrack = track?.mediaTrack, mediaTrack.isSameDelivery(as: rtcTrack) else { return false }
+            }
+            return true
+        }
+    }
+
+    private func isCurrentMediaSource(
+        _ sourceTransport: Transport,
+        publication: RemoteTrackPublication,
+        receiveGeneration: UInt64
+    ) -> Bool {
+        guard receiveGeneration == dataPacketReceiveGeneration else { return false }
+
+        return _state.read { state in
+            guard state.transport?.subscriber === sourceTransport,
+                  sourceTransport.dataPacketReceiveGeneration == receiveGeneration
+            else { return false }
+
+            return state.remoteParticipants.values.contains { participant in
+                (participant._state.trackPublications[publication.sid] as? RemoteTrackPublication) === publication
+            }
+        }
     }
 
     func engine(_ engine: Room, didReceiveUserPacket packet: Livekit_UserPacket, encryptionType: EncryptionType) {
@@ -267,7 +407,12 @@ extension Room {
         }
     }
 
-    func room(didReceiveRpcResponse response: Livekit_RpcResponse) {
+    func room(
+        didReceiveRpcResponse response: Livekit_RpcResponse,
+        from participantIdentity: String,
+        participantSid: Participant.Sid?,
+        dataPacketReceiveGeneration: UInt64
+    ) {
         let (payload, error): (String?, RpcError?) = switch response.value {
         case let .payload(v): (v, nil)
         case let .error(e): (nil, RpcError.fromProto(e))
@@ -277,20 +422,34 @@ extension Room {
         Task.discarding { [rpcClient] in
             await rpcClient.handleIncomingResponse(requestId: response.requestID,
                                                    payload: payload,
-                                                   error: error)
+                                                   error: error,
+                                                   senderIdentity: Participant.Identity(from: participantIdentity),
+                                                   senderParticipantSid: participantSid,
+                                                   dataPacketReceiveGeneration: dataPacketReceiveGeneration)
         }
     }
 
-    func room(didReceiveRpcAck ack: Livekit_RpcAck) {
+    func room(
+        didReceiveRpcAck ack: Livekit_RpcAck,
+        from participantIdentity: String,
+        participantSid: Participant.Sid?,
+        dataPacketReceiveGeneration: UInt64
+    ) {
         Task.discarding { [rpcClient] in
-            await rpcClient.handleIncomingAck(requestId: ack.requestID)
+            await rpcClient.handleIncomingAck(
+                requestId: ack.requestID,
+                senderIdentity: Participant.Identity(from: participantIdentity),
+                senderParticipantSid: participantSid,
+                dataPacketReceiveGeneration: dataPacketReceiveGeneration
+            )
         }
     }
 
     func room(
         didReceiveRpcRequest request: Livekit_RpcRequest,
         from participantIdentity: String,
-        participantSid: Participant.Sid?
+        participantSid: Participant.Sid?,
+        dataPacketReceiveGeneration: UInt64
     ) {
         let callerIdentity = Participant.Identity(from: participantIdentity)
         let requestId = request.id
@@ -302,6 +461,7 @@ extension Room {
         Task.discarding { [rpcServer] in
             await rpcServer.handleIncomingRequest(callerIdentity: callerIdentity,
                                                   callerParticipantSid: participantSid,
+                                                  callerDataPacketReceiveGeneration: dataPacketReceiveGeneration,
                                                   requestId: requestId,
                                                   method: method,
                                                   payload: payload,

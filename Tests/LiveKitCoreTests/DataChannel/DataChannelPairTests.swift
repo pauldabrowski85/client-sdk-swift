@@ -16,6 +16,7 @@
 
 import Foundation
 @testable import LiveKit
+import LiveKitWebRTC
 import Testing
 
 /// Unit-level coverage for the parts of `DataChannelPair` that don't need a
@@ -86,6 +87,20 @@ struct DataChannelPairTests {
         } throws: { ($0 as? LiveKitError)?.type == .cancelled }
     }
 
+    @Test func resetBeforeLatePreparedSendCannotTransferOperationToReplacementGeneration() async throws {
+        let pair = DataChannelPair()
+        let prepared = try pair.prepareSend(dataPacket: .with {
+            $0.kind = .reliable
+            $0.user = Livekit_UserPacket.with { $0.payload = Data("old".utf8) }
+        })
+
+        pair.reset(throwing: LiveKitError(.invalidState, message: "old generation retired"))
+
+        await #expect {
+            try await pair.send(prepared: prepared)
+        } throws: { ($0 as? LiveKitError)?.type == .invalidState }
+    }
+
     @Test func openCompleterWaitHonorsTaskCancellation() async {
         let pair = DataChannelPair()
         let waitTask = Task { try await pair.openCompleter.wait() }
@@ -124,6 +139,61 @@ struct DataChannelPairTests {
         await #expect {
             try await sendTask.value
         } throws: { ($0 as? LiveKitError)?.type == .cancelled }
+    }
+
+    @Test func staleReceiveCannotPoisonReplacementReliableDeduplicationState() async throws {
+        let room = Room()
+        let oldTransport = try Transport(
+            config: .liveKitDefault(),
+            target: .publisher,
+            primary: true,
+            delegate: room
+        )
+        let newTransport = try Transport(
+            config: .liveKitDefault(),
+            target: .publisher,
+            primary: true,
+            dataPacketReceiveGeneration: 1,
+            delegate: room
+        )
+        let oldReliable = try #require(await oldTransport.dataChannel(
+            for: LKRTCDataChannel.Labels.reliable,
+            configuration: RTC.createDataChannelConfiguration()
+        ))
+        let newReliable = try #require(await newTransport.dataChannel(
+            for: LKRTCDataChannel.Labels.reliable,
+            configuration: RTC.createDataChannelConfiguration()
+        ))
+        let pair = DataChannelPair(reliableChannel: oldReliable, receiveGeneration: 0)
+        let oldOwnership = try #require(pair.currentOwnership(for: oldReliable))
+        let packet = Livekit_DataPacket.with {
+            $0.kind = .reliable
+            $0.participantSid = "PA_same"
+            $0.sequence = 1
+        }
+
+        pair.reset(throwing: LiveKitError(.cancelled, message: "old generation retired"))
+        pair.set(reliable: newReliable, receiveGeneration: 1)
+
+        #expect(pair.admitReceivedPacket(
+            packet,
+            from: .reliable,
+            ownership: oldOwnership
+        ) == .stale)
+        #expect(pair.receiveStates().isEmpty)
+
+        let newOwnership = try #require(pair.currentOwnership(for: newReliable))
+        #expect(pair.admitReceivedPacket(
+            packet,
+            from: .reliable,
+            ownership: newOwnership
+        ) == .accepted)
+        #expect(pair.receiveStates().contains {
+            $0.publisherSid == "PA_same" && $0.lastSeq == 1
+        })
+
+        await oldTransport.close()
+        await newTransport.close()
     }
 }
 

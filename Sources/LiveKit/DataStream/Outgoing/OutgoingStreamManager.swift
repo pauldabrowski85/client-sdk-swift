@@ -21,14 +21,31 @@ import Foundation
 
 /// Manages state of outgoing data streams.
 actor OutgoingStreamManager: Loggable {
-    typealias PacketHandler = @Sendable (Livekit_DataPacket) async throws -> Void
+    enum OperationKind: Equatable, Sendable {
+        case write
+        case close
+    }
+
+    typealias PacketHandler = @Sendable (
+        Livekit_DataPacket,
+        UInt64,
+        (@Sendable () -> Bool)?
+    ) async throws -> Void
+    typealias SendGenerationProvider = @Sendable () -> UInt64
     typealias EncryptionProvider = @Sendable () -> EncryptionType
 
     private nonisolated let packetHandler: PacketHandler
+    private nonisolated let sendGenerationProvider: SendGenerationProvider
     private nonisolated let encryptionProvider: EncryptionProvider
+    private var operationObserver: (@Sendable (OperationKind) -> Void)?
 
-    init(packetHandler: @escaping PacketHandler, encryptionProvider: @escaping EncryptionProvider) {
+    init(
+        packetHandler: @escaping PacketHandler,
+        sendGenerationProvider: @escaping SendGenerationProvider,
+        encryptionProvider: @escaping EncryptionProvider
+    ) {
         self.packetHandler = packetHandler
+        self.sendGenerationProvider = sendGenerationProvider
         self.encryptionProvider = encryptionProvider
     }
 
@@ -83,6 +100,13 @@ actor OutgoingStreamManager: Loggable {
     }
 
     func streamText(options: StreamTextOptions) async throws -> TextStreamWriter {
+        try await streamText(options: options, admission: nil)
+    }
+
+    func streamText(
+        options: StreamTextOptions,
+        admission: (@Sendable () -> Bool)?
+    ) async throws -> TextStreamWriter {
         let info = TextStreamInfo(
             id: options.id ?? Self.uniqueID(),
             topic: options.topic,
@@ -99,6 +123,7 @@ actor OutgoingStreamManager: Loggable {
         return try await openTextStream(
             with: info,
             sendingTo: options.destinationIdentities,
+            admission: admission
         )
     }
 
@@ -122,11 +147,20 @@ actor OutgoingStreamManager: Loggable {
     private func openTextStream(
         with info: TextStreamInfo,
         sendingTo recipients: [Participant.Identity],
+        admission: (@Sendable () -> Bool)? = nil
     ) async throws -> TextStreamWriter {
-        try await openStream(with: info, sendingTo: recipients)
+        let descriptor = try await openStream(
+            with: info,
+            sendingTo: recipients,
+            admission: admission
+        )
         return TextStreamWriter(
             info: info,
-            destination: Destination(streamID: info.id, manager: self),
+            destination: Destination(
+                streamID: info.id,
+                descriptorGeneration: descriptor.generation,
+                manager: self
+            ),
         )
     }
 
@@ -134,27 +168,50 @@ actor OutgoingStreamManager: Loggable {
         with info: ByteStreamInfo,
         sendingTo recipients: [Participant.Identity],
     ) async throws -> ByteStreamWriter {
-        try await openStream(with: info, sendingTo: recipients)
+        let descriptor = try await openStream(with: info, sendingTo: recipients)
         return ByteStreamWriter(
             info: info,
-            destination: Destination(streamID: info.id, manager: self),
+            destination: Destination(
+                streamID: info.id,
+                descriptorGeneration: descriptor.generation,
+                manager: self
+            ),
         )
     }
 
     // MARK: - State
 
     /// Information about an open data stream.
-    private struct Descriptor {
+    private final class Descriptor: @unchecked Sendable {
         let info: StreamInfo
+        let generation = UUID()
+        let dataChannelSendGeneration: UInt64
+        let admission: (@Sendable () -> Bool)?
+        let operationLane = SerialRunnerActor<Void>()
         var writtenLength: Int = 0
         var chunkIndex: UInt64 = 0
+
+        init(
+            info: StreamInfo,
+            dataChannelSendGeneration: UInt64,
+            admission: (@Sendable () -> Bool)?
+        ) {
+            self.info = info
+            self.dataChannelSendGeneration = dataChannelSendGeneration
+            self.admission = admission
+        }
     }
 
     /// Mapping between stream ID and descriptor for open streams.
     private var openStreams: [String: Descriptor] = [:]
+    var openStreamCount: Int { openStreams.count }
 
-    private func hasOpenStream(for streamID: String) -> Bool {
-        openStreams[streamID] != nil
+    func setOperationObserver(_ observer: (@Sendable (OperationKind) -> Void)?) {
+        operationObserver = observer
+    }
+
+    private func hasOpenStream(for streamID: String, generation: UUID) -> Bool {
+        openStreams[streamID]?.generation == generation
     }
 
     // MARK: - Packet sending
@@ -162,10 +219,21 @@ actor OutgoingStreamManager: Loggable {
     private func openStream(
         with info: StreamInfo,
         sendingTo recipients: [Participant.Identity],
-    ) async throws {
+        admission: (@Sendable () -> Bool)? = nil
+    ) async throws -> Descriptor {
         guard openStreams[info.id] == nil else {
             throw StreamError.alreadyOpened
         }
+
+        // Reserve the exact descriptor before the first suspension. Reset and
+        // same-ID opens can now terminalize or reject this pending header rather
+        // than letting it install stale state after teardown.
+        let descriptor = Descriptor(
+            info: info,
+            dataChannelSendGeneration: sendGenerationProvider(),
+            admission: admission
+        )
+        openStreams[info.id] = descriptor
 
         let header = Livekit_DataStream.Header(info)
         let packet = Livekit_DataPacket.with {
@@ -173,22 +241,46 @@ actor OutgoingStreamManager: Loggable {
             $0.destinationIdentities = recipients.map(\.stringValue)
         }
 
-        try await packetHandler(packet)
+        do {
+            try await descriptor.operationLane.run { [packetHandler] in
+                try await packetHandler(
+                    packet,
+                    descriptor.dataChannelSendGeneration,
+                    descriptor.admission
+                )
+            }
+        } catch {
+            removeStream(id: info.id, descriptor: descriptor)
+            throw error
+        }
 
-        let descriptor = Descriptor(info: info)
-        openStreams[info.id] = descriptor
+        guard openStreams[info.id] === descriptor else {
+            throw StreamError.terminated
+        }
+        return descriptor
     }
 
-    private func send(_ data: some StreamData, to id: String) async throws {
-        for chunk in data.chunks(of: Self.chunkSize) {
-            try await sendChunk(chunk, to: id)
+    private func send(
+        _ data: some StreamData,
+        to id: String,
+        descriptorGeneration: UUID
+    ) async throws {
+        let descriptor = try descriptor(for: id, generation: descriptorGeneration)
+        operationObserver?(.write)
+        try await descriptor.operationLane.run { [weak self] in
+            guard let self else { throw StreamError.terminated }
+            for chunk in data.chunks(of: Self.chunkSize) {
+                try await self.sendChunk(chunk, to: id, descriptor: descriptor)
+            }
         }
     }
 
-    private func sendChunk(_ data: Data, to id: String) async throws {
-        guard let descriptor = openStreams[id] else {
-            throw StreamError.unknownStream
-        }
+    private func sendChunk(
+        _ data: Data,
+        to id: String,
+        descriptor: Descriptor
+    ) async throws {
+        guard openStreams[id] === descriptor else { throw StreamError.terminated }
         let chunk = Livekit_DataStream.Chunk.with {
             $0.streamID = id
             $0.chunkIndex = descriptor.chunkIndex
@@ -197,26 +289,75 @@ actor OutgoingStreamManager: Loggable {
         let packet = Livekit_DataPacket.with {
             $0.value = .streamChunk(chunk)
         }
-        try await packetHandler(packet)
+        do {
+            try await packetHandler(
+                packet,
+                descriptor.dataChannelSendGeneration,
+                descriptor.admission
+            )
+        } catch {
+            removeStream(id: id, descriptor: descriptor)
+            throw error
+        }
 
-        openStreams[id]!.writtenLength += data.count
-        openStreams[id]!.chunkIndex += 1
+        guard openStreams[id] === descriptor else {
+            throw StreamError.terminated
+        }
+        descriptor.writtenLength += data.count
+        descriptor.chunkIndex += 1
     }
 
-    private func closeStream(with id: String, reason: String?) async throws {
-        guard openStreams[id] != nil else {
-            throw StreamError.unknownStream
-        }
+    private func closeStream(
+        with id: String,
+        descriptorGeneration: UUID,
+        reason: String?
+    ) async throws {
+        let descriptor = try descriptor(for: id, generation: descriptorGeneration)
+        operationObserver?(.close)
+        try await descriptor.operationLane.run { [weak self] in
+            guard let self else { throw StreamError.terminated }
+            guard await self.owns(descriptor, for: id) else {
+                throw StreamError.terminated
+            }
 
-        let trailer = Livekit_DataStream.Trailer.with {
-            $0.streamID = id
-            $0.reason = reason ?? ""
-        }
-        let packet = Livekit_DataPacket.with {
-            $0.value = .streamTrailer(trailer)
-        }
+            let trailer = Livekit_DataStream.Trailer.with {
+                $0.streamID = id
+                $0.reason = reason ?? ""
+            }
+            let packet = Livekit_DataPacket.with {
+                $0.value = .streamTrailer(trailer)
+            }
 
-        try await packetHandler(packet)
+            do {
+                try await self.packetHandler(
+                    packet,
+                    descriptor.dataChannelSendGeneration,
+                    descriptor.admission
+                )
+            } catch {
+                await self.removeStream(id: id, descriptor: descriptor)
+                throw error
+            }
+            await self.removeStream(id: id, descriptor: descriptor)
+        }
+    }
+
+    func reset() {
+        openStreams.removeAll()
+    }
+
+    private func descriptor(for id: String, generation: UUID) throws -> Descriptor {
+        guard let descriptor = openStreams[id] else { throw StreamError.unknownStream }
+        guard descriptor.generation == generation else { throw StreamError.terminated }
+        return descriptor
+    }
+
+    private func owns(_ descriptor: Descriptor, for id: String) -> Bool {
+        openStreams[id] === descriptor
+    }
+
+    private func removeStream(id: String, descriptor: Descriptor) {
+        guard openStreams[id] === descriptor else { return }
         openStreams[id] = nil
     }
 
@@ -224,23 +365,35 @@ actor OutgoingStreamManager: Loggable {
 
     fileprivate struct Destination: StreamWriterDestination {
         let streamID: String
+        let descriptorGeneration: UUID
         weak var manager: OutgoingStreamManager?
 
         var isOpen: Bool {
             get async {
                 guard let manager else { return false }
-                return await manager.hasOpenStream(for: streamID)
+                return await manager.hasOpenStream(
+                    for: streamID,
+                    generation: descriptorGeneration
+                )
             }
         }
 
         func write(_ data: some StreamData) async throws {
             guard let manager else { throw StreamError.terminated }
-            try await manager.send(data, to: streamID)
+            try await manager.send(
+                data,
+                to: streamID,
+                descriptorGeneration: descriptorGeneration
+            )
         }
 
         func close(reason: String?) async throws {
             guard let manager else { throw StreamError.terminated }
-            try? await manager.closeStream(with: streamID, reason: reason)
+            try await manager.closeStream(
+                with: streamID,
+                descriptorGeneration: descriptorGeneration,
+                reason: reason
+            )
         }
     }
 

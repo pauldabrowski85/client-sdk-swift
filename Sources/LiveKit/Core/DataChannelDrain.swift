@@ -76,8 +76,12 @@ final class DataChannelDrain<Stage: SendStage>: NSObject, LKRTCDataChannelDelega
 
     private enum Event {
         /// Work to prepare and queue.
-        case submitted(Stage.Input, CheckedContinuation<Void, any Error>?)
-        case commanded(Stage.Command)
+        case submitted(
+            Stage.Input,
+            DrainSendAdmission?,
+            CheckedContinuation<Void, any Error>?
+        )
+        case commanded(Stage.Command, (@Sendable () -> Bool)?)
         case drained(UInt64)
         /// A channel was attached or swapped: the mirror starts over, and under
         /// ``SendOverflow/dropOldest`` anything queued for the previous channel is dropped.
@@ -96,7 +100,7 @@ final class DataChannelDrain<Stage: SendStage>: NSObject, LKRTCDataChannelDelega
     /// Names the channel in this drain's log lines, since one session runs three drains.
     private let label: String
     private let overflow: SendOverflow
-    private let onMessage: @Sendable (Data) -> Void
+    private let onMessage: @Sendable (Data, LKRTCDataChannel) -> Void
     private let onStateChange: @Sendable (LKRTCDataChannel) -> Void
     /// Called on a transition only, never per change in the amount buffered.
     private let onBufferStatusChange: @Sendable (Bool) -> Void
@@ -114,7 +118,7 @@ final class DataChannelDrain<Stage: SendStage>: NSObject, LKRTCDataChannelDelega
         overflow: SendOverflow,
         stage: Stage,
         maxMessageSize: UInt64 = 0,
-        onMessage: @escaping @Sendable (Data) -> Void = { _ in },
+        onMessage: @escaping @Sendable (Data, LKRTCDataChannel) -> Void = { _, _ in },
         onStateChange: @escaping @Sendable (LKRTCDataChannel) -> Void = { _ in },
         onBufferStatusChange: @escaping @Sendable (Bool) -> Void = { _ in },
     ) {
@@ -196,8 +200,12 @@ final class DataChannelDrain<Stage: SendStage>: NSObject, LKRTCDataChannelDelega
     /// rather than stranded.
     /// - Warning: Cancelling the submitting task does **not** withdraw a queued write; it stays
     ///   queued until the channel takes it or ``reset(throwing:)`` fails it.
-    func submit(_ input: Stage.Input, continuation: CheckedContinuation<Void, any Error>? = nil) {
-        eventContinuation.yield(.submitted(input, continuation))
+    func submit(
+        _ input: Stage.Input,
+        admission: DrainSendAdmission? = nil,
+        continuation: CheckedContinuation<Void, any Error>? = nil
+    ) {
+        eventContinuation.yield(.submitted(input, admission, continuation))
     }
 
     /// Submits work and suspends until its last write reaches the channel (or it is dropped,
@@ -205,15 +213,21 @@ final class DataChannelDrain<Stage: SendStage>: NSObject, LKRTCDataChannelDelega
     /// that need an await use this rather than re-deriving the wrapping — and the awaited `self`
     /// keeps the drain alive for the write's whole lifetime, which the raw entry point requires of
     /// its callers.
-    func send(_ input: Stage.Input) async throws {
+    func send(
+        _ input: Stage.Input,
+        admission: DrainSendAdmission? = nil
+    ) async throws {
         try await withCheckedThrowingContinuation { continuation in
-            submit(input, continuation: continuation)
+            submit(input, admission: admission, continuation: continuation)
         }
     }
 
     /// Submits an out-of-band request, ordered behind work already submitted.
-    func submit(command: Stage.Command) {
-        eventContinuation.yield(.commanded(command))
+    func submit(
+        command: Stage.Command,
+        admission: (@Sendable () -> Bool)? = nil
+    ) {
+        eventContinuation.yield(.commanded(command, admission))
     }
 
     /// Closes the channel and fails everything queued for it. The failure routes through the event
@@ -242,9 +256,15 @@ final class DataChannelDrain<Stage: SendStage>: NSObject, LKRTCDataChannelDelega
 
     private func process(_ event: Event, state: inout LoopState) {
         switch event {
-        case let .submitted(input, continuation):
-            enqueue(input, continuation: continuation, state: &state)
-        case let .commanded(command):
+        case let .submitted(input, admission, continuation):
+            enqueue(
+                input,
+                admission: admission,
+                continuation: continuation,
+                state: &state
+            )
+        case let .commanded(command, admission):
+            guard admission?() != false else { break }
             // Replays append synchronously, inside this event: routing them back through the
             // stream would let a concurrent reset()'s .fail land between two replays, re-queueing
             // writes stamped with pre-reset sequences into the next session.
@@ -292,9 +312,14 @@ final class DataChannelDrain<Stage: SendStage>: NSObject, LKRTCDataChannelDelega
 
     private func enqueue(
         _ input: Stage.Input,
+        admission: DrainSendAdmission?,
         continuation: CheckedContinuation<Void, any Error>?,
         state: inout LoopState,
     ) {
+        if let error = admission?.preflight() {
+            continuation?.resume(throwing: error)
+            return
+        }
         state.scratch.removeAll(keepingCapacity: true)
         do {
             try state.stage.prepare(input, into: &state.scratch)
@@ -302,6 +327,7 @@ final class DataChannelDrain<Stage: SendStage>: NSObject, LKRTCDataChannelDelega
                 from: state.scratch,
                 into: &state.writes,
                 continuation: continuation,
+                admission: admission,
                 maxMessageSize: state.maxMessageSize,
             )
         } catch {
@@ -355,20 +381,32 @@ final class DataChannelDrain<Stage: SendStage>: NSObject, LKRTCDataChannelDelega
             guard let write = state.queue.next else { return }
             state.meter.willSend(write.byteCount)
 
-            guard channel.send(write.payload) else {
-                // Never reached the transport, so they are not outstanding after all.
-                state.meter.didDrain(UInt64(write.byteCount))
+            let send: @Sendable () -> Bool = {
+                channel.send(write.payload)
+            }
+            let attempt = write.admission?.attempt(channel, send) ??
+                (send() ? DrainSendAttempt.sent : .failed)
+
+            switch attempt {
+            case .sent:
+                state.queue.advance()
+                write.settle(with: .success(()))
+                state.stage.didDispatch(write)
+            case .unavailable:
+                _ = state.meter.didDrain(UInt64(write.byteCount))
+                return
+            case let .rejected(error):
+                _ = state.meter.didDrain(UInt64(write.byteCount))
+                state.queue.advance()
+                write.settle(with: .failure(error))
+            case .failed:
+                _ = state.meter.didDrain(UInt64(write.byteCount))
                 let failure = LiveKitError(.invalidState, message: "sendData failed")
-                // Removed *before* it is settled, so no later cleanup can reach this write's
-                // continuation a second time — dropFailedWrite settles only what remains.
                 state.queue.advance()
                 write.settle(with: .failure(failure))
                 dropFailedWrite(state: &state, throwing: failure)
                 return
             }
-            state.queue.advance()
-            write.settle(with: .success(()))
-            state.stage.didDispatch(write)
         }
     }
 
@@ -428,7 +466,7 @@ final class DataChannelDrain<Stage: SendStage>: NSObject, LKRTCDataChannelDelega
 
     func dataChannel(_ dataChannel: LKRTCDataChannel, didReceiveMessageWith buffer: LKRTCDataBuffer) {
         guard isCurrent(dataChannel) else { return }
-        onMessage(buffer.data)
+        onMessage(buffer.data, dataChannel)
     }
 }
 

@@ -15,6 +15,7 @@
  */
 
 @testable import LiveKit
+import Foundation
 import Testing
 #if canImport(LiveKitTestSupport)
 import LiveKitTestSupport
@@ -53,6 +54,7 @@ struct SessionOptionsTests {
         let options = SessionOptions(encryption: .sharedKey("k"))
 
         #expect(options.preConnectAudio)
+        #expect(options.enableMicrophoneOnConnect)
         #expect(options.agentConnectTimeout == 20)
     }
 
@@ -60,10 +62,12 @@ struct SessionOptionsTests {
         let options = SessionOptions(
             encryption: .sharedKey("k"),
             preConnectAudio: false,
+            enableMicrophoneOnConnect: false,
             agentConnectTimeout: 5,
         )
 
         #expect(!options.preConnectAudio)
+        #expect(!options.enableMicrophoneOnConnect)
         #expect(options.agentConnectTimeout == 5)
     }
 
@@ -74,5 +78,29 @@ struct SessionOptionsTests {
         let options = SessionOptions(room: provided)
 
         #expect(options.room === provided)
+    }
+
+    @MainActor
+    @Test func nonBufferedSessionCanLeaveMicrophoneDisabledOnConnect() async throws {
+        let room = Room()
+        let options = SessionOptions(
+            room: room,
+            preConnectAudio: false,
+            enableMicrophoneOnConnect: false
+        )
+        let session = Session(
+            tokenSource: LiteralTokenSource(
+                serverURL: URL(string: "wss://example.invalid")!,
+                participantToken: "unused"
+            ),
+            options: options,
+            senders: [],
+            receivers: []
+        )
+
+        #expect(!options.preConnectAudio)
+        #expect(!options.enableMicrophoneOnConnect)
+        try await session.enableMicrophoneAfterConnectIfConfigured()
+        #expect(room.localParticipant.localAudioTracks.isEmpty)
     }
 }

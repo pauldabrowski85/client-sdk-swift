@@ -53,6 +53,10 @@ public final class RoomOptions: NSObject, Sendable, Loggable {
     /// resume(unmute) when the app enters foreground again.
     public let suspendLocalVideoTracksInBackground: Bool
 
+    /// Whether local tracks retained across a full reconnect or room move are
+    /// automatically republished before the application regains control.
+    public let autoRepublishLocalTracksOnFullReconnect: Bool
+
     /// E2EE Options
     public let e2eeOptions: E2EEOptions?
     /// Encryption
@@ -76,6 +80,7 @@ public final class RoomOptions: NSObject, Sendable, Loggable {
         dynacast = false
         stopLocalTrackOnUnpublish = true
         suspendLocalVideoTracksInBackground = true
+        autoRepublishLocalTracksOnFullReconnect = true
         e2eeOptions = nil
         encryptionOptions = nil
         reportRemoteTrackStatistics = false
@@ -92,6 +97,7 @@ public final class RoomOptions: NSObject, Sendable, Loggable {
                 dynacast: Bool = false,
                 stopLocalTrackOnUnpublish: Bool = true,
                 suspendLocalVideoTracksInBackground: Bool = true,
+                autoRepublishLocalTracksOnFullReconnect: Bool = true,
                 e2eeOptions: E2EEOptions? = nil,
                 encryptionOptions: EncryptionOptions? = nil,
                 reportRemoteTrackStatistics: Bool = false,
@@ -107,6 +113,7 @@ public final class RoomOptions: NSObject, Sendable, Loggable {
         self.dynacast = dynacast
         self.stopLocalTrackOnUnpublish = stopLocalTrackOnUnpublish
         self.suspendLocalVideoTracksInBackground = suspendLocalVideoTracksInBackground
+        self.autoRepublishLocalTracksOnFullReconnect = autoRepublishLocalTracksOnFullReconnect
         self.e2eeOptions = e2eeOptions
         self.encryptionOptions = encryptionOptions
         self.reportRemoteTrackStatistics = reportRemoteTrackStatistics
@@ -133,6 +140,7 @@ public final class RoomOptions: NSObject, Sendable, Loggable {
             dynacast == other.dynacast &&
             stopLocalTrackOnUnpublish == other.stopLocalTrackOnUnpublish &&
             suspendLocalVideoTracksInBackground == other.suspendLocalVideoTracksInBackground &&
+            autoRepublishLocalTracksOnFullReconnect == other.autoRepublishLocalTracksOnFullReconnect &&
             e2eeOptions == other.e2eeOptions &&
             encryptionOptions == other.encryptionOptions &&
             reportRemoteTrackStatistics == other.reportRemoteTrackStatistics &&
@@ -151,6 +159,7 @@ public final class RoomOptions: NSObject, Sendable, Loggable {
         hasher.combine(dynacast)
         hasher.combine(stopLocalTrackOnUnpublish)
         hasher.combine(suspendLocalVideoTracksInBackground)
+        hasher.combine(autoRepublishLocalTracksOnFullReconnect)
         hasher.combine(e2eeOptions)
         hasher.combine(encryptionOptions)
         hasher.combine(reportRemoteTrackStatistics)

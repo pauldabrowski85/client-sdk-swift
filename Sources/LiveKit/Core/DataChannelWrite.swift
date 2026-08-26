@@ -28,6 +28,23 @@ protocol DrainSendChannel: AnyObject, Sendable {
     func send(_ payload: Data) -> Bool
 }
 
+enum DrainSendAttempt {
+    case sent
+    case unavailable
+    case rejected(Error)
+    case failed
+}
+
+/// Rejects stale work before it can park, then runs the final send decision while the owner holds
+/// its generation/provenance lock. The attempt callback must invoke the send operation at most once.
+struct DrainSendAdmission: Sendable {
+    let preflight: @Sendable () -> Error?
+    let attempt: @Sendable (
+        _ channel: DrainSendChannel,
+        _ send: @Sendable () -> Bool
+    ) -> DrainSendAttempt
+}
+
 extension LKRTCDataChannel: DrainSendChannel {
     var isOpen: Bool { readyState == .open }
 
@@ -93,11 +110,18 @@ final class SendToken: @unchecked Sendable {
 struct ReadyWrite {
     let payload: Data
     let sequence: UInt32
+    let admission: DrainSendAdmission?
     let token: SendToken?
 
-    init(payload: Data, sequence: UInt32, token: SendToken? = nil) {
+    init(
+        payload: Data,
+        sequence: UInt32,
+        admission: DrainSendAdmission? = nil,
+        token: SendToken? = nil
+    ) {
         self.payload = payload
         self.sequence = sequence
+        self.admission = admission
         self.token = token
     }
 
@@ -116,15 +140,17 @@ struct ReadyWrite {
 struct RetainedWrite {
     let payload: Data
     let sequence: UInt32
+    let admission: DrainSendAdmission?
 
     init(_ write: ReadyWrite) {
         payload = write.payload
         sequence = write.sequence
+        admission = write.admission
     }
 
     /// Re-enters the queue with no waiter to resume.
     var replayed: ReadyWrite {
-        ReadyWrite(payload: payload, sequence: sequence)
+        ReadyWrite(payload: payload, sequence: sequence, admission: admission)
     }
 }
 
@@ -142,6 +168,7 @@ func makeWrites(
     from prepared: [PreparedBytes],
     into group: inout [ReadyWrite],
     continuation: CheckedContinuation<Void, any Error>?,
+    admission: DrainSendAdmission? = nil,
     maxMessageSize: UInt64,
 ) throws {
     group.removeAll(keepingCapacity: true)
@@ -157,6 +184,7 @@ func makeWrites(
         group.append(ReadyWrite(
             payload: bytes.bytes,
             sequence: bytes.sequence,
+            admission: admission,
             token: index == prepared.count - 1 ? continuation.map(SendToken.init) : nil,
         ))
     }

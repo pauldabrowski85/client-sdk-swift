@@ -108,9 +108,7 @@ public struct RpcError: Error {
     }
 }
 
-/// Maximum payload size for RPC v1 requests and responses. v2 (data-stream-based) payloads
-/// have no size limit. Cross-version interactions still go through v1 packets and are
-/// subject to this limit.
+/// Maximum payload size for RPC v1 requests and responses.
 let MAX_RPC_PAYLOAD_BYTES = 15360 // 15 KB
 
 // MARK: - RPC v2 stream constants
@@ -125,6 +123,15 @@ enum RpcStreamAttribute {
     static let method = "lk.rpc_request_method"
     static let timeoutMs = "lk.rpc_request_response_timeout_ms"
     static let version = "lk.rpc_request_version"
+}
+
+enum RpcStreamLimits {
+    static let maximumPayloadBytes = 1_048_576
+    static let incoming = IncomingStreamLimits(
+        maxStreamBytes: maximumPayloadBytes,
+        maxConcurrentStreams: 32,
+        maxBufferedChunks: 128
+    )
 }
 
 let RPC_STREAM_VERSION = "2"
@@ -149,6 +156,11 @@ public struct RpcInvocationData {
     /// publisher provenance.
     public let callerParticipantSid: Participant.Sid?
 
+    /// Client-local receive generation captured with the request packet before
+    /// handler dispatch. This can be `nil` for manually constructed invocation
+    /// data that predates receive-generation provenance.
+    public let callerDataPacketReceiveGeneration: UInt64?
+
     /// The data sent by the caller (as a string)
     public let payload: String
 
@@ -157,6 +169,66 @@ public struct RpcInvocationData {
 }
 
 struct PendingRpcResponse {
-    let participantIdentity: Participant.Identity
+    let participantConnection: RpcParticipantConnection
     let completer: AsyncCompleter<String>
+}
+
+struct RpcParticipantConnection: @unchecked Sendable {
+    let identity: Participant.Identity
+    let sid: Participant.Sid
+    let dataPacketReceiveGeneration: UInt64
+    let participant: RemoteParticipant
+
+    static func resolve(
+        in room: Room,
+        identity: Participant.Identity,
+        sid: Participant.Sid?,
+        dataPacketReceiveGeneration: UInt64?
+    ) -> RpcParticipantConnection? {
+        guard let sid,
+              let dataPacketReceiveGeneration,
+              dataPacketReceiveGeneration == room.dataPacketReceiveGeneration
+        else { return nil }
+        return room._state.read { state in
+            guard let participant = state.remoteParticipants[identity],
+                  participant.sid == sid,
+                  participant.dataPacketReceiveGeneration == dataPacketReceiveGeneration
+            else { return nil }
+            return RpcParticipantConnection(
+                identity: identity,
+                sid: sid,
+                dataPacketReceiveGeneration: dataPacketReceiveGeneration,
+                participant: participant
+            )
+        }
+    }
+
+    static func resolveCurrent(
+        in room: Room,
+        identity: Participant.Identity
+    ) -> RpcParticipantConnection? {
+        let receiveGeneration = room.dataPacketReceiveGeneration
+        return room._state.read { state in
+            guard let participant = state.remoteParticipants[identity],
+                  let sid = participant.sid,
+                  participant.dataPacketReceiveGeneration == receiveGeneration
+            else { return nil }
+            return RpcParticipantConnection(
+                identity: identity,
+                sid: sid,
+                dataPacketReceiveGeneration: receiveGeneration,
+                participant: participant
+            )
+        }
+    }
+
+    func isCurrent(in room: Room) -> Bool {
+        guard room.dataPacketReceiveGeneration == dataPacketReceiveGeneration else { return false }
+        return room._state.read { state in
+            guard let current = state.remoteParticipants[identity] else { return false }
+            return current === participant &&
+                current.sid == sid &&
+                current.dataPacketReceiveGeneration == dataPacketReceiveGeneration
+        }
+    }
 }

@@ -31,6 +31,7 @@ final class Transport: NSObject, Loggable {
     nonisolated let target: Livekit_SignalTarget
     nonisolated let isPrimary: Bool
     nonisolated let singlePCMode: Bool
+    nonisolated var dataPacketReceiveGeneration: UInt64 { _dataPacketReceiveGeneration.copy() }
 
     var connectionState: LKRTCPeerConnectionState {
         _pc.connectionState
@@ -55,6 +56,7 @@ final class Transport: NSObject, Loggable {
     // MARK: - Private
 
     private let _delegate = MulticastDelegate<TransportDelegate>(label: "TransportDelegate")
+    private nonisolated let _dataPacketReceiveGeneration: StateSync<UInt64>
     private let _debounce = Debounce(delay: 0.02) // 20ms
 
     private var _reNegotiate: Bool = false
@@ -89,6 +91,7 @@ final class Transport: NSObject, Loggable {
          target: Livekit_SignalTarget,
          primary: Bool,
          singlePCMode: Bool = false,
+         dataPacketReceiveGeneration: UInt64 = 0,
          delegate: TransportDelegate) throws
     {
         // try create peerConnection
@@ -100,6 +103,7 @@ final class Transport: NSObject, Loggable {
         self.target = target
         isPrimary = primary
         self.singlePCMode = singlePCMode
+        _dataPacketReceiveGeneration = StateSync(dataPacketReceiveGeneration)
         _pcBox = RTCBox(pc)
 
         super.init()
@@ -107,6 +111,13 @@ final class Transport: NSObject, Loggable {
 
         _pc.delegate = self
         _delegate.add(delegate: delegate)
+    }
+
+    nonisolated func advanceDataPacketReceiveGeneration(to generation: UInt64) {
+        _dataPacketReceiveGeneration.mutate { current in
+            guard generation >= current else { return }
+            current = generation
+        }
     }
 
     func negotiate(force: Bool = false) async throws {
@@ -405,6 +416,11 @@ extension Transport: LKRTCPeerConnectionDelegate {
         }
 
         log("type: \(type(of: track)), track.id: \(track.trackId), streams: \(streams.map { "Stream(hash: \($0.hash), id: \($0.streamId), videoTracks: \($0.videoTracks.count), audioTracks: \($0.audioTracks.count))" })")
+        // WebRTC delivers remote media enabled. Silence it here, at the ingress boundary on the
+        // signaling thread (the proxy's own thread, so this does not block), before the delegate
+        // queue or any Task hop can delay subscription admission. Only the exact admitted
+        // publication re-enables it, inside `activateSubscribedTrack`.
+        track.isEnabled = false
         let receiver = RTCReceiver(rtpReceiver)
         let mediaTrack = RTCMediaTrack(track)
         // Only the ids travel on: the streams' blocking proxy destructors run here, on the
