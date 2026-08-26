@@ -494,6 +494,73 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
         await manager.reset()
     }
 
+    @Test func perConnectionStreamAdmissionPreservesCapacityForAnotherCaller() async throws {
+        let releaseHandlers = TestGate()
+        let rejections = StateSync<[IncomingStreamRejection]>([])
+        try await manager.registerTextStreamHandler(
+            for: RpcStreamTopic.request,
+            limits: RpcStreamLimits.incomingRequest,
+            onStreamRejected: { rejection in rejections.mutate { $0.append(rejection) } }
+        ) { _, _ in
+            await releaseHandlers.wait()
+        }
+
+        let callerA = Participant.Identity(from: "caller-a")
+        let callerASid = Participant.Sid(from: "PA_caller_a")
+        let callerB = Participant.Identity(from: "caller-b")
+        let callerBSid = Participant.Sid(from: "PA_caller_b")
+        let receiveGeneration: UInt64 = 7
+        await manager.reset(to: receiveGeneration)
+
+        for index in 0 ..< RpcInvocationLimits.maximumInFlightPerConnection {
+            sendTextHeader(
+                streamID: "caller-a-\(index)",
+                topic: RpcStreamTopic.request,
+                participant: callerA,
+                publisherParticipantSid: callerASid,
+                dataPacketReceiveGeneration: receiveGeneration
+            )
+        }
+        await waitForOpenStreams(RpcInvocationLimits.maximumInFlightPerConnection)
+
+        sendTextHeader(
+            streamID: "caller-a-over-cap",
+            topic: RpcStreamTopic.request,
+            participant: callerA,
+            publisherParticipantSid: callerASid,
+            dataPacketReceiveGeneration: receiveGeneration,
+            attributes: [RpcStreamAttribute.requestId: "request-over-cap"]
+        )
+        let rejectionDeadline = Date().addingTimeInterval(10)
+        while rejections.copy().isEmpty, Date() < rejectionDeadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        sendTextHeader(
+            streamID: "caller-b-admitted",
+            topic: RpcStreamTopic.request,
+            participant: callerB,
+            publisherParticipantSid: callerBSid,
+            dataPacketReceiveGeneration: receiveGeneration
+        )
+        await waitForOpenStreams(RpcInvocationLimits.maximumInFlightPerConnection + 1)
+
+        let rejection = try #require(rejections.copy().first)
+        #expect(rejection.participantIdentity == callerA)
+        #expect(rejection.publisherParticipantSid == callerASid)
+        #expect(rejection.dataPacketReceiveGeneration == receiveGeneration)
+        #expect(rejection.attributes[RpcStreamAttribute.requestId] == "request-over-cap")
+        #expect(!rejection.handlerWasDispatched)
+        #expect(
+            rejection.error == .tooManyOpenStreams(
+                maximum: RpcInvocationLimits.maximumInFlightPerConnection
+            )
+        )
+        #expect(await manager.openStreamCount == RpcInvocationLimits.maximumInFlightPerConnection + 1)
+        await releaseHandlers.open()
+        await manager.reset()
+    }
+
     @Test func packetEventFloodTripsBoundedIngress() async throws {
         let manager = IncomingStreamManager(eventBufferCapacity: 1)
         let rejected = StateSync<StreamError?>(nil)
@@ -842,6 +909,29 @@ extension IncomingStreamManagerTests {
         let header = Livekit_DataStream.Header.with {
             $0.streamID = streamID
             $0.topic = topicName
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
+        manager.handle(.header(
+            header,
+            participant.stringValue,
+            publisherParticipantSid,
+            dataPacketReceiveGeneration,
+            .none
+        ))
+    }
+
+    private func sendTextHeader(
+        streamID: String,
+        topic: String,
+        participant: Participant.Identity,
+        publisherParticipantSid: Participant.Sid?,
+        dataPacketReceiveGeneration: UInt64,
+        attributes: [String: String] = [:]
+    ) {
+        let header = Livekit_DataStream.Header.with {
+            $0.streamID = streamID
+            $0.topic = topic
+            $0.attributes = attributes
             $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
         }
         manager.handle(.header(

@@ -32,10 +32,10 @@ public extension LocalParticipant {
     ///   - destinationIdentity: The identity of the destination participant
     ///   - method: The method name to call
     ///   - payload: The payload to pass to the method
-    ///   - responseTimeout: Timeout for receiving a response after the initial connection (in seconds).
-    ///     If a value less than `maxRoundTripLatency + 1` is provided, it will be automatically
-    ///     clamped to that floor to ensure sufficient time for round-trip latency buffering.
-    ///     Default: 15s.
+    ///   - responseTimeout: Caller-side deadline for receiving a response after the initial
+    ///     connection, in seconds. The caller stops waiting after this duration. The timeout
+    ///     advertised to the receiver is separately floored to `maxRoundTripLatency + 1` so
+    ///     network latency does not leave the remote handler with a negative budget. Default: 15s.
     ///   - maxRoundTripLatency: Upper bound on round-trip latency to the destination, in seconds.
     ///     If no ack arrives within this window the call is rejected with
     ///     `RpcError.BuiltInError.connectionTimeout`. Increase this on high-latency links where

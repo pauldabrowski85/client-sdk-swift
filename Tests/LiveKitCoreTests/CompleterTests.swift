@@ -23,6 +23,57 @@ import LiveKitTestSupport
 
 @Suite(.tags(.concurrency))
 struct CompleterTests {
+    @Test func resumeBetweenFastPathAndRegistrationIsNotLost() async throws {
+        let completer = AsyncCompleter<Void>(label: "registration-race", defaultTimeout: 0.05)
+        completer.setBeforeWaitRegistrationForTests { [weak completer] in
+            completer?.resume(returning: ())
+        }
+
+        try await completer.wait()
+
+        #expect(completer.waiterCount == 0)
+        completer.setBeforeWaitRegistrationForTests(nil)
+    }
+
+    @Test func cancellationBeforeRegistrationDoesNotLeaveOrphanedWaiter() async {
+        let completer = AsyncCompleter<Void>(label: "cancellation-registration-race", defaultTimeout: 1)
+        let registrationGapEntered = StateSync(false)
+        let releaseRegistrationGap = DispatchSemaphore(value: 0)
+        completer.setBeforeWaitRegistrationForTests {
+            registrationGapEntered.mutate { $0 = true }
+            releaseRegistrationGap.wait()
+        }
+        let task = Task { try await completer.wait() }
+        let deadline = Date().addingTimeInterval(1)
+        while !registrationGapEntered.copy(), Date() < deadline {
+            try? await Task.sleep(nanoseconds: 1_000_000)
+        }
+        #expect(registrationGapEntered.copy())
+
+        task.cancel()
+        releaseRegistrationGap.signal()
+
+        await #expect {
+            try await task.value
+        } throws: { ($0 as? LiveKitError)?.type == .cancelled }
+        #expect(completer.waiterCount == 0)
+        completer.setBeforeWaitRegistrationForTests(nil)
+    }
+
+    @Test func resetBetweenFastPathAndRegistrationIsNotLost() async {
+        let completer = AsyncCompleter<Void>(label: "reset-registration-race", defaultTimeout: 0.05)
+        completer.setBeforeWaitRegistrationForTests { [weak completer] in
+            completer?.reset(throwing: LiveKitError(.network, message: "transport reset"))
+        }
+
+        await #expect {
+            try await completer.wait()
+        } throws: { ($0 as? LiveKitError)?.type == .network }
+
+        #expect(completer.waiterCount == 0)
+        completer.setBeforeWaitRegistrationForTests(nil)
+    }
+
     @Test func completerReuse() async throws {
         let completer = AsyncCompleter<Void>(label: "Test01", defaultTimeout: 1)
         do {

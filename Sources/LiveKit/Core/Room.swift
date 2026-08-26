@@ -823,7 +823,7 @@ extension Room {
         await rpcServer.attach(to: self)
         await incomingStreamManager.registerTextStreamHandlerIfNeeded(
             for: RpcStreamTopic.request,
-            limits: RpcStreamLimits.incoming,
+            limits: RpcStreamLimits.incomingRequest,
             onStreamRejected: { [weak rpcServer] rejection in
                 guard !rejection.handlerWasDispatched else { return }
                 Task { await rpcServer?.handleIncomingRequestStreamRejection(rejection) }
@@ -833,7 +833,7 @@ extension Room {
         }
         await incomingStreamManager.registerTextStreamHandlerIfNeeded(
             for: RpcStreamTopic.response,
-            limits: RpcStreamLimits.incoming,
+            limits: RpcStreamLimits.incomingResponse,
             onStreamRejected: { [weak rpcClient] rejection in
                 guard !rejection.handlerWasDispatched else { return }
                 Task { await rpcClient?.handleIncomingResponseStreamRejection(rejection) }
@@ -1006,7 +1006,8 @@ extension Room: DataChannelDelegate {
         _: DataChannelPair,
         didReceiveDataPacket dataPacket: Livekit_DataPacket,
         encryptionType: EncryptionType,
-        receiveGeneration: UInt64
+        receiveGeneration: UInt64,
+        receivedAtContinuousTimeNanoseconds: UInt64
     ) {
         guard receiveGeneration == dataPacketReceiveGeneration else {
             log("Ignoring data packet from stale receive generation \(receiveGeneration)", .warning)
@@ -1015,7 +1016,17 @@ extension Room: DataChannelDelegate {
 
         switch dataPacket.value {
         case let .speaker(update): engine(self, didUpdateSpeakers: update.speakers)
-        case let .user(userPacket): engine(self, didReceiveUserPacket: userPacket, encryptionType: encryptionType)
+        case let .user(userPacket):
+            engine(
+                self,
+                didReceiveUserPacket: userPacket,
+                from: dataPacket.participantIdentity,
+                participantSid: dataPacket.participantSid.isEmpty
+                    ? nil
+                    : Participant.Sid(from: dataPacket.participantSid),
+                dataPacketReceiveGeneration: receiveGeneration,
+                encryptionType: encryptionType
+            )
         case let .transcription(packet): room(didReceiveTranscriptionPacket: packet)
         case let .rpcResponse(response):
             room(
@@ -1042,7 +1053,8 @@ extension Room: DataChannelDelegate {
                 participantSid: dataPacket.participantSid.isEmpty
                     ? nil
                     : Participant.Sid(from: dataPacket.participantSid),
-                dataPacketReceiveGeneration: receiveGeneration
+                dataPacketReceiveGeneration: receiveGeneration,
+                receivedAtContinuousTimeNanoseconds: receivedAtContinuousTimeNanoseconds
             )
         case let .streamHeader(header):
             incomingStreamManager.handle(.header(
@@ -1050,7 +1062,8 @@ extension Room: DataChannelDelegate {
                 dataPacket.participantIdentity,
                 dataPacket.participantSid.isEmpty ? nil : Participant.Sid(from: dataPacket.participantSid),
                 receiveGeneration,
-                encryptionType
+                encryptionType,
+                receivedAtContinuousTimeNanoseconds
             ))
         case let .streamChunk(chunk):
             incomingStreamManager.handle(.chunk(

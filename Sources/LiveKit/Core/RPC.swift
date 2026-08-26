@@ -22,7 +22,7 @@ import Foundation
 /// serialized and sent across the wire. The sender will receive an equivalent error on the other side.
 ///
 /// Built-in types are included but developers may use any message string, with a max length of 256 bytes.
-public struct RpcError: Error {
+public struct RpcError: Error, Sendable {
     /// The error code of the RPC call. Error codes 1001-1999 are reserved for built-in errors.
     ///
     /// See `RpcError.BuiltInError` for built-in error information.
@@ -88,6 +88,12 @@ public struct RpcError: Error {
         RpcError(code: key.code, message: key.message, data: data)
     }
 
+    static let receiverOverloaded = RpcError(
+        code: BuiltInError.applicationError.code,
+        message: "RPC receiver overloaded",
+        data: "resource_exhausted"
+    )
+
     static let MAX_MESSAGE_BYTES = 256
     static let MAX_DATA_BYTES = 15360 // 15 KB
 
@@ -125,13 +131,30 @@ enum RpcStreamAttribute {
     static let version = "lk.rpc_request_version"
 }
 
+enum RpcInvocationLimits {
+    static let maximumInFlight = 32
+    static let maximumInFlightPerConnection = 8
+}
+
 enum RpcStreamLimits {
     static let maximumPayloadBytes = 1_048_576
-    static let incoming = IncomingStreamLimits(
+    static let incomingRequest = IncomingStreamLimits(
         maxStreamBytes: maximumPayloadBytes,
-        maxConcurrentStreams: 32,
+        maxConcurrentStreams: RpcInvocationLimits.maximumInFlight,
+        maxConcurrentStreamsPerParticipantConnection: RpcInvocationLimits.maximumInFlightPerConnection,
         maxBufferedChunks: 128
     )
+    static let incomingResponse = IncomingStreamLimits(
+        maxStreamBytes: maximumPayloadBytes,
+        maxConcurrentStreams: RpcInvocationLimits.maximumInFlight,
+        maxBufferedChunks: 128
+    )
+}
+
+enum RpcContinuousClock {
+    static func nowNanoseconds() -> UInt64 {
+        clock_gettime_nsec_np(CLOCK_MONOTONIC_RAW)
+    }
 }
 
 let RPC_STREAM_VERSION = "2"
@@ -144,7 +167,7 @@ let RPC_STREAM_VERSION = "2"
 /// - SeeAlso: `LocalParticipant.registerRpcMethod`
 public typealias RpcHandler = @Sendable (RpcInvocationData) async throws -> String
 
-public struct RpcInvocationData {
+public struct RpcInvocationData: Sendable {
     /// A unique identifier for this RPC request
     public let requestId: String
 
@@ -166,6 +189,12 @@ public struct RpcInvocationData {
 
     /// The maximum time available to return a response
     public let responseTimeout: TimeInterval
+
+    /// Absolute deadline on the receiver's continuous monotonic clock, in
+    /// nanoseconds. This clock advances while the system is asleep.
+    /// SDK-delivered invocations always provide this value. It can be `nil`
+    /// only for invocation values manually constructed by older integrations.
+    public let responseDeadlineContinuousTimeNanoseconds: UInt64?
 }
 
 struct PendingRpcResponse {

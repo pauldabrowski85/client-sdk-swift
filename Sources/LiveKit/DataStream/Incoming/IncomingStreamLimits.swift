@@ -22,18 +22,25 @@ public struct IncomingStreamLimits: Equatable, Sendable {
 
     public let maxStreamBytes: Int?
     public let maxConcurrentStreams: Int
+    public let maxConcurrentStreamsPerParticipantConnection: Int?
     public let maxBufferedChunks: Int
 
     public init(
         maxStreamBytes: Int? = nil,
         maxConcurrentStreams: Int = 64,
+        maxConcurrentStreamsPerParticipantConnection: Int? = nil,
         maxBufferedChunks: Int = 256
     ) {
         precondition(maxStreamBytes == nil || maxStreamBytes! > 0)
         precondition(maxConcurrentStreams > 0)
+        precondition(
+            maxConcurrentStreamsPerParticipantConnection == nil ||
+                maxConcurrentStreamsPerParticipantConnection! > 0
+        )
         precondition(maxBufferedChunks > 0)
         self.maxStreamBytes = maxStreamBytes
         self.maxConcurrentStreams = maxConcurrentStreams
+        self.maxConcurrentStreamsPerParticipantConnection = maxConcurrentStreamsPerParticipantConnection
         self.maxBufferedChunks = maxBufferedChunks
     }
 }

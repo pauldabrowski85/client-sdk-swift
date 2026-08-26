@@ -70,6 +70,135 @@ struct RpcClientTests {
         }
     }
 
+    @Test func performRpcPreservesTimeoutsAboveTwoMinutes() async throws {
+        let room = Room()
+        await room.rpcClient.attach(to: room)
+        let destination = Participant.Identity(from: "long-timeout-destination")
+        try await RpcTestSupport.installRemote(in: room, identity: destination, clientProtocol: .v0)
+        let observed = StateSync<Livekit_RpcRequest?>(nil)
+        room.publisherDataChannel = MockDataChannelPair { packet in
+            guard case let .rpcRequest(request) = packet.value else { return }
+            observed.mutate { $0 = request }
+        }
+        await room.rpcClient.setAfterPublish { requestId in
+            await RpcTestSupport.deliverAck(in: room, requestId: requestId, from: destination)
+            await RpcTestSupport.deliverResponse(
+                in: room,
+                requestId: requestId,
+                payload: "long-timeout-response",
+                error: nil,
+                from: destination
+            )
+        }
+
+        let response = try await room.localParticipant.performRpc(
+            destinationIdentity: destination,
+            method: "long-running-method",
+            payload: "",
+            responseTimeout: 180
+        )
+
+        #expect(response == "long-timeout-response")
+        #expect(observed.copy()?.responseTimeoutMs == 180_000)
+    }
+
+    @Test func performRpcValidatesTimeoutsBeforeWireConversion() async throws {
+        let room = Room()
+        await room.rpcClient.attach(to: room)
+        let destination = Participant.Identity(from: "timeout-validation-destination")
+        try await RpcTestSupport.installRemote(in: room, identity: destination, clientProtocol: .v0)
+        let published = StateSync(0)
+        room.publisherDataChannel = MockDataChannelPair { _ in published.mutate { $0 += 1 } }
+
+        let invalidCalls: [(TimeInterval, TimeInterval)] = [
+            (.nan, 7),
+            (.infinity, 7),
+            (-1, 7),
+            (15, -.infinity),
+            (15, -0.001),
+            (TimeInterval(UInt32.max) / 1000 + 1, 7),
+        ]
+        for (responseTimeout, maxRoundTripLatency) in invalidCalls {
+            await #expect(throws: LiveKitError.self) {
+                try await room.localParticipant.performRpc(
+                    destinationIdentity: destination,
+                    method: "invalid-timeout",
+                    payload: "",
+                    responseTimeout: responseTimeout,
+                    maxRoundTripLatency: maxRoundTripLatency
+                )
+            }
+        }
+
+        #expect(published.copy() == 0)
+        #expect(await room.rpcClient.pendingCount == 0)
+    }
+
+    @Test func performRpcClampsTimeoutToRoundTripFloor() async throws {
+        let room = Room()
+        await room.rpcClient.attach(to: room)
+        let destination = Participant.Identity(from: "clamped-timeout-destination")
+        try await RpcTestSupport.installRemote(in: room, identity: destination, clientProtocol: .v0)
+        let observed = StateSync<Livekit_RpcRequest?>(nil)
+        room.publisherDataChannel = MockDataChannelPair { packet in
+            guard case let .rpcRequest(request) = packet.value else { return }
+            observed.mutate { $0 = request }
+        }
+        await room.rpcClient.setAfterPublish { requestId in
+            await RpcTestSupport.deliverAck(in: room, requestId: requestId, from: destination)
+            await RpcTestSupport.deliverResponse(
+                in: room,
+                requestId: requestId,
+                payload: "clamped",
+                error: nil,
+                from: destination
+            )
+        }
+
+        let response = try await room.localParticipant.performRpc(
+            destinationIdentity: destination,
+            method: "clamped-timeout",
+            payload: "",
+            responseTimeout: 0.5,
+            maxRoundTripLatency: 0
+        )
+
+        #expect(response == "clamped")
+        #expect(observed.copy()?.responseTimeoutMs == 1_000)
+    }
+
+    @Test(arguments: [ClientProtocol.v0, ClientProtocol.v1])
+    func performRpcKeepsCallerDeadlineWhenWireTimeoutIsClamped(clientProtocol: ClientProtocol) async throws {
+        let room = Room()
+        await room.rpcClient.attach(to: room)
+        let destination = Participant.Identity(from: "local-deadline-destination")
+        try await RpcTestSupport.installRemote(
+            in: room,
+            identity: destination,
+            clientProtocol: clientProtocol
+        )
+        room.publisherDataChannel = MockDataChannelPair { _ in }
+        let start = Date()
+
+        do {
+            _ = try await room.localParticipant.performRpc(
+                destinationIdentity: destination,
+                method: "local-deadline",
+                payload: "",
+                responseTimeout: 0.05,
+                maxRoundTripLatency: 7
+            )
+            Issue.record("Expected response timeout")
+        } catch let error as RpcError {
+            #expect(error.code == RpcError.BuiltInError.responseTimeout.code)
+        }
+
+        let elapsed = Date().timeIntervalSince(start)
+        #expect(elapsed >= 0.03)
+        #expect(elapsed < 1)
+        #expect(await room.rpcClient.pendingCount == 0)
+    }
+
     /// Regression test: a fast remote that responds immediately after publish must not
     /// race the caller's pending-state registration. With pre-publish registration in
     /// `RpcClientManager.performRpc`, the response arriving synchronously after
@@ -562,6 +691,40 @@ struct RpcServerTests {
         }
     }
 
+    @Test func handlerAcceptsTimeoutsAboveTwoMinutes() async throws {
+        let room = Room()
+        await room.rpcServer.attach(to: room)
+        let caller = Participant.Identity(from: "long-timeout-caller")
+        let participant = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: caller,
+            clientProtocol: .v0
+        )
+        let sid = try #require(participant.sid)
+        let observedTimeout = StateSync<TimeInterval?>(nil)
+        room.publisherDataChannel = MockDataChannelPair { _ in }
+        try await room.registerRpcMethod("long-running-method") { invocation in
+            observedTimeout.mutate { $0 = invocation.responseTimeout }
+            return "accepted"
+        }
+
+        await room.rpcServer.handleIncomingRequest(
+            callerIdentity: caller,
+            callerParticipantSid: sid,
+            callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
+            requestId: "long-timeout-request",
+            method: "long-running-method",
+            payload: "",
+            responseTimeout: 180,
+            receivedAtContinuousTimeNanoseconds: RpcContinuousClock.nowNanoseconds(),
+            version: 1
+        )
+
+        let remaining = try #require(observedTimeout.copy())
+        #expect(remaining > 179)
+        #expect(remaining <= 180)
+    }
+
     /// A packet admitted for participant A must not reach the application after
     /// participant B with the same identity has become canonical.
     @Test func v1InvocationRejectsPublisherSidAcrossIdentityReplacement() async throws {
@@ -603,7 +766,8 @@ struct RpcServerTests {
             MockDataChannelPair { _ in },
             didReceiveDataPacket: packet,
             encryptionType: .none,
-            receiveGeneration: room.dataPacketReceiveGeneration
+            receiveGeneration: room.dataPacketReceiveGeneration,
+            receivedAtContinuousTimeNanoseconds: RpcContinuousClock.nowNanoseconds()
         )
         try? await Task.sleep(nanoseconds: 10_000_000)
         #expect(!invoked.copy())
@@ -1405,10 +1569,703 @@ struct RpcStreamResourceLimitTests {
         }
     }
 
+    @Test func inboundV1OversizeRequestNeverReachesApplicationHandler() async throws {
+        let room = Room()
+        await room.rpcServer.attach(to: room)
+        let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v0)
+        let sid = try #require(participant.sid)
+        let invoked = StateSync(false)
+        let responseError = StateSync<Livekit_RpcError?>(nil)
+        room.publisherDataChannel = MockDataChannelPair { packet in
+            guard case let .rpcResponse(response) = packet.value,
+                  case let .error(error) = response.value
+            else { return }
+            responseError.mutate { $0 = error }
+        }
+        try await room.registerRpcMethod("bounded") { _ in
+            invoked.mutate { $0 = true }
+            return "unreachable"
+        }
+
+        await room.rpcServer.handleIncomingRequest(
+            callerIdentity: caller,
+            callerParticipantSid: sid,
+            callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
+            requestId: "oversize-v1",
+            method: "bounded",
+            payload: String(repeating: "a", count: MAX_RPC_PAYLOAD_BYTES + 1),
+            responseTimeout: 1,
+            receivedAtContinuousTimeNanoseconds: RpcContinuousClock.nowNanoseconds(),
+            version: 1
+        )
+
+        #expect(!invoked.copy())
+        #expect(responseError.copy()?.code == UInt32(RpcError.BuiltInError.requestPayloadTooLarge.code))
+    }
+
+    @Test func v1SchedulingDelayCannotRefreshExpiredDeadline() async throws {
+        let room = Room()
+        await room.rpcServer.attach(to: room)
+        let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v0)
+        let sid = try #require(participant.sid)
+        let invoked = StateSync(false)
+        let responseError = StateSync<Livekit_RpcError?>(nil)
+        room.publisherDataChannel = MockDataChannelPair { packet in
+            guard case let .rpcResponse(response) = packet.value,
+                  case let .error(error) = response.value
+            else { return }
+            responseError.mutate { $0 = error }
+        }
+        try await room.registerRpcMethod("bounded") { _ in
+            invoked.mutate { $0 = true }
+            return "unreachable"
+        }
+
+        await room.rpcServer.handleIncomingRequest(
+            callerIdentity: caller,
+            callerParticipantSid: sid,
+            callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
+            requestId: "expired-v1",
+            method: "bounded",
+            payload: "",
+            responseTimeout: 0.05,
+            receivedAtContinuousTimeNanoseconds: RpcContinuousClock.nowNanoseconds() - 1_000_000_000,
+            version: 1
+        )
+
+        #expect(!invoked.copy())
+        #expect(responseError.copy()?.code == UInt32(RpcError.BuiltInError.responseTimeout.code))
+    }
+
+    @Test func v2HeaderWithoutTrailerTimesOutAndReleasesResources() async throws {
+        let room = Room()
+        let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v1)
+        let sid = try #require(participant.sid)
+        let invoked = StateSync(false)
+        let responseError = StateSync<Livekit_RpcError?>(nil)
+        room.publisherDataChannel = MockDataChannelPair { packet in
+            guard case let .rpcResponse(response) = packet.value,
+                  case let .error(error) = response.value
+            else { return }
+            responseError.mutate { $0 = error }
+        }
+        await room.setupRpc()
+        try await room.registerRpcMethod("bounded") { _ in
+            invoked.mutate { $0 = true }
+            return "unreachable"
+        }
+
+        room.incomingStreamManager.handle(.header(
+            requestHeader(
+                id: "unterminated-request",
+                requestId: "unterminated-v2",
+                declaredLength: nil,
+                timeoutMs: "50"
+            ),
+            caller.stringValue,
+            sid,
+            room.dataPacketReceiveGeneration,
+            .none
+        ))
+        await waitForRpcError(responseError)
+        await waitForResourcesToDrain(in: room)
+
+        #expect(!invoked.copy())
+        #expect(responseError.copy()?.code == UInt32(RpcError.BuiltInError.responseTimeout.code))
+        let openStreamCount = await room.incomingStreamManager.openStreamCount
+        let activeInvocationCount = await room.rpcServer.activeInvocationCount
+        #expect(openStreamCount == 0)
+        #expect(activeInvocationCount == 0)
+    }
+
+    @Test func malformedV2HeaderThroughStreamManagerDrainsDescriptor() async throws {
+        let room = Room()
+        let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v1)
+        let sid = try #require(participant.sid)
+        let responseError = StateSync<Livekit_RpcError?>(nil)
+        room.publisherDataChannel = MockDataChannelPair { packet in
+            guard case let .rpcResponse(response) = packet.value,
+                  case let .error(error) = response.value
+            else { return }
+            responseError.mutate { $0 = error }
+        }
+        await room.setupRpc()
+        let streamID = "malformed-production-stream"
+        let header = Livekit_DataStream.Header.with {
+            $0.streamID = streamID
+            $0.topic = RpcStreamTopic.request
+            $0.totalLength = 0
+            $0.attributes = [
+                RpcStreamAttribute.requestId: "malformed-production-stream",
+                RpcStreamAttribute.timeoutMs: "1000",
+                RpcStreamAttribute.version: RPC_STREAM_VERSION,
+            ]
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
+        room.incomingStreamManager.handle(.header(
+            header,
+            caller.stringValue,
+            sid,
+            room.dataPacketReceiveGeneration,
+            .none
+        ))
+        room.incomingStreamManager.handle(.trailer(
+            Livekit_DataStream.Trailer.with { $0.streamID = streamID },
+            caller.stringValue,
+            sid,
+            room.dataPacketReceiveGeneration,
+            .none
+        ))
+        await waitForRpcError(responseError)
+        await waitForResourcesToDrain(in: room)
+
+        #expect(responseError.copy()?.code == UInt32(RpcError.BuiltInError.applicationError.code))
+        #expect(responseError.copy()?.message == "RPC data stream malformed")
+        #expect(await room.incomingStreamManager.openStreamCount == 0)
+        #expect(await room.rpcServer.activeInvocationCount == 0)
+    }
+
+    @Test func v2DeadlineExpiringAfterReadNeverDispatchesHandler() async throws {
+        let room = Room()
+        let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v1)
+        let sid = try #require(participant.sid)
+        let invoked = StateSync(false)
+        let responseError = StateSync<Livekit_RpcError?>(nil)
+        room.publisherDataChannel = MockDataChannelPair { packet in
+            guard case let .rpcResponse(response) = packet.value,
+                  case let .error(error) = response.value
+            else { return }
+            responseError.mutate { $0 = error }
+        }
+        await room.setupRpc()
+        await room.rpcServer.setAfterRequestStreamRead {
+            try? await Task.sleep(nanoseconds: 100_000_000)
+        }
+        try await room.registerRpcMethod("bounded") { _ in
+            invoked.mutate { $0 = true }
+            return "unreachable"
+        }
+
+        let streamID = "post-read-expiry"
+        room.incomingStreamManager.handle(.header(
+            requestHeader(
+                id: streamID,
+                requestId: "post-read-expiry-v2",
+                declaredLength: 0,
+                timeoutMs: "50"
+            ),
+            caller.stringValue,
+            sid,
+            room.dataPacketReceiveGeneration,
+            .none
+        ))
+        room.incomingStreamManager.handle(.trailer(
+            Livekit_DataStream.Trailer.with { $0.streamID = streamID },
+            caller.stringValue,
+            sid,
+            room.dataPacketReceiveGeneration,
+            .none
+        ))
+        await waitForRpcError(responseError)
+
+        #expect(!invoked.copy())
+        #expect(responseError.copy()?.code == UInt32(RpcError.BuiltInError.responseTimeout.code))
+    }
+
+    @Test func v2SuspensionJumpExpiresBeforeHandlerDispatch() async throws {
+        let room = Room()
+        let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v1)
+        let sid = try #require(participant.sid)
+        let continuousTime = StateSync<UInt64>(1_000_000_000)
+        let invoked = StateSync(false)
+        let responseError = StateSync<Livekit_RpcError?>(nil)
+        room.publisherDataChannel = MockDataChannelPair { packet in
+            guard case let .rpcResponse(response) = packet.value,
+                  case let .error(error) = response.value
+            else { return }
+            responseError.mutate { $0 = error }
+        }
+        await room.setupRpc()
+        await room.rpcServer.setInvocationClock(
+            nowNanoseconds: { continuousTime.copy() },
+            sleepUntil: { _ in try await Task.sleep(nanoseconds: 60_000_000_000) }
+        )
+        await room.rpcServer.setAfterRequestStreamRead {
+            continuousTime.mutate { $0 += 3_600_000_000_000 }
+        }
+        try await room.registerRpcMethod("bounded") { _ in
+            invoked.mutate { $0 = true }
+            return "unreachable"
+        }
+
+        let streamID = "suspension-expiry"
+        room.incomingStreamManager.handle(.header(
+            requestHeader(
+                id: streamID,
+                requestId: "suspension-expiry-v2",
+                declaredLength: 0,
+                timeoutMs: "60000"
+            ),
+            caller.stringValue,
+            sid,
+            room.dataPacketReceiveGeneration,
+            .none,
+            continuousTime.copy()
+        ))
+        room.incomingStreamManager.handle(.trailer(
+            Livekit_DataStream.Trailer.with { $0.streamID = streamID },
+            caller.stringValue,
+            sid,
+            room.dataPacketReceiveGeneration,
+            .none
+        ))
+        await waitForRpcError(responseError)
+
+        #expect(!invoked.copy())
+        #expect(responseError.copy()?.code == UInt32(RpcError.BuiltInError.responseTimeout.code))
+    }
+
+    @Test func continuousClockJumpTimesOutBlockedHandlerPromptly() async throws {
+        let room = Room()
+        await room.rpcServer.attach(to: room)
+        let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v0)
+        let sid = try #require(participant.sid)
+        let continuousTime = StateSync<UInt64>(1_000_000_000)
+        let sleepEntered = AsyncCompleter<Void>(label: "deadline-sleep-entered", defaultTimeout: 10)
+        let wakeDeadline = AsyncCompleter<Void>(label: "wake-deadline", defaultTimeout: 10)
+        let handlerEntered = AsyncCompleter<Void>(label: "blocked-handler-entered", defaultTimeout: 10)
+        let handlerRelease = AsyncCompleter<Void>(label: "release-blocked-handler", defaultTimeout: 10)
+        let responseError = StateSync<Livekit_RpcError?>(nil)
+        room.publisherDataChannel = MockDataChannelPair { packet in
+            guard case let .rpcResponse(response) = packet.value,
+                  case let .error(error) = response.value
+            else { return }
+            responseError.mutate { $0 = error }
+        }
+        await room.rpcServer.setInvocationClock(
+            nowNanoseconds: { continuousTime.copy() },
+            sleepUntil: { deadline in
+                sleepEntered.resume(returning: ())
+                while continuousTime.copy() < deadline {
+                    _ = try await wakeDeadline.wait()
+                }
+            }
+        )
+        try await room.registerRpcMethod("bounded") { _ in
+            handlerEntered.resume(returning: ())
+            _ = try await handlerRelease.wait()
+            return "released"
+        }
+
+        let requestTask = Task {
+            await room.rpcServer.handleIncomingRequest(
+                callerIdentity: caller,
+                callerParticipantSid: sid,
+                callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
+                requestId: "sleep-blocked-handler",
+                method: "bounded",
+                payload: "",
+                responseTimeout: 60,
+                receivedAtContinuousTimeNanoseconds: continuousTime.copy(),
+                version: 1
+            )
+        }
+        _ = try await sleepEntered.wait()
+        _ = try await handlerEntered.wait()
+        continuousTime.mutate { $0 += 3_600_000_000_000 }
+        wakeDeadline.resume(returning: ())
+        await requestTask.value
+
+        #expect(responseError.copy()?.code == UInt32(RpcError.BuiltInError.responseTimeout.code))
+        handlerRelease.resume(returning: ())
+        await waitForResourcesToDrain(in: room)
+        #expect(await room.rpcServer.activeInvocationCount == 0)
+    }
+
+    @Test func timedOutPreflightDoesNotRetainRoomOrOriginalParticipant() async throws {
+        var room: Room? = Room()
+        let weakRoom = RpcTestWeakReference(room)
+        let rpcServer = try #require(room?.rpcServer)
+        await rpcServer.attach(to: try #require(room))
+        let caller = Participant.Identity(from: "retention-caller")
+        var originalParticipant: RemoteParticipant? = try await RpcTestSupport.installRemote(
+            in: try #require(room),
+            identity: caller,
+            clientProtocol: .v0,
+            sid: Participant.Sid(from: "PA_retention")
+        )
+        let weakOriginalParticipant = RpcTestWeakReference(originalParticipant)
+        let callerSid = try #require(originalParticipant?.sid)
+        let receiveGeneration = try #require(room?.dataPacketReceiveGeneration)
+        let preflightEntered = RpcNonCooperativeGate()
+        let releasePreflight = RpcNonCooperativeGate()
+        let invoked = StateSync(false)
+        await rpcServer.setBeforeHandlerPreflight {
+            await preflightEntered.open()
+            await releasePreflight.wait()
+        }
+        do {
+            let registrationRoom = try #require(room)
+            registrationRoom.publisherDataChannel = MockDataChannelPair { _ in }
+            try await registrationRoom.registerRpcMethod("retention") { _ in
+                invoked.mutate { $0 = true }
+                return "unreachable"
+            }
+        }
+
+        let request = Task {
+            await rpcServer.handleIncomingRequest(
+                callerIdentity: caller,
+                callerParticipantSid: callerSid,
+                callerDataPacketReceiveGeneration: receiveGeneration,
+                requestId: "retention-request",
+                method: "retention",
+                payload: "",
+                responseTimeout: 0.05,
+                receivedAtContinuousTimeNanoseconds: RpcContinuousClock.nowNanoseconds(),
+                version: 1
+            )
+        }
+        await preflightEntered.wait()
+        await request.value
+
+        let replacementInfo = Livekit_ParticipantInfo.with {
+            $0.identity = caller.stringValue
+            $0.sid = callerSid.stringValue
+        }
+        let replacement: RemoteParticipant
+        do {
+            let replacementRoom = try #require(room)
+            replacement = RemoteParticipant(
+                info: replacementInfo,
+                room: replacementRoom,
+                connectionState: .connected
+            )
+            replacementRoom._state.mutate { $0.remoteParticipants[caller] = replacement }
+        }
+        originalParticipant = nil
+        let participantReleaseDeadline = Date().addingTimeInterval(1)
+        while weakOriginalParticipant.value != nil, Date() < participantReleaseDeadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(weakOriginalParticipant.value == nil)
+
+        room = nil
+        let roomReleaseDeadline = Date().addingTimeInterval(1)
+        while weakRoom.value != nil, Date() < roomReleaseDeadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(weakRoom.value == nil)
+
+        await releasePreflight.open()
+        let drainDeadline = Date().addingTimeInterval(1)
+        while await rpcServer.activeInvocationCount != 0, Date() < drainDeadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(await rpcServer.activeInvocationCount == 0)
+        #expect(!invoked.copy())
+        await rpcServer.setBeforeHandlerPreflight(nil)
+    }
+
+    @Test func continuousClockJumpCancelsBlockedStreamReadPromptly() async throws {
+        let room = Room()
+        let participant = try await RpcTestSupport.installRemote(in: room, identity: caller, clientProtocol: .v1)
+        let sid = try #require(participant.sid)
+        let continuousTime = StateSync<UInt64>(1_000_000_000)
+        let sleepEntered = AsyncCompleter<Void>(label: "stream-deadline-sleep-entered", defaultTimeout: 10)
+        let wakeDeadline = AsyncCompleter<Void>(label: "wake-stream-deadline", defaultTimeout: 10)
+        let invoked = StateSync(false)
+        let responseError = StateSync<Livekit_RpcError?>(nil)
+        room.publisherDataChannel = MockDataChannelPair { packet in
+            guard case let .rpcResponse(response) = packet.value,
+                  case let .error(error) = response.value
+            else { return }
+            responseError.mutate { $0 = error }
+        }
+        await room.setupRpc()
+        await room.rpcServer.setInvocationClock(
+            nowNanoseconds: { continuousTime.copy() },
+            sleepUntil: { deadline in
+                sleepEntered.resume(returning: ())
+                while continuousTime.copy() < deadline {
+                    _ = try await wakeDeadline.wait()
+                }
+            }
+        )
+        try await room.registerRpcMethod("bounded") { _ in
+            invoked.mutate { $0 = true }
+            return "unreachable"
+        }
+
+        room.incomingStreamManager.handle(.header(
+            requestHeader(
+                id: "sleep-blocked-stream",
+                requestId: "sleep-blocked-stream",
+                declaredLength: nil,
+                timeoutMs: "60000"
+            ),
+            caller.stringValue,
+            sid,
+            room.dataPacketReceiveGeneration,
+            .none,
+            continuousTime.copy()
+        ))
+        _ = try await sleepEntered.wait()
+        continuousTime.mutate { $0 += 3_600_000_000_000 }
+        wakeDeadline.resume(returning: ())
+        await waitForRpcError(responseError)
+        await waitForResourcesToDrain(in: room)
+
+        #expect(!invoked.copy())
+        #expect(responseError.copy()?.code == UInt32(RpcError.BuiltInError.responseTimeout.code))
+        let openStreamCount = await room.incomingStreamManager.openStreamCount
+        let activeInvocationCount = await room.rpcServer.activeInvocationCount
+        #expect(openStreamCount == 0)
+        #expect(activeInvocationCount == 0)
+    }
+
+    @Test func perConnectionAdmissionPreservesCapacityForAnotherCaller() async throws {
+        let room = Room()
+        await room.rpcServer.attach(to: room)
+        let firstParticipant = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: caller,
+            clientProtocol: .v1
+        )
+        let secondCaller = Participant.Identity(from: "second-bounded-caller")
+        let secondParticipant = try await RpcTestSupport.installRemote(
+            in: room,
+            identity: secondCaller,
+            clientProtocol: .v0
+        )
+        let firstSid = try #require(firstParticipant.sid)
+        let secondSid = try #require(secondParticipant.sid)
+        let enteredByCaller = StateSync<[Participant.Identity: Int]>([:])
+        let overloadErrors = StateSync<[Livekit_RpcError]>([])
+        let release = StateSync(false)
+        room.publisherDataChannel = MockDataChannelPair { packet in
+            guard case let .rpcResponse(response) = packet.value,
+                  case let .error(error) = response.value,
+                  error.code == UInt32(RpcError.BuiltInError.applicationError.code)
+            else { return }
+            overloadErrors.mutate { $0.append(error) }
+        }
+        try await room.registerRpcMethod("blocked") { invocation in
+            enteredByCaller.mutate { $0[invocation.callerIdentity, default: 0] += 1 }
+            while !release.copy() { await Task.yield() }
+            return "released"
+        }
+
+        await withTaskGroup(of: Void.self) { group in
+            for index in 0 ..< RpcInvocationLimits.maximumInFlightPerConnection {
+                group.addTask {
+                    if index.isMultiple(of: 2) {
+                        await room.rpcServer.handleIncomingRequest(
+                            callerIdentity: caller,
+                            callerParticipantSid: firstSid,
+                            callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
+                            requestId: "flood-v1-\(index)",
+                            method: "blocked",
+                            payload: "",
+                            responseTimeout: 0.05,
+                            receivedAtContinuousTimeNanoseconds: RpcContinuousClock.nowNanoseconds(),
+                            version: 1
+                        )
+                    } else {
+                        await room.rpcServer.handleIncomingRequestStream(
+                            reader: RpcTestSupport.makeRequestReader(
+                                requestId: "flood-v2-\(index)",
+                                method: "blocked",
+                                payload: "",
+                                timeoutMs: 50,
+                                publisherParticipantSid: firstSid,
+                                dataPacketReceiveGeneration: room.dataPacketReceiveGeneration
+                            ),
+                            callerIdentity: caller
+                        )
+                    }
+                }
+            }
+
+            await waitUntil {
+                enteredByCaller.copy()[caller] == RpcInvocationLimits.maximumInFlightPerConnection
+            }
+            #expect(enteredByCaller.copy()[caller] == RpcInvocationLimits.maximumInFlightPerConnection)
+            let activeInvocationCount = await room.rpcServer.activeInvocationCount
+            #expect(activeInvocationCount == RpcInvocationLimits.maximumInFlightPerConnection)
+
+            group.addTask {
+                await room.rpcServer.handleIncomingRequest(
+                    callerIdentity: caller,
+                    callerParticipantSid: firstSid,
+                    callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
+                    requestId: "overflow-v1",
+                    method: "blocked",
+                    payload: "",
+                    responseTimeout: 0.05,
+                    receivedAtContinuousTimeNanoseconds: RpcContinuousClock.nowNanoseconds(),
+                    version: 1
+                )
+            }
+            group.addTask {
+                await room.rpcServer.handleIncomingRequestStream(
+                    reader: RpcTestSupport.makeRequestReader(
+                        requestId: "overflow-v2",
+                        method: "blocked",
+                        payload: "",
+                        timeoutMs: 50,
+                        publisherParticipantSid: firstSid,
+                        dataPacketReceiveGeneration: room.dataPacketReceiveGeneration
+                    ),
+                    callerIdentity: caller
+                )
+            }
+            await waitUntil { overloadErrors.copy().count == 2 }
+
+            let replacementInfo = Livekit_ParticipantInfo.with {
+                $0.identity = caller.stringValue
+                $0.sid = firstSid.stringValue
+                $0.clientProtocol = Int32(ClientProtocol.v0.rawValue)
+            }
+            let replacement = RemoteParticipant(
+                info: replacementInfo,
+                room: room,
+                connectionState: .connected
+            )
+            room._state.mutate { $0.remoteParticipants[caller] = replacement }
+            let replacementSid = replacement.sid
+            group.addTask {
+                await room.rpcServer.handleIncomingRequest(
+                    callerIdentity: caller,
+                    callerParticipantSid: replacementSid,
+                    callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
+                    requestId: "replacement-overflow-v1",
+                    method: "blocked",
+                    payload: "",
+                    responseTimeout: 0.05,
+                    receivedAtContinuousTimeNanoseconds: RpcContinuousClock.nowNanoseconds(),
+                    version: 1
+                )
+            }
+            await waitUntil { overloadErrors.copy().count == 3 }
+            #expect(overloadErrors.copy().count == 3)
+            for error in overloadErrors.copy() {
+                #expect(error.message == "RPC receiver overloaded")
+                #expect(error.data == "resource_exhausted")
+            }
+
+            group.addTask {
+                await room.rpcServer.handleIncomingRequest(
+                    callerIdentity: secondCaller,
+                    callerParticipantSid: secondSid,
+                    callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
+                    requestId: "second-caller-v1",
+                    method: "blocked",
+                    payload: "",
+                    responseTimeout: 0.05,
+                    receivedAtContinuousTimeNanoseconds: RpcContinuousClock.nowNanoseconds(),
+                    version: 1
+                )
+            }
+            await waitUntil { enteredByCaller.copy()[secondCaller] == 1 }
+            #expect(enteredByCaller.copy()[secondCaller] == 1)
+            let fairActiveInvocationCount = await room.rpcServer.activeInvocationCount
+            #expect(fairActiveInvocationCount == RpcInvocationLimits.maximumInFlightPerConnection + 1)
+
+            release.mutate { $0 = true }
+            await group.waitForAll()
+        }
+        await waitForResourcesToDrain(in: room)
+
+        let activeInvocationCount = await room.rpcServer.activeInvocationCount
+        #expect(activeInvocationCount == 0)
+    }
+
+    @Test func roomWideAdmissionCapsNonCooperativeHandlersAcrossCallers() async throws {
+        let room = Room()
+        await room.rpcServer.attach(to: room)
+        let identities = (0 ..< 5).map { Participant.Identity(from: "global-bounded-caller-\($0)") }
+        var sids: [Participant.Identity: Participant.Sid] = [:]
+        for identity in identities {
+            let participant = try await RpcTestSupport.installRemote(
+                in: room,
+                identity: identity,
+                clientProtocol: .v0
+            )
+            sids[identity] = participant.sid
+        }
+        let entered = StateSync(0)
+        let overloadErrors = StateSync<[Livekit_RpcError]>([])
+        let release = StateSync(false)
+        room.publisherDataChannel = MockDataChannelPair { packet in
+            guard case let .rpcResponse(response) = packet.value,
+                  case let .error(error) = response.value,
+                  error.code == UInt32(RpcError.BuiltInError.applicationError.code)
+            else { return }
+            overloadErrors.mutate { $0.append(error) }
+        }
+        try await room.registerRpcMethod("blocked-global") { _ in
+            entered.mutate { $0 += 1 }
+            while !release.copy() { await Task.yield() }
+            return "released"
+        }
+
+        await withTaskGroup(of: Void.self) { group in
+            for callerIndex in 0 ..< 4 {
+                let identity = identities[callerIndex]
+                let sid = sids[identity]!
+                for requestIndex in 0 ..< RpcInvocationLimits.maximumInFlightPerConnection {
+                    group.addTask {
+                        await room.rpcServer.handleIncomingRequest(
+                            callerIdentity: identity,
+                            callerParticipantSid: sid,
+                            callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
+                            requestId: "global-\(callerIndex)-\(requestIndex)",
+                            method: "blocked-global",
+                            payload: "",
+                            responseTimeout: 0.05,
+                            receivedAtContinuousTimeNanoseconds: RpcContinuousClock.nowNanoseconds(),
+                            version: 1
+                        )
+                    }
+                }
+            }
+            await waitUntil { entered.copy() == RpcInvocationLimits.maximumInFlight }
+            #expect(entered.copy() == RpcInvocationLimits.maximumInFlight)
+            #expect(await room.rpcServer.activeInvocationCount == RpcInvocationLimits.maximumInFlight)
+
+            let overflowIdentity = identities[4]
+            let overflowSid = sids[overflowIdentity]!
+            group.addTask {
+                await room.rpcServer.handleIncomingRequest(
+                    callerIdentity: overflowIdentity,
+                    callerParticipantSid: overflowSid,
+                    callerDataPacketReceiveGeneration: room.dataPacketReceiveGeneration,
+                    requestId: "global-overflow",
+                    method: "blocked-global",
+                    payload: "",
+                    responseTimeout: 0.05,
+                    receivedAtContinuousTimeNanoseconds: RpcContinuousClock.nowNanoseconds(),
+                    version: 1
+                )
+            }
+            await waitUntil { overloadErrors.copy().count == 1 }
+            #expect(overloadErrors.copy().count == 1)
+            #expect(overloadErrors.copy().first?.message == "RPC receiver overloaded")
+            #expect(overloadErrors.copy().first?.data == "resource_exhausted")
+
+            release.mutate { $0 = true }
+            await group.waitForAll()
+        }
+        await waitForResourcesToDrain(in: room)
+        #expect(await room.rpcServer.activeInvocationCount == 0)
+    }
+
     private func requestHeader(
         id: String,
         requestId: String,
-        declaredLength: UInt64?
+        declaredLength: UInt64?,
+        timeoutMs: String = "1000"
     ) -> Livekit_DataStream.Header {
         Livekit_DataStream.Header.with {
             $0.streamID = id
@@ -1417,7 +2274,7 @@ struct RpcStreamResourceLimitTests {
             $0.attributes = [
                 RpcStreamAttribute.requestId: requestId,
                 RpcStreamAttribute.method: "bounded",
-                RpcStreamAttribute.timeoutMs: "1000",
+                RpcStreamAttribute.timeoutMs: timeoutMs,
                 RpcStreamAttribute.version: RPC_STREAM_VERSION,
             ]
             $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
@@ -1450,6 +2307,46 @@ struct RpcStreamResourceLimitTests {
         while error.copy() == nil, Date() < deadline {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
+    }
+
+    private func waitForResourcesToDrain(in room: Room) async {
+        await waitUntil {
+            let openStreamCount = await room.incomingStreamManager.openStreamCount
+            let activeInvocationCount = await room.rpcServer.activeInvocationCount
+            return openStreamCount == 0 && activeInvocationCount == 0
+        }
+    }
+
+    private func waitUntil(_ condition: @Sendable () async -> Bool) async {
+        let deadline = Date().addingTimeInterval(10)
+        while !(await condition()), Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+}
+
+private actor RpcNonCooperativeGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        let continuations = waiters
+        waiters = []
+        for continuation in continuations { continuation.resume() }
+    }
+}
+
+private final class RpcTestWeakReference<Value: AnyObject>: @unchecked Sendable {
+    weak var value: Value?
+
+    init(_ value: Value?) {
+        self.value = value
     }
 }
 
