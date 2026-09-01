@@ -910,6 +910,83 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
         #expect(payload.copy() == "hello")
     }
 
+    @Test func agentFragmentsMayContinueAUserAttributedStream() async throws {
+        // The live LiveKit Cloud transcription shape: the agent opens a stream
+        // attributed to the transcribed user's identity, and later fragments
+        // of the same stream carry the agent's own identity. The SID — the
+        // actual participant connection — is the same on every packet, and it
+        // alone decides.
+        let connectionSid = Participant.Sid(from: "PA_connection")
+        let rejected = StateSync<StreamError?>(nil)
+        let payload = StateSync<String?>(nil)
+        try await manager.registerTextStreamHandler(
+            for: topicName,
+            onStreamRejected: { rejection in rejected.mutate { $0 = rejection.error } }
+        ) { reader, _ in
+            let text = try await reader.readAll()
+            payload.mutate { $0 = text }
+        }
+
+        let header = Livekit_DataStream.Header.with {
+            $0.streamID = "user-attributed"
+            $0.topic = topicName
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
+        manager.handle(.header(header, "transcribed-user", connectionSid, 0, .none))
+        await waitForOpenStreams(1)
+
+        let chunk = Livekit_DataStream.Chunk.with {
+            $0.streamID = header.streamID
+            $0.content = Data("hello".utf8)
+        }
+        manager.handle(.chunk(chunk, "agent-worker", connectionSid, 0, .none))
+        let trailer = Livekit_DataStream.Trailer.with {
+            $0.streamID = header.streamID
+        }
+        manager.handle(.trailer(trailer, "agent-worker", connectionSid, 0, .none))
+
+        let deadline = Date().addingTimeInterval(10)
+        while payload.copy() == nil, rejected.copy() == nil, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(rejected.copy() == nil)
+        #expect(payload.copy() == "hello")
+    }
+
+    @Test func sameIdentityCannotContinueAStreamFromADifferentConnection() async throws {
+        // When both packets carry a SID, the SID decides even if the identity
+        // labels agree: a different connection is a different sender.
+        let rejected = StateSync<StreamError?>(nil)
+        let readerError = StateSync<StreamError?>(nil)
+        try await manager.registerTextStreamHandler(
+            for: topicName,
+            onStreamRejected: { rejection in rejected.mutate { $0 = rejection.error } }
+        ) { reader, _ in
+            do {
+                _ = try await reader.readAll()
+            } catch let error as StreamError {
+                readerError.mutate { $0 = error }
+            }
+        }
+
+        await sendTextHeader(
+            streamID: "sid-decides",
+            publisherParticipantSid: Participant.Sid(from: "PA_original")
+        )
+        await waitForOpenStreams(1)
+        await sendTextChunk(
+            streamID: "sid-decides",
+            content: "forged",
+            publisherParticipantSid: Participant.Sid(from: "PA_other")
+        )
+
+        await waitForRejection(rejected)
+        await waitForRejection(readerError)
+        #expect(rejected.copy()?.isSenderMismatch == true)
+        #expect(readerError.copy()?.isSenderMismatch == true)
+        #expect(await manager.openStreamCount == 0)
+    }
+
     // MARK: - Helpers
 
     private func sendByteStream(chunks: [Data]) async {

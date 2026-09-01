@@ -596,13 +596,6 @@ actor IncomingStreamManager: Loggable {
         openStreams.removeAll()
     }
 
-    /// The SFU fills `participant_sid` on forwarded packets lazily: packets
-    /// relayed in a sender's first moments can carry an empty SID while later
-    /// packets carry the real one, and a stream can stay open across that
-    /// window (a word-timed transcription segment, for example). An absent SID
-    /// on either side is "not yet known", never a spoof: the identity is
-    /// server-authored and always checked, and once a SID is recorded a later
-    /// different SID still rejects.
     private static func senderDescription(
         _ identity: String,
         _ sid: Participant.Sid?,
@@ -611,12 +604,27 @@ actor IncomingStreamManager: Loggable {
         "\(identity)/\(sid?.stringValue ?? "nil")@\(generation)"
     }
 
-    private static func senderSidMatches(
-        _ recorded: Participant.Sid?,
-        _ incoming: Participant.Sid?
+    /// Whether a later fragment comes from the participant connection that
+    /// opened the stream.
+    ///
+    /// The SID is the connection: when both packets carry one, it alone
+    /// decides. Identities legitimately differ across one stream's packets —
+    /// an agent publishes a transcription stream attributed to the transcribed
+    /// participant's identity while other fragments of the same stream carry
+    /// the agent's own identity (observed live on LiveKit Cloud, 2026-09-01).
+    /// An absent SID on either side is "not yet known" — the SFU fills
+    /// `participant_sid` lazily — and the identity is then the best remaining
+    /// signal; once a SID is recorded a later different SID still rejects.
+    private static func senderMatches(
+        recordedIdentity: Participant.Identity,
+        recordedSid: Participant.Sid?,
+        identity: Participant.Identity,
+        participantSid: Participant.Sid?
     ) -> Bool {
-        guard let recorded, let incoming else { return true }
-        return recorded == incoming
+        if let recordedSid, let participantSid {
+            return recordedSid == participantSid
+        }
+        return recordedIdentity == identity
     }
 
     /// Handles a data stream chunk.
@@ -631,8 +639,12 @@ actor IncomingStreamManager: Loggable {
               let descriptor = openStreams[chunk.streamID],
               descriptor.dataPacketReceiveGeneration == dataPacketReceiveGeneration else { return }
 
-        guard descriptor.identity == Participant.Identity(from: identityString),
-              Self.senderSidMatches(descriptor.participantSid, participantSid) else {
+        guard Self.senderMatches(
+            recordedIdentity: descriptor.identity,
+            recordedSid: descriptor.participantSid,
+            identity: Participant.Identity(from: identityString),
+            participantSid: participantSid
+        ) else {
             reject(descriptor, streamID: chunk.streamID, error: .senderMismatch(
                 expected: Self.senderDescription(
                     descriptor.identity.stringValue,
@@ -704,8 +716,12 @@ actor IncomingStreamManager: Loggable {
             return
         }
 
-        guard descriptor.identity == Participant.Identity(from: identityString),
-              Self.senderSidMatches(descriptor.participantSid, participantSid) else {
+        guard Self.senderMatches(
+            recordedIdentity: descriptor.identity,
+            recordedSid: descriptor.participantSid,
+            identity: Participant.Identity(from: identityString),
+            participantSid: participantSid
+        ) else {
             reject(descriptor, streamID: trailer.streamID, error: .senderMismatch(
                 expected: Self.senderDescription(
                     descriptor.identity.stringValue,
