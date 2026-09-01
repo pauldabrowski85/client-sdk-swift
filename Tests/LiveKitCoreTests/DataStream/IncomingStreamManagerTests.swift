@@ -423,8 +423,8 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
 
         await waitForRejection(rejected)
         await waitForRejection(readerError)
-        #expect(rejected.copy() == .senderMismatch)
-        #expect(readerError.copy() == .senderMismatch)
+        #expect(rejected.copy()?.isSenderMismatch == true)
+        #expect(readerError.copy()?.isSenderMismatch == true)
         #expect(await manager.openStreamCount == 0)
     }
 
@@ -464,8 +464,8 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
 
         await waitForRejection(rejected)
         await waitForRejection(readerError)
-        #expect(rejected.copy() == .senderMismatch)
-        #expect(readerError.copy() == .senderMismatch)
+        #expect(rejected.copy()?.isSenderMismatch == true)
+        #expect(readerError.copy()?.isSenderMismatch == true)
         #expect(await manager.openStreamCount == 0)
     }
 
@@ -876,8 +876,8 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
 
         await waitForRejection(rejected)
         await waitForRejection(readerError)
-        #expect(rejected.copy() == .senderMismatch)
-        #expect(readerError.copy() == .senderMismatch)
+        #expect(rejected.copy()?.isSenderMismatch == true)
+        #expect(readerError.copy()?.isSenderMismatch == true)
         #expect(await manager.openStreamCount == 0)
     }
 

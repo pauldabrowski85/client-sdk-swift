@@ -63,6 +63,16 @@ public enum StreamError: Error, Equatable, Sendable {
     /// Encryption type mismatch between stream header and chunk/trailer.
     case encryptionTypeMismatch(expected: EncryptionType, received: EncryptionType)
 
-    /// A stream fragment was published by a different participant connection than its header.
-    case senderMismatch
+    /// A stream fragment was published by a different participant connection
+    /// than its header. The payload names the header's sender and the
+    /// offending fragment's, as `identity/sid@receiveGeneration`.
+    case senderMismatch(expected: String, received: String)
+}
+
+public extension StreamError {
+    /// Whether this error is a sender mismatch, regardless of the recorded senders.
+    var isSenderMismatch: Bool {
+        if case .senderMismatch = self { return true }
+        return false
+    }
 }

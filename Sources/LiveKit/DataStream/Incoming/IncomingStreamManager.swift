@@ -603,6 +603,14 @@ actor IncomingStreamManager: Loggable {
     /// on either side is "not yet known", never a spoof: the identity is
     /// server-authored and always checked, and once a SID is recorded a later
     /// different SID still rejects.
+    private static func senderDescription(
+        _ identity: String,
+        _ sid: Participant.Sid?,
+        _ generation: UInt64
+    ) -> String {
+        "\(identity)/\(sid?.stringValue ?? "nil")@\(generation)"
+    }
+
     private static func senderSidMatches(
         _ recorded: Participant.Sid?,
         _ incoming: Participant.Sid?
@@ -625,7 +633,14 @@ actor IncomingStreamManager: Loggable {
 
         guard descriptor.identity == Participant.Identity(from: identityString),
               Self.senderSidMatches(descriptor.participantSid, participantSid) else {
-            reject(descriptor, streamID: chunk.streamID, error: .senderMismatch)
+            reject(descriptor, streamID: chunk.streamID, error: .senderMismatch(
+                expected: Self.senderDescription(
+                    descriptor.identity.stringValue,
+                    descriptor.participantSid,
+                    descriptor.dataPacketReceiveGeneration
+                ),
+                received: Self.senderDescription(identityString, participantSid, dataPacketReceiveGeneration)
+            ))
             return
         }
         if descriptor.participantSid == nil, let participantSid {
@@ -691,7 +706,14 @@ actor IncomingStreamManager: Loggable {
 
         guard descriptor.identity == Participant.Identity(from: identityString),
               Self.senderSidMatches(descriptor.participantSid, participantSid) else {
-            reject(descriptor, streamID: trailer.streamID, error: .senderMismatch)
+            reject(descriptor, streamID: trailer.streamID, error: .senderMismatch(
+                expected: Self.senderDescription(
+                    descriptor.identity.stringValue,
+                    descriptor.participantSid,
+                    descriptor.dataPacketReceiveGeneration
+                ),
+                received: Self.senderDescription(identityString, participantSid, dataPacketReceiveGeneration)
+            ))
             return
         }
 
