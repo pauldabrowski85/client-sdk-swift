@@ -33,7 +33,9 @@ actor IncomingStreamManager: Loggable {
         let generation = UUID()
         let info: StreamInfo
         let identity: Participant.Identity
-        let participantSid: Participant.Sid?
+        /// Mutable: a SID learned from a later packet is locked in (see
+        /// `senderSidMatches`).
+        var participantSid: Participant.Sid?
         let dataPacketReceiveGeneration: UInt64
         let continuation: StreamReaderSource.Continuation
         let limits: IncomingStreamLimits
@@ -594,6 +596,21 @@ actor IncomingStreamManager: Loggable {
         openStreams.removeAll()
     }
 
+    /// The SFU fills `participant_sid` on forwarded packets lazily: packets
+    /// relayed in a sender's first moments can carry an empty SID while later
+    /// packets carry the real one, and a stream can stay open across that
+    /// window (a word-timed transcription segment, for example). An absent SID
+    /// on either side is "not yet known", never a spoof: the identity is
+    /// server-authored and always checked, and once a SID is recorded a later
+    /// different SID still rejects.
+    private static func senderSidMatches(
+        _ recorded: Participant.Sid?,
+        _ incoming: Participant.Sid?
+    ) -> Bool {
+        guard let recorded, let incoming else { return true }
+        return recorded == incoming
+    }
+
     /// Handles a data stream chunk.
     private func handle(
         chunk: Livekit_DataStream.Chunk,
@@ -607,9 +624,12 @@ actor IncomingStreamManager: Loggable {
               descriptor.dataPacketReceiveGeneration == dataPacketReceiveGeneration else { return }
 
         guard descriptor.identity == Participant.Identity(from: identityString),
-              descriptor.participantSid == participantSid else {
+              Self.senderSidMatches(descriptor.participantSid, participantSid) else {
             reject(descriptor, streamID: chunk.streamID, error: .senderMismatch)
             return
+        }
+        if descriptor.participantSid == nil, let participantSid {
+            openStreams[chunk.streamID]?.participantSid = participantSid
         }
 
         // Error paths remove the descriptor synchronously for the same reason as
@@ -670,7 +690,7 @@ actor IncomingStreamManager: Loggable {
         }
 
         guard descriptor.identity == Participant.Identity(from: identityString),
-              descriptor.participantSid == participantSid else {
+              Self.senderSidMatches(descriptor.participantSid, participantSid) else {
             reject(descriptor, streamID: trailer.streamID, error: .senderMismatch)
             return
         }

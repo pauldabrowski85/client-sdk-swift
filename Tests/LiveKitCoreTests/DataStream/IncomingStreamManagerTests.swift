@@ -811,6 +811,105 @@ struct IncomingStreamManagerTests: @unchecked Sendable {
         #expect(await manager.failedTopicDiagnosticCount == 0)
     }
 
+    @Test func sidLearnedFromLaterPacketDoesNotRejectAuthenticatedStream() async throws {
+        // The SFU fills participant_sid lazily: a header can arrive with no SID
+        // while later chunks carry the real one. That must read as "not yet
+        // known", not as a forgery.
+        let rejected = StateSync<StreamError?>(nil)
+        let payload = StateSync<String?>(nil)
+        try await manager.registerTextStreamHandler(
+            for: topicName,
+            onStreamRejected: { rejection in rejected.mutate { $0 = rejection.error } }
+        ) { reader, _ in
+            let text = try await reader.readAll()
+            payload.mutate { $0 = text }
+        }
+
+        await sendTextHeader(streamID: "late-sid")
+        await waitForOpenStreams(1)
+        await sendTextChunk(
+            streamID: "late-sid",
+            content: "hello",
+            publisherParticipantSid: Participant.Sid(from: "PA_learned")
+        )
+        await sendTextTrailer(
+            streamID: "late-sid",
+            publisherParticipantSid: Participant.Sid(from: "PA_learned")
+        )
+
+        let deadline = Date().addingTimeInterval(10)
+        while payload.copy() == nil, rejected.copy() == nil, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(rejected.copy() == nil)
+        #expect(payload.copy() == "hello")
+    }
+
+    @Test func learnedSidStillRejectsADifferentSid() async throws {
+        // Once a SID is observed for the stream it is locked in: a later
+        // packet claiming a different SID is still a forgery.
+        let rejected = StateSync<StreamError?>(nil)
+        let readerError = StateSync<StreamError?>(nil)
+        try await manager.registerTextStreamHandler(
+            for: topicName,
+            onStreamRejected: { rejection in rejected.mutate { $0 = rejection.error } }
+        ) { reader, _ in
+            do {
+                _ = try await reader.readAll()
+            } catch let error as StreamError {
+                readerError.mutate { $0 = error }
+            }
+        }
+
+        await sendTextHeader(streamID: "locked-sid")
+        await waitForOpenStreams(1)
+        await sendTextChunk(
+            streamID: "locked-sid",
+            content: "a",
+            publisherParticipantSid: Participant.Sid(from: "PA_learned")
+        )
+        await sendTextChunk(
+            streamID: "locked-sid",
+            content: "b",
+            publisherParticipantSid: Participant.Sid(from: "PA_forged")
+        )
+
+        await waitForRejection(rejected)
+        await waitForRejection(readerError)
+        #expect(rejected.copy() == .senderMismatch)
+        #expect(readerError.copy() == .senderMismatch)
+        #expect(await manager.openStreamCount == 0)
+    }
+
+    @Test func absentSidOnLaterPacketDoesNotRejectAuthenticatedStream() async throws {
+        // The reverse window: the header carried a SID but a later packet's
+        // is empty. Absent is "unknown", never a mismatch.
+        let rejected = StateSync<StreamError?>(nil)
+        let payload = StateSync<String?>(nil)
+        try await manager.registerTextStreamHandler(
+            for: topicName,
+            onStreamRejected: { rejection in rejected.mutate { $0 = rejection.error } }
+        ) { reader, _ in
+            let text = try await reader.readAll()
+            payload.mutate { $0 = text }
+        }
+
+        await sendTextHeader(
+            streamID: "absent-sid",
+            publisherParticipantSid: Participant.Sid(from: "PA_known")
+        )
+        await waitForOpenStreams(1)
+        await sendTextChunk(streamID: "absent-sid", content: "hello")
+        await sendTextTrailer(streamID: "absent-sid")
+
+        let deadline = Date().addingTimeInterval(10)
+        while payload.copy() == nil, rejected.copy() == nil, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(rejected.copy() == nil)
+        #expect(payload.copy() == "hello")
+    }
+
     // MARK: - Helpers
 
     private func sendByteStream(chunks: [Data]) async {
