@@ -312,7 +312,22 @@ extension Room: SignalClientDelegate {
                     continue
                 } else {
                     let infoSid = Participant.Sid(from: info.sid)
-                    let isNewParticipant = $0.remoteParticipants[infoIdentity]?.sid != infoSid
+                    let current = $0.remoteParticipants[infoIdentity]
+                    let isNewParticipant = current?.sid != infoSid
+                    // A new SID under a known identity is a new connection replacing the old one
+                    // (the publisher's full reconnect, or the server evicting a duplicate
+                    // identity). The old SID's disconnect may never arrive, or arrive after this
+                    // update when it no longer matches, so retire the replaced connection here
+                    // exactly as if its disconnect had come first: its tracks are unpublished
+                    // and it disconnects before the replacement connects.
+                    if let current, isNewParticipant, let currentSid = current.sid {
+                        disconnectedParticipants.append((
+                            current,
+                            infoIdentity,
+                            currentSid,
+                            current.dataPacketReceiveGeneration
+                        ))
+                    }
                     let participant = $0.updateRemoteParticipant(info: info, room: self)
 
                     if isNewParticipant {

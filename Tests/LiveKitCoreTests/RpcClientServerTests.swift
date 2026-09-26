@@ -2084,6 +2084,10 @@ struct RpcServerTests {
                     ),
                     callerIdentity: caller,
                 )
+                // Rejections before admission go through the bounded control-reply queue,
+                // which publishes on its own task after the handler returns. The
+                // confirmation counts only while this body runs, so wait for that task.
+                await waitUntil { room.rpcServer.activeControlReplyCount == 0 }
             }
         }
     }
@@ -2129,6 +2133,13 @@ struct RpcServerTests {
                     callerIdentity: caller,
                 )
             }
+        }
+    }
+
+    private func waitUntil(_ condition: @Sendable () async -> Bool) async {
+        let deadline = Date().addingTimeInterval(10)
+        while !(await condition()), Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
         }
     }
 }
