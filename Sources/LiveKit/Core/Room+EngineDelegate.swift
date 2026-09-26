@@ -237,11 +237,11 @@ extension Room {
 
     func engine(
         _: Room,
-        didRemoveTrackWithId trackId: String,
+        didRemoveTrack track: RTCMediaTrackIdentity,
         sourceTransport: Transport,
         receiveGeneration: UInt64
     ) async throws {
-        let trackSid = Track.Sid(from: trackId)
+        let trackSid = Track.Sid(from: track.trackId)
         guard let publication = currentRemotePublication(
             forSid: trackSid,
             sourceTransport: sourceTransport,
@@ -254,11 +254,10 @@ extension Room {
             receiveGeneration: receiveGeneration
         ) else { return }
 
-        // Only the id crosses the delegate pipeline (the raw proxy stays on the signaling
-        // thread), so the removed track is matched by its WebRTC track id. The transport and
-        // receive-generation guards above already bind it to the current subscriber.
+        // Match the native track, not the id: a delayed remove for an old track must not clear a
+        // same-id replacement.
         guard let subscribedTrack = publication.track,
-              subscribedTrack.mediaTrack.trackId == trackId
+              subscribedTrack.mediaTrack.identity == track
         else { return }
 
         guard await publication.replaceSubscribedTrack(expected: subscribedTrack, with: nil) else {
@@ -329,7 +328,7 @@ extension Room {
             }
             if let track, publication.track !== track { return false }
             if let rtcTrack {
-                guard let mediaTrack = track?.mediaTrack, mediaTrack.isSameDelivery(as: rtcTrack) else { return false }
+                guard track?.mediaTrack.identity == rtcTrack.identity else { return false }
             }
             return true
         }

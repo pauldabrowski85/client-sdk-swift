@@ -574,12 +574,13 @@ public class RemoteTrackPublication: TrackPublication, @unchecked Sendable {
                   state.track === track
             else { return false }
             track._state.mutate { $0.trackState = .started }
-            if let audioTrack {
-                audioTrack.volume = 1
+            // Enabled inside the admission lock so a revoked admission cannot race it, and so
+            // through `gate`, never a wait on the RTC executor while the lock is held.
+            let restoresVolume = audioTrack != nil
+            track.mediaTrack.gate { raw in
+                if restoresVolume { (raw as? LKRTCAudioTrack)?.source.volume = 1 }
+                raw.isEnabled = true
             }
-            // Enabled inside the admission lock so a revoked admission cannot race it. Like
-            // `RemoteAudioTrack.volume`, this is a blocking hop onto the RTC executor.
-            track.mediaTrack.blocking { $0.isEnabled = true }
             return true
         }
     }
@@ -1059,11 +1060,13 @@ private extension RemoteTrackPublication {
         }
     }
 
+    /// Runs under the room and publication locks, so it flips the raw track through `gate`.
     static func silenceAndDetach(_ track: Track) {
-        if let audioTrack = track as? RemoteAudioTrack {
-            audioTrack.volume = 0
+        let silencesVolume = track is RemoteAudioTrack
+        track.mediaTrack.gate { raw in
+            if silencesVolume { (raw as? LKRTCAudioTrack)?.source.volume = 0 }
+            raw.isEnabled = false
         }
-        track.mediaTrack.blocking { $0.isEnabled = false }
         track.detachRemoteTransportSynchronously()
     }
 

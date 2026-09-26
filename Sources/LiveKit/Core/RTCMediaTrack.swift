@@ -18,6 +18,43 @@ import Foundation
 
 internal import LiveKitWebRTC
 
+/// Identifies one native libwebrtc track, independent of the ObjC wrapper that carried it.
+///
+/// libwebrtc hands out a new `LKRTCMediaStreamTrack` wrapper on every `LKRTCRtpReceiver.track`
+/// read, so the wrapper delivered with `didAdd` and the one delivered with `didRemove` are
+/// different objects for the same native track, and `===` never matches them. The wrapper's `hash`
+/// is the native track pointer (what its `isEqual:` compares), and reading it is an ivar read, not a
+/// proxy call, so it is safe on any thread. `trackId` alone is not enough: a resubscription can
+/// deliver a new native track with the same id.
+///
+/// The identity retains the track, so its native pointer cannot be freed and reused by another
+/// track while the identity can still be compared: equal identities are the same live track.
+struct RTCMediaTrackIdentity: Hashable, Sendable {
+    let trackId: String
+    private let native: Int
+    private let anchor: RTCBox<LKRTCMediaStreamTrack>
+
+    /// Nonisolated: reads only `id()` (a `BYPASS` proxy member) and the wrapper's `hash`.
+    init(_ raw: LKRTCMediaStreamTrack) {
+        self.init(raw, anchor: RTCBox(raw))
+    }
+
+    fileprivate init(_ raw: LKRTCMediaStreamTrack, anchor: RTCBox<LKRTCMediaStreamTrack>) {
+        trackId = raw.trackId
+        native = raw.hash
+        self.anchor = anchor
+    }
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.native == rhs.native && lhs.trackId == rhs.trackId
+    }
+
+    func hash(into hasher: inout Hasher) {
+        hasher.combine(native)
+        hasher.combine(trackId)
+    }
+}
+
 /// A `@RTC`-confined handle on an `LKRTCMediaStreamTrack`.
 ///
 /// The raw track is a libwebrtc proxy: `set_enabled`, the renderer sink attach and detach, `volume`
@@ -31,6 +68,8 @@ struct RTCMediaTrack: Sendable {
     /// proxy members). Captured once at construction so reading them later needs no actor hop.
     let trackId: String
     let kind: String
+    /// The native track this wraps; see ``RTCMediaTrackIdentity``.
+    let identity: RTCMediaTrackIdentity
 
     private let box: RTCBox<LKRTCMediaStreamTrack>
 
@@ -39,7 +78,9 @@ struct RTCMediaTrack: Sendable {
     init(_ raw: LKRTCMediaStreamTrack) {
         trackId = raw.trackId
         kind = raw.kind
-        box = RTCBox(raw)
+        let box = RTCBox(raw)
+        identity = RTCMediaTrackIdentity(raw, anchor: box)
+        self.box = box
     }
 
     /// The underlying track. `@RTC`-isolated by design — every use is on the RTC executor.
@@ -51,17 +92,20 @@ struct RTCMediaTrack: Sendable {
         try box.blocking(body)
     }
 
+    /// Runs `body` with the raw track on the calling thread, for the media gates that enable or
+    /// silence a remote track while holding a `StateSync` lock, so that a revoked admission can
+    /// never race the flip. They must not wait on the serial RTC executor there: work on that
+    /// executor takes `StateSync` locks itself (the video publish body reads `Room._state` inside
+    /// `RTC.run`), so a lock holder waiting on it inverts the lock order and can deadlock. The raw
+    /// track is a libwebrtc proxy that marshals `set_enabled` and the source volume onto WebRTC's
+    /// own threads, so the direct call is thread-safe, as every caller made it before 2.17.0.
+    func gate<T>(_ body: (LKRTCMediaStreamTrack) throws -> T) rethrows -> T {
+        try box.unconfined(body)
+    }
+
     /// Runs `teardown` with the raw track off both the cooperative pool and the RTC executor, for
     /// `deinit` paths whose detach blocks on a WebRTC thread.
     func park(_ teardown: @escaping @Sendable (LKRTCMediaStreamTrack) -> Void) {
         box.park(teardown)
-    }
-
-    /// Whether `other` is a copy of this same delivered track, not merely a track with the same id.
-    ///
-    /// Copies of one `RTCMediaTrack` share its box, so this is the identity of one `didAdd`
-    /// delivery. It reads no proxy member, so it needs no RTC hop.
-    func isSameDelivery(as other: RTCMediaTrack) -> Bool {
-        box === other.box
     }
 }

@@ -42,6 +42,13 @@ final class RTCBox<Raw: AnyObject>: @unchecked Sendable {
         try RTC.blocking { try body(raw) }
     }
 
+    /// Runs `body` with the raw object on the calling thread, bypassing the RTC executor. Only for
+    /// callers that hold a `StateSync` lock and therefore must not wait on that executor; see
+    /// ``RTCMediaTrack/gate(_:)``.
+    func unconfined<T>(_ body: (Raw) throws -> T) rethrows -> T {
+        try body(raw)
+    }
+
     /// Hands the raw object to `teardown` on the release queue, for `deinit` paths whose teardown
     /// blocks on a WebRTC thread.
     func park(_ teardown: @escaping @Sendable (Raw) -> Void) {

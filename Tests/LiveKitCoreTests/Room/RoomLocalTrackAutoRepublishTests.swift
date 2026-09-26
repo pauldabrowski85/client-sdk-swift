@@ -78,8 +78,8 @@ struct RoomLocalTrackAutoRepublishTests {
             rtcConfiguration: .liveKitDefault(),
             singlePeerConnection: false
         )
-        let publisher = try #require(join.transport.publisher)
-        let subscriber = try #require(join.transport.subscriber)
+        let publisher = join.transport.publisher
+        let subscriber = join.transport.subscriber
         room._state.mutate {
             $0.stage = .connected(join)
         }
@@ -97,7 +97,7 @@ struct RoomLocalTrackAutoRepublishTests {
     }
 
     private func installMutedRetainedTrack(in room: Room) async -> LocalTrackPublication {
-        let track = LocalAudioTrack.createTrack(name: "retained-microphone")
+        let track = await LocalAudioTrack.createTrack(name: "retained-microphone")
         track.set(muted: true, notify: false)
         let publication = LocalTrackPublication(
             info: .with {

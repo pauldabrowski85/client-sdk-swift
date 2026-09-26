@@ -128,7 +128,7 @@ extension Room: TransportDelegate {
         }
     }
 
-    func transport(_ transport: Transport, didRemoveTrackWithId trackId: String) {
+    func transport(_ transport: Transport, didRemoveTrack track: RTCMediaTrackIdentity) {
         let receiveGeneration = transport.dataPacketReceiveGeneration
         guard isCurrentTransport(
             transport,
@@ -144,7 +144,7 @@ extension Room: TransportDelegate {
                 do {
                     try await self.engine(
                         self,
-                        didRemoveTrackWithId: trackId,
+                        didRemoveTrack: track,
                         sourceTransport: transport,
                         receiveGeneration: receiveGeneration
                     )

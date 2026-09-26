@@ -27,7 +27,7 @@ struct LocalParticipantPublishCancellationTests {
             roomOptions: room._state.roomOptions
         )
         let transportDelegate = PublishCancellationTransportDelegate()
-        let publisher = try Transport(
+        let publisher = try await Transport(
             config: .liveKitDefault(),
             target: .publisher,
             primary: true,
@@ -182,7 +182,7 @@ private final class CancellationProbeAudioTrack: LocalAudioTrack, @unchecked Sen
         super.init(
             name: "cancelled-publication-track",
             source: .microphone,
-            track: mediaTrack,
+            track: RTCMediaTrack(mediaTrack),
             reportStatistics: false,
             captureOptions: AudioCaptureOptions()
         )
@@ -212,11 +212,11 @@ private final class PublishCancellationTransportDelegate: TransportDelegate, @un
     func transport(_: Transport, didOpenDataChannel _: LKRTCDataChannel) {}
     func transport(
         _: Transport,
-        didAddTrack _: LKRTCMediaStreamTrack,
-        rtpReceiver _: LKRTCRtpReceiver,
-        streams _: [LKRTCMediaStream]
+        didAddTrack _: RTCMediaTrack,
+        rtpReceiver _: RTCReceiver,
+        streamIds _: [String]
     ) {}
-    func transport(_: Transport, didRemoveTrack _: LKRTCMediaStreamTrack) {}
+    func transport(_: Transport, didRemoveTrack _: RTCMediaTrackIdentity) {}
     func transportShouldNegotiate(_: Transport) {}
 }
 

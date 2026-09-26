@@ -435,11 +435,12 @@ extension Transport: LKRTCPeerConnectionDelegate {
             return
         }
 
-        // Only the id travels on: nothing downstream needs the proxy, and boxing it here would
-        // add a release to park for a track that is already gone.
-        let trackId = track.trackId
-        log("didRemove track: \(trackId)")
-        _delegate.notify { $0.transport(self, didRemoveTrackWithId: trackId) }
+        // Only the identity travels on: nothing downstream calls the proxy. It anchors the native
+        // track (one parked release when it is dropped) so a delayed remove matches this exact
+        // track and never a same-id replacement.
+        let identity = RTCMediaTrackIdentity(track)
+        log("didRemove track: \(identity.trackId)")
+        _delegate.notify { $0.transport(self, didRemoveTrack: identity) }
     }
 
     nonisolated func peerConnection(_: LKRTCPeerConnection, didOpen dataChannel: LKRTCDataChannel) {

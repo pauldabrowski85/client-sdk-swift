@@ -46,6 +46,34 @@ struct PublishTrackTests {
         }
     }
 
+    /// EnactVoice's push-to-talk keeps its Room after a failed press only because nothing of the
+    /// failed publication survives it: no local capture, no retained track, and no server track.
+    @Test func publishTimeoutLeavesNoCaptureOrServerTrack() async throws {
+        try await TestEnvironment.withRooms([RoomTestingOptions(canPublish: true), RoomTestingOptions(canSubscribe: true)]) { rooms in
+            let publisher = rooms[0].localParticipant
+            let publisherIdentity = try #require(publisher.identity)
+            let remote = try #require(rooms[1].remoteParticipants[publisherIdentity])
+
+            let failedTrack = FrameStarvedAudioTrack()
+            await #expect(throws: LiveKitError.self) {
+                try await publisher.publish(audioTrack: failedTrack)
+            }
+
+            #expect(publisher.trackPublications.isEmpty)
+            #expect(failedTrack.trackState == .stopped)
+            #expect(publisher.failedPublishTrackCount == 0)
+            try await publisher.stopFailedPublishTracks()
+
+            // The SFU accepted AddTrack before the frame timeout; the rollback's renegotiation
+            // must take the track away from every subscriber.
+            let deadline = Date().addingTimeInterval(15)
+            while Date() < deadline, !remote.trackPublications.isEmpty {
+                try await Task.sleep(nanoseconds: 200_000_000)
+            }
+            #expect(remote.trackPublications.isEmpty)
+        }
+    }
+
     @Test func publishWithoutPermissions() async throws {
         try await TestEnvironment.withRoom(RoomTestingOptions(canPublish: false)) { room in
             let audioTrack = await LocalAudioTrack.createTrack()

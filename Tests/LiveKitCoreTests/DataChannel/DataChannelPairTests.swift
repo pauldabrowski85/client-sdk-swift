@@ -143,13 +143,13 @@ struct DataChannelPairTests {
 
     @Test func staleReceiveCannotPoisonReplacementReliableDeduplicationState() async throws {
         let room = Room()
-        let oldTransport = try Transport(
+        let oldTransport = try await Transport(
             config: .liveKitDefault(),
             target: .publisher,
             primary: true,
             delegate: room
         )
-        let newTransport = try Transport(
+        let newTransport = try await Transport(
             config: .liveKitDefault(),
             target: .publisher,
             primary: true,

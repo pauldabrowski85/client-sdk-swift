@@ -14,6 +14,7 @@
  * limitations under the License.
  */
 
+import Dispatch
 @testable import LiveKit
 import LiveKitWebRTC
 import Testing
@@ -458,7 +459,7 @@ struct RemoteAudioPlayoutCoordinatorTests {
         }
 
         await startEntered.wait()
-        #expect(!fixture.rtcTrack.isEnabled)
+        #expect(!fixture.rtcTrack.isEnabledForTesting)
         #expect(subscriptionSendCount.copy() == 0)
 
         await releaseStart.open()
@@ -471,7 +472,7 @@ struct RemoteAudioPlayoutCoordinatorTests {
             )
         }
         #expect(try await activation.value)
-        #expect(fixture.rtcTrack.isEnabled)
+        #expect(fixture.rtcTrack.isEnabledForTesting)
         #expect(fixture.track.volume == 1)
         #expect(probe.snapshot.isPlaying)
         #expect(probe.snapshot.isEngineRunning)
@@ -499,13 +500,13 @@ struct RemoteAudioPlayoutCoordinatorTests {
 
         await startEntered.wait()
         fixture.publication.invalidateSubscriptionAdmissionForOwnershipLoss()
-        #expect(!fixture.rtcTrack.isEnabled)
+        #expect(!fixture.rtcTrack.isEnabledForTesting)
         await releaseStart.open()
 
         await #expect(throws: (any Error).self) {
             try await subscription.value
         }
-        #expect(!fixture.rtcTrack.isEnabled)
+        #expect(!fixture.rtcTrack.isEnabledForTesting)
         try await fixture.publication.stopRetainedRemoteTracks()
         #expect(coordinator.activeOwnerCount == 0)
     }
@@ -695,11 +696,11 @@ struct RemoteAudioPlayoutCoordinatorTests {
 
         #expect(fixture.publication.currentSubscriptionAdmissionSnapshot() == snapshotA)
         #expect(fixture.publication.track === fixture.track)
-        #expect(fixture.track.mediaTrack.isEnabled)
+        #expect(fixture.track.mediaTrack.isEnabledForTesting)
 
         try await fixture.publication.revokeSubscription()
         #expect(fixture.publication.track == nil)
-        #expect(!fixture.track.mediaTrack.isEnabled)
+        #expect(!fixture.track.mediaTrack.isEnabledForTesting)
         _ = try fixture.publication.admitSubscription()
     }
 
@@ -755,8 +756,8 @@ struct RemoteAudioPlayoutCoordinatorTests {
         try await second.publication.set(subscribed: true, admission: second.admissionToken)
         #expect(try await first.publication.activateSubscribedTrack(first.track, admission: first.admission))
         #expect(try await second.publication.activateSubscribedTrack(second.track, admission: second.admission))
-        #expect(first.rtcTrack.isEnabled)
-        #expect(second.rtcTrack.isEnabled)
+        #expect(first.rtcTrack.isEnabledForTesting)
+        #expect(second.rtcTrack.isEnabledForTesting)
 
         let firstOwner = try #require(first.publication._state.remoteAudioPlayoutOwner)
         probe.forceLifecycle(playing: false, recording: false, engineRunning: false)
@@ -764,8 +765,8 @@ struct RemoteAudioPlayoutCoordinatorTests {
             try await coordinator.validate(owner: firstOwner) { true }
         }
 
-        #expect(!first.rtcTrack.isEnabled)
-        #expect(!second.rtcTrack.isEnabled)
+        #expect(!first.rtcTrack.isEnabledForTesting)
+        #expect(!second.rtcTrack.isEnabledForTesting)
         await waitUntil {
             first.room.connectionState == .disconnected &&
                 second.room.connectionState == .disconnected
@@ -773,6 +774,74 @@ struct RemoteAudioPlayoutCoordinatorTests {
         #expect(first.room.connectionState == .disconnected)
         #expect(second.room.connectionState == .disconnected)
     }
+
+    // The media gates run under `StateSync` locks. RTC-executor work can wait for those same locks
+    // (the video publish body reads `Room._state` inside `RTC.run`), so a gate that waited on the
+    // executor would wait on a job that waits on it. Each test below occupies the executor with a
+    // job that cannot finish until the gate has returned; the job's wait is bounded, so a gate
+    // that does hop fails the test after two seconds instead of deadlocking the run.
+
+    @Test func ownershipLossSilencesUnderTheRoomLockWithoutWaitingOnTheRTCExecutor() async throws {
+        let probe = PlayoutDriverProbe()
+        let coordinator = RemoteAudioPlayoutCoordinator(driver: probe.driver)
+        let fixture = try makePublicationFixture(coordinator: coordinator, suffix: "gate-silence")
+        fixture.rtcTrack.setEnabledForTesting(true)
+
+        let release = DispatchSemaphore(value: 0)
+        let executorJob = await occupyRTCExecutor(until: release)
+        let started = ContinuousClock.now
+        // `RemoteParticipant.set(info:)` revokes a vanished track this way while it holds
+        // `Room._state`, the lock the video publish body takes on the executor.
+        fixture.room._state.mutate { _ in
+            fixture.publication.invalidateSubscriptionAdmissionForOwnershipLoss()
+        }
+        let gateDuration = ContinuousClock.now - started
+        release.signal()
+
+        #expect(await executorJob.value)
+        #expect(gateDuration < .seconds(1))
+        // The fixture's track wraps a local source, whose volume reads back as 1 whatever is
+        // written, so the enabled flag is the observable half of the gate.
+        #expect(!fixture.rtcTrack.isEnabledForTesting)
+    }
+
+    @Test func activationEnablesUnderThePublicationLockWithoutWaitingOnTheRTCExecutor() async throws {
+        let probe = PlayoutDriverProbe()
+        let coordinator = RemoteAudioPlayoutCoordinator(driver: probe.driver)
+        let fixture = try makePublicationFixture(coordinator: coordinator, suffix: "gate-activate")
+        try await fixture.publication.set(subscribed: true, admission: fixture.admissionToken)
+
+        let release = DispatchSemaphore(value: 0)
+        let executorJob = await occupyRTCExecutor(until: release)
+        let started = ContinuousClock.now
+        let activated = try await fixture.publication.activateSubscribedTrack(
+            fixture.track,
+            admission: fixture.admission
+        )
+        let gateDuration = ContinuousClock.now - started
+        release.signal()
+
+        #expect(await executorJob.value)
+        #expect(gateDuration < .seconds(1))
+        #expect(activated)
+        #expect(fixture.rtcTrack.isEnabledForTesting)
+    }
+}
+
+/// Parks a job on the serial RTC executor until `release` is signalled or two seconds pass, and
+/// returns once the job is running. The job's value says whether it was released in time.
+private func occupyRTCExecutor(until release: DispatchSemaphore) async -> Task<Bool, Never> {
+    let (entered, enteredContinuation) = AsyncStream<Void>.makeStream()
+    let job = Task {
+        await RTC.run {
+            enteredContinuation.yield()
+            return release.wait(timeout: .now() + .seconds(2)) == .success
+        }
+    }
+    for await _ in entered {
+        break
+    }
+    return job
 }
 
 private struct PlayoutDriverSnapshot {
@@ -962,7 +1031,7 @@ private struct PlayoutPublicationFixture {
     let admissionToken: RemoteTrackSubscriptionAdmission
     let admission: RemoteTrackSubscriptionAdmissionSnapshot
     let track: RemoteAudioTrack
-    let rtcTrack: LKRTCAudioTrack
+    let rtcTrack: RTCMediaTrack
 }
 
 private struct LegacyPlayoutPublicationFixture {
@@ -1016,11 +1085,12 @@ private func makePublicationFixture(
     }
     let admissionToken = try publication.admitSubscription()
     let admission = try #require(publication.currentSubscriptionAdmissionSnapshot())
-    let rtcTrack = RTC.peerConnectionFactory.audioTrack(
+    let rawTrack = RTC.peerConnectionFactory.audioTrack(
         with: RTC.createAudioSource(nil),
         trackId: trackSid
     )
-    rtcTrack.isEnabled = false
+    rawTrack.isEnabled = false
+    let rtcTrack = RTCMediaTrack(rawTrack)
     let track = RemoteAudioTrack(
         name: "playout-audio",
         source: .microphone,
@@ -1069,7 +1139,7 @@ private func makeProtectedVideoPublication() throws -> ProtectedVideoPublication
             throw LiveKitError(.invalidState, message: "Injected stale video admission")
         }
     }
-    let rtcTrack = RTC.createVideoTrack(source: RTC.createVideoSource(forScreenShare: false))
+    let rtcTrack = RTCMediaTrack(RTC.createVideoTrack(source: RTC.createVideoSource(forScreenShare: false)))
     let track = RemoteVideoTrack(
         name: "protected-video",
         source: .camera,
@@ -1077,7 +1147,7 @@ private func makeProtectedVideoPublication() throws -> ProtectedVideoPublication
         reportStatistics: false
     )
     track._state.mutate { $0.trackState = .started }
-    track.mediaTrack.isEnabled = true
+    track.mediaTrack.setEnabledForTesting(true)
     return ProtectedVideoPublicationFixture(
         room: room,
         participant: participant,

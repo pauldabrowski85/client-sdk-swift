@@ -59,7 +59,7 @@ struct RoomTransportOwnershipTests {
                 fixture.staleSubscriber,
                 didAddTrack: fixture.rtcTrack,
                 rtpReceiver: fixture.rtpReceiver,
-                streams: [fixture.stream]
+                streamIds: [fixture.streamId]
             )
             try await Task.sleep(nanoseconds: 100_000_000)
 
@@ -74,18 +74,114 @@ struct RoomTransportOwnershipTests {
                 fixture.original.trackPublications[fixture.trackSid] as? RemoteTrackPublication
             )
             _ = try publication.admitSubscription()
-            fixture.rtcTrack.isEnabled = true
 
-            fixture.room.transport(
-                fixture.staleSubscriber,
-                didAddTrack: fixture.rtcTrack,
-                rtpReceiver: fixture.rtpReceiver,
-                streams: [fixture.stream]
-            )
+            // Since 2.17.0 the raw track is silenced in Transport's peer-connection callback, on
+            // the signaling thread, so drive that callback rather than the Room delegate method.
+            let staleSubscriber = fixture.staleSubscriber
+            let streamId = fixture.streamId
+            let silencedBeforeReturn = try await RTC.run { () throws -> Bool in
+                let receiver = try staleSubscriber.addTransceiver(
+                    ofType: .audio,
+                    transceiverInit: LKRTCRtpTransceiverInit()
+                ).receiver
+                guard let track = receiver.track,
+                      let peerConnection = RTC.createPeerConnection(
+                          .liveKitDefault(),
+                          constraints: .defaultPCConstraints
+                      )
+                else { throw LiveKitError(.invalidState, message: "no receiver track") }
+                track.isEnabled = true
+                staleSubscriber.peerConnection(
+                    peerConnection,
+                    didAdd: receiver,
+                    streams: [RTC.peerConnectionFactory.mediaStream(withStreamId: streamId)]
+                )
+                let silenced = !(receiver.track?.isEnabled ?? true)
+                peerConnection.close()
+                return silenced
+            }
 
-            #expect(!fixture.rtcTrack.isEnabled)
+            #expect(silencedBeforeReturn)
             fixture.installReplacementAsCurrent()
             await fixture.room.flushExecutionQueue()
+        }
+    }
+
+    @Test func receiverTrackWrappersOfOneNativeTrackShareOneIdentity() async throws {
+        try await withTransportFixture { fixture in
+            let staleSubscriber = fixture.staleSubscriber
+            let (sameWrapper, first, second, other) = try await RTC.run {
+                () throws -> (Bool, RTCMediaTrackIdentity, RTCMediaTrackIdentity, RTCMediaTrackIdentity) in
+                let receiver = try staleSubscriber.addTransceiver(
+                    ofType: .audio,
+                    transceiverInit: LKRTCRtpTransceiverInit()
+                ).receiver
+                let otherReceiver = try staleSubscriber.addTransceiver(
+                    ofType: .audio,
+                    transceiverInit: LKRTCRtpTransceiverInit()
+                ).receiver
+                guard let firstRead = receiver.track,
+                      let secondRead = receiver.track,
+                      let otherTrack = otherReceiver.track
+                else { throw LiveKitError(.invalidState, message: "no receiver track") }
+                return (
+                    firstRead === secondRead,
+                    RTCMediaTrackIdentity(firstRead),
+                    RTCMediaTrackIdentity(secondRead),
+                    RTCMediaTrackIdentity(otherTrack)
+                )
+            }
+
+            // libwebrtc wraps the native track anew on every read, so the wrapper seen by
+            // didAdd is never the one seen by didRemove; only the native identity matches.
+            #expect(!sameWrapper)
+            #expect(first == second)
+            #expect(first != other)
+        }
+    }
+
+    @Test func removeCarryingAnotherWrapperOfTheSubscribedTrackRetiresIt() async throws {
+        try await withTransportFixture { fixture in
+            fixture.installOriginalAsCurrent()
+            let publication = try #require(
+                fixture.original.trackPublications[fixture.trackSid] as? RemoteTrackPublication
+            )
+            let staleSubscriber = fixture.staleSubscriber
+            let trackId = fixture.trackSid.stringValue
+            // The remove must carry the publication's SID as its track id, and must arrive in a
+            // different wrapper of the same native track, as libwebrtc delivers it in production.
+            let (sameWrapper, added, removed) = try await RTC.run {
+                () throws -> (Bool, RTCMediaTrack, RTCMediaTrackIdentity) in
+                let raw = RTC.peerConnectionFactory.audioTrack(
+                    with: RTC.createAudioSource(nil),
+                    trackId: trackId
+                )
+                let sender = try staleSubscriber.addTransceiver(
+                    with: raw,
+                    transceiverInit: LKRTCRtpTransceiverInit()
+                ).sender
+                guard let removedRead = sender.track else {
+                    throw LiveKitError(.invalidState, message: "no sender track")
+                }
+                return (raw === removedRead, RTCMediaTrack(raw), RTCMediaTrackIdentity(removedRead))
+            }
+            try #require(!sameWrapper)
+            let subscribed = RemoteAudioTrack(
+                name: "subscribed-audio",
+                source: .microphone,
+                track: added,
+                reportStatistics: false
+            )
+            await publication.set(track: subscribed)
+
+            try await fixture.room.engine(
+                fixture.room,
+                didRemoveTrack: removed,
+                sourceTransport: staleSubscriber,
+                receiveGeneration: staleSubscriber.dataPacketReceiveGeneration
+            )
+
+            #expect(publication.track == nil)
         }
     }
 
@@ -105,7 +201,7 @@ struct RoomTransportOwnershipTests {
 
             fixture.room.transport(
                 fixture.staleSubscriber,
-                didRemoveTrack: fixture.rtcTrack
+                didRemoveTrack: fixture.rtcTrack.identity
             )
             try await Task.sleep(nanoseconds: 100_000_000)
 
@@ -125,7 +221,7 @@ struct RoomTransportOwnershipTests {
                 fixture.staleSubscriber,
                 didAddTrack: fixture.rtcTrack,
                 rtpReceiver: fixture.rtpReceiver,
-                streams: [fixture.stream]
+                streamIds: [fixture.streamId]
             )
             await fixture.room.flushExecutionQueue()
 
@@ -154,7 +250,7 @@ struct RoomTransportOwnershipTests {
             fixture.installOriginalAsCurrent()
             fixture.room.transport(
                 fixture.staleSubscriber,
-                didRemoveTrack: fixture.rtcTrack
+                didRemoveTrack: fixture.rtcTrack.identity
             )
             await fixture.room.flushExecutionQueue()
 
@@ -191,7 +287,7 @@ struct RoomTransportOwnershipTests {
                     fixture.room,
                     didAddTrack: fixture.rtcTrack,
                     rtpReceiver: fixture.rtpReceiver,
-                    stream: fixture.stream,
+                    streamId: fixture.streamId,
                     sourceTransport: fixture.staleSubscriber,
                     receiveGeneration: fixture.staleSubscriber.dataPacketReceiveGeneration
                 )
@@ -236,7 +332,7 @@ struct RoomTransportOwnershipTests {
 
             let firstTask = Task {
                 try await fixture.original.addSubscribedMediaTrack(
-                    rtcTrack: fixture.rtcTrack,
+                    mediaTrack: fixture.rtcTrack,
                     rtpReceiver: fixture.rtpReceiver,
                     trackSid: fixture.trackSid,
                     sourceTransport: fixture.staleSubscriber,
@@ -247,17 +343,20 @@ struct RoomTransportOwnershipTests {
             await firstInstalled.wait()
 
             let secondSource = RTC.createAudioSource(nil)
-            let secondRTCTrack = RTC.peerConnectionFactory.audioTrack(
+            let secondRTCTrack = RTCMediaTrack(RTC.peerConnectionFactory.audioTrack(
                 with: secondSource,
                 trackId: fixture.trackSid.stringValue
-            )
-            let secondTransceiver = try await fixture.staleSubscriber.addTransceiver(
-                ofType: .audio,
-                transceiverInit: LKRTCRtpTransceiverInit()
-            )
+            ))
+            let staleSubscriber = fixture.staleSubscriber
+            let secondReceiver = try await RTC.run {
+                try RTCReceiver(staleSubscriber.addTransceiver(
+                    ofType: .audio,
+                    transceiverInit: LKRTCRtpTransceiverInit()
+                ).receiver)
+            }
             try await fixture.original.addSubscribedMediaTrack(
-                rtcTrack: secondRTCTrack,
-                rtpReceiver: secondTransceiver.receiver,
+                mediaTrack: secondRTCTrack,
+                rtpReceiver: secondReceiver,
                 trackSid: fixture.trackSid,
                 sourceTransport: fixture.staleSubscriber,
                 receiveGeneration: fixture.staleSubscriber.dataPacketReceiveGeneration,
@@ -269,7 +368,7 @@ struct RoomTransportOwnershipTests {
 
             let winningTrack = try #require(publication.track)
             let losingTrack = try #require(publication.firstTrack.copy())
-            #expect(winningTrack.mediaTrack === secondRTCTrack)
+            #expect(winningTrack.mediaTrack.identity == secondRTCTrack.identity)
             #expect(winningTrack.trackState == .started)
             #expect(losingTrack.trackState == .stopped)
             #expect(losingTrack._state.transport == nil)
@@ -283,10 +382,10 @@ struct RoomTransportOwnershipTests {
                 fixture.original.trackPublications[fixture.trackSid] as? RemoteTrackPublication
             )
             let replacementSource = RTC.createAudioSource(nil)
-            let replacementRTCTrack = RTC.peerConnectionFactory.audioTrack(
+            let replacementRTCTrack = RTCMediaTrack(RTC.peerConnectionFactory.audioTrack(
                 with: replacementSource,
                 trackId: fixture.trackSid.stringValue
-            )
+            ))
             let replacementTrack = RemoteAudioTrack(
                 name: "replacement-audio",
                 source: .microphone,
@@ -297,7 +396,7 @@ struct RoomTransportOwnershipTests {
 
             try await fixture.room.engine(
                 fixture.room,
-                didRemoveTrack: fixture.rtcTrack,
+                didRemoveTrack: fixture.rtcTrack.identity,
                 sourceTransport: fixture.staleSubscriber,
                 receiveGeneration: fixture.staleSubscriber.dataPacketReceiveGeneration
             )
@@ -386,7 +485,7 @@ struct RoomTransportOwnershipTests {
                     fixture.room,
                     didAddTrack: fixture.rtcTrack,
                     rtpReceiver: fixture.rtpReceiver,
-                    stream: fixture.stream,
+                    streamId: fixture.streamId,
                     sourceTransport: fixture.staleSubscriber,
                     receiveGeneration: fixture.staleSubscriber.dataPacketReceiveGeneration
                 )
@@ -394,7 +493,7 @@ struct RoomTransportOwnershipTests {
             await didSetTrack.wait()
             let capturedTrack = try #require(publication.capturedTrack.copy() as? RemoteAudioTrack)
             #expect(capturedTrack.trackState == .stopped)
-            #expect(!fixture.rtcTrack.isEnabled)
+            #expect(!fixture.rtcTrack.isEnabledForTesting)
 
             let revokeTask = Task {
                 try await publication.revokeSubscription()
@@ -403,7 +502,7 @@ struct RoomTransportOwnershipTests {
                 await Task.yield()
             }
             #expect(publication.track == nil)
-            #expect(!fixture.rtcTrack.isEnabled)
+            #expect(!fixture.rtcTrack.isEnabledForTesting)
 
             await releaseSet.open()
             await addTask.value
@@ -412,7 +511,7 @@ struct RoomTransportOwnershipTests {
             #expect(publication.track == nil)
             #expect(capturedTrack.trackState == .stopped)
             #expect(capturedTrack._state.transport == nil)
-            #expect(!fixture.rtcTrack.isEnabled)
+            #expect(!fixture.rtcTrack.isEnabledForTesting)
         }
     }
 
@@ -442,7 +541,7 @@ struct RoomTransportOwnershipTests {
             try await publication.revokeSubscription()
 
             #expect(publication.track == nil)
-            #expect(!fixture.rtcTrack.isEnabled)
+            #expect(!fixture.rtcTrack.isEnabledForTesting)
         }
     }
 
@@ -469,29 +568,29 @@ struct RoomTransportOwnershipTests {
                 releaseStop: releaseStop
             )
             displaced._state.mutate { $0.trackState = .started }
-            displaced.mediaTrack.isEnabled = true
+            displaced.mediaTrack.setEnabledForTesting(true)
             await displaced.set(transport: fixture.staleSubscriber, rtpReceiver: fixture.rtpReceiver)
             await publication.set(track: displaced)
 
             let replacementSource = RTC.createAudioSource(nil)
-            let replacementRTCTrack = RTC.peerConnectionFactory.audioTrack(
+            let replacementRTCTrack = RTCMediaTrack(RTC.peerConnectionFactory.audioTrack(
                 with: replacementSource,
                 trackId: fixture.trackSid.stringValue
-            )
+            ))
             let replacement = RemoteAudioTrack(
                 name: "replacement-audio",
                 source: .microphone,
                 track: replacementRTCTrack,
                 reportStatistics: false
             )
-            replacement.mediaTrack.isEnabled = false
+            replacement.mediaTrack.setEnabledForTesting(false)
             let snapshot = try #require(publication.currentSubscriptionAdmissionSnapshot())
             #expect(await publication.replaceSubscribedTrack(
                 expected: displaced,
                 with: replacement,
                 admission: snapshot
             ))
-            #expect(!displaced.mediaTrack.isEnabled)
+            #expect(!displaced.mediaTrack.isEnabledForTesting)
             #expect(displaced._state.transport == nil)
 
             let retirementTask = Task {
@@ -507,8 +606,8 @@ struct RoomTransportOwnershipTests {
             }
 
             #expect(publication.track == nil)
-            #expect(!displaced.mediaTrack.isEnabled)
-            #expect(!replacement.mediaTrack.isEnabled)
+            #expect(!displaced.mediaTrack.isEnabledForTesting)
+            #expect(!replacement.mediaTrack.isEnabledForTesting)
             #expect(displaced._state.transport == nil)
             #expect(replacement._state.transport == nil)
 
@@ -541,21 +640,21 @@ struct RoomTransportOwnershipTests {
                 reportStatistics: false
             )
             exactTrack._state.mutate { $0.trackState = .started }
-            exactTrack.mediaTrack.isEnabled = true
+            exactTrack.mediaTrack.setEnabledForTesting(true)
             await exactTrack.set(transport: fixture.staleSubscriber, rtpReceiver: fixture.rtpReceiver)
             await publication.set(track: exactTrack)
 
             await #expect(throws: LiveKitError.self) {
                 try await fixture.room.engine(
                     fixture.room,
-                    didRemoveTrack: fixture.rtcTrack,
+                    didRemoveTrack: fixture.rtcTrack.identity,
                     sourceTransport: fixture.staleSubscriber,
                     receiveGeneration: fixture.staleSubscriber.dataPacketReceiveGeneration
                 )
             }
 
             #expect(publication.track == nil)
-            #expect(!exactTrack.mediaTrack.isEnabled)
+            #expect(!exactTrack.mediaTrack.isEnabledForTesting)
             #expect(exactTrack._state.transport == nil)
             #expect(throws: LiveKitError.self) {
                 _ = try publication.admitSubscription()
@@ -564,7 +663,7 @@ struct RoomTransportOwnershipTests {
             try await publication.revokeSubscription()
 
             #expect(exactTrack.trackState == .stopped)
-            #expect(!exactTrack.mediaTrack.isEnabled)
+            #expect(!exactTrack.mediaTrack.isEnabledForTesting)
             _ = try publication.admitSubscription()
         }
     }
@@ -606,10 +705,10 @@ struct RoomTransportOwnershipTests {
             }
             await releaseProofPassed.wait()
 
-            let replacementRTCTrack = RTC.peerConnectionFactory.audioTrack(
+            let replacementRTCTrack = RTCMediaTrack(RTC.peerConnectionFactory.audioTrack(
                 with: RTC.createAudioSource(nil),
                 trackId: "TR_retirement_b"
-            )
+            ))
             let stopEntered = TestMediaGate()
             let allowFailedStop = TestMediaGate()
             let retiredB = GatedFailOnceRemoteAudioTrack(
@@ -655,7 +754,7 @@ private final class GatedStopRemoteAudioTrack: RemoteAudioTrack, @unchecked Send
     init(
         name: String,
         source: Track.Source,
-        track: LKRTCMediaStreamTrack,
+        track: RTCMediaTrack,
         reportStatistics: Bool,
         stopEntered: TestMediaGate,
         releaseStop: TestMediaGate
@@ -698,7 +797,7 @@ private final class GatedFailOnceRemoteAudioTrack: RemoteAudioTrack, @unchecked 
     init(
         name: String,
         source: Track.Source,
-        track: LKRTCMediaStreamTrack,
+        track: RTCMediaTrack,
         reportStatistics: Bool,
         stopEntered: TestMediaGate,
         allowFailedStop: TestMediaGate
@@ -870,9 +969,9 @@ private struct TransportOwnershipFixture {
     let original: RemoteParticipant
     let replacement: RemoteParticipant
     let trackSid: Track.Sid
-    let rtcTrack: LKRTCAudioTrack
-    let rtpReceiver: LKRTCRtpReceiver
-    let stream: LKRTCMediaStream
+    let rtcTrack: RTCMediaTrack
+    let rtpReceiver: RTCReceiver
+    let streamId: String
 
     func installOriginalAsCurrent() {
         room._state.mutate {
@@ -926,9 +1025,9 @@ private func withTransportFixture(
         rtcConfiguration: .liveKitDefault(),
         singlePeerConnection: false
     )
-    let staleSubscriber = try #require(staleJoin.transport.subscriber)
-    let currentPublisher = try #require(currentJoin.transport.publisher)
-    let currentSubscriber = try #require(currentJoin.transport.subscriber)
+    let staleSubscriber = staleJoin.transport.subscriber
+    let currentPublisher = currentJoin.transport.publisher
+    let currentSubscriber = currentJoin.transport.subscriber
 
     do {
         let participantSid = "PA_reused"
@@ -969,17 +1068,17 @@ private func withTransportFixture(
         }
 
         let audioSource = RTC.createAudioSource(nil)
-        let rtcTrack = RTC.peerConnectionFactory.audioTrack(
+        let rtcTrack = RTCMediaTrack(RTC.peerConnectionFactory.audioTrack(
             with: audioSource,
             trackId: trackSid.stringValue
-        )
-        let transceiver = try await staleSubscriber.addTransceiver(
-            ofType: .audio,
-            transceiverInit: LKRTCRtpTransceiverInit()
-        )
-        let stream = RTC.peerConnectionFactory.mediaStream(
-            withStreamId: "\(participantSid)|\(trackSid.stringValue)"
-        )
+        ))
+        let rtpReceiver = try await RTC.run {
+            try RTCReceiver(staleSubscriber.addTransceiver(
+                ofType: .audio,
+                transceiverInit: LKRTCRtpTransceiverInit()
+            ).receiver)
+        }
+        let streamId = "\(participantSid)|\(trackSid.stringValue)"
 
         #expect(ObjectIdentifier(original) != ObjectIdentifier(replacement))
         try await body(TransportOwnershipFixture(
@@ -994,8 +1093,8 @@ private func withTransportFixture(
             replacement: replacement,
             trackSid: trackSid,
             rtcTrack: rtcTrack,
-            rtpReceiver: transceiver.receiver,
-            stream: stream
+            rtpReceiver: rtpReceiver,
+            streamId: streamId
         ))
     } catch {
         await staleJoin.transport.close()
