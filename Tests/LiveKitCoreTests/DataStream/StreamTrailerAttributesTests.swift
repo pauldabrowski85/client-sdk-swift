@@ -73,10 +73,7 @@ struct StreamTrailerAttributesTests {
             _ = try await reader.readAll()
         }
         manager.handle(.header(textHeader(streamID: "open", attributes: [:]), sender.stringValue, nil, 0, .none))
-        let deadline = Date().addingTimeInterval(5)
-        while seenWhileOpen.copy() == nil, Date() < deadline {
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
+        try await poll(timeout: 5, for: "the handler to observe the stream") { seenWhileOpen.copy() != nil }
         #expect(seenWhileOpen.copy() == [:])
         manager.handle(.trailer(trailer(streamID: "open", attributes: ["late": "1"]), sender.stringValue, nil, 0, .none))
         await manager.unregisterTextStreamHandler(for: topic)
@@ -99,10 +96,7 @@ struct StreamTrailerAttributesTests {
             $0.attributes = ["why": "aborted"]
         }
         manager.handle(.trailer(aborted, sender.stringValue, nil, 0, .none))
-        let deadline = Date().addingTimeInterval(5)
-        while result.copy() == nil, Date() < deadline {
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
+        try await poll(timeout: 5, for: "the handler to observe the stream") { result.copy() != nil }
         #expect(result.copy() == ["why": "aborted"])
         await manager.unregisterTextStreamHandler(for: topic)
     }
@@ -125,10 +119,30 @@ struct StreamTrailerAttributesTests {
             0,
             .none
         ))
-        let deadline = Date().addingTimeInterval(5)
-        while result.copy() == nil, Date() < deadline {
-            try await Task.sleep(nanoseconds: 10_000_000)
+        try await poll(timeout: 5, for: "the handler to observe the stream") { result.copy() != nil }
+        #expect(result.copy() == [:])
+        await manager.unregisterTextStreamHandler(for: topic)
+    }
+
+    @Test func trailerWithMismatchedEncryptionDoesNotInjectAttributes() async throws {
+        let manager = IncomingStreamManager()
+        let result = StateSync<[String: String]?>(nil)
+        try await manager.registerTextStreamHandler(for: topic) { reader, _ in
+            do {
+                _ = try await reader.readAll()
+            } catch {
+                result.mutate { $0 = reader.trailerAttributes }
+            }
         }
+        manager.handle(.header(textHeader(streamID: "e2ee", attributes: [:]), sender.stringValue, nil, 0, .none))
+        manager.handle(.trailer(
+            trailer(streamID: "e2ee", attributes: ["enact.served": "injected"]),
+            sender.stringValue,
+            nil,
+            0,
+            .gcm
+        ))
+        try await poll(timeout: 5, for: "the handler to observe the stream") { result.copy() != nil }
         #expect(result.copy() == [:])
         await manager.unregisterTextStreamHandler(for: topic)
     }
@@ -148,10 +162,7 @@ struct StreamTrailerAttributesTests {
         manager.handle(.header(header, sender.stringValue, nil, 0, .none))
         manager.handle(.chunk(chunk(streamID: "bytes", index: 0, content: Data([1, 2, 3])), sender.stringValue, nil, 0, .none))
         manager.handle(.trailer(trailer(streamID: "bytes", attributes: ["sha": "abc"]), sender.stringValue, nil, 0, .none))
-        let deadline = Date().addingTimeInterval(5)
-        while result.copy() == nil, Date() < deadline {
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
+        try await poll(timeout: 5, for: "the handler to observe the stream") { result.copy() != nil }
         #expect(result.copy() == ["sha": "abc"])
         await manager.unregisterByteStreamHandler(for: topic)
     }
@@ -186,10 +197,7 @@ struct StreamTrailerAttributesTests {
         }
         manager.handle(.trailer(trailer(streamID: streamID, attributes: trailerAttributes), sender.stringValue, nil, 0, .none))
 
-        let deadline = Date().addingTimeInterval(5)
-        while result.copy() == nil, Date() < deadline {
-            try await Task.sleep(nanoseconds: 10_000_000)
-        }
+        try await poll(timeout: 5, for: "the handler to observe the stream") { result.copy() != nil }
         await manager.unregisterTextStreamHandler(for: topic)
         return try #require(result.copy())
     }

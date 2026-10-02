@@ -34,6 +34,12 @@ public final class TextStreamReader: NSObject, AsyncSequence, Sendable {
     /// arrive here. Read this after the sequence has finished or ``readAll()``
     /// has returned. Before then, and for a trailer with no attributes, it is
     /// empty. The header's attributes are never changed.
+    ///
+    /// A stream that ends abnormally (the trailer carries a `reason`, or the
+    /// content is shorter than the header's total length) still records its
+    /// trailer's attributes before the sequence throws. Decide whether to
+    /// trust them on that path; a trailer from a different sender or with a
+    /// different encryption type never records any.
     public var trailerAttributes: [String: String] {
         trailer.attributes
     }

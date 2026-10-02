@@ -29,7 +29,8 @@ public final class ByteStreamReader: NSObject, AsyncSequence, Sendable {
     ///
     /// ``info`` holds only the header's attributes. Read this after the
     /// sequence has finished or ``readAll()`` has returned; before then, and
-    /// for a trailer with no attributes, it is empty.
+    /// for a trailer with no attributes, it is empty. An abnormal end still
+    /// records the trailer's attributes before the sequence throws.
     public var trailerAttributes: [String: String] {
         trailer.attributes
     }
