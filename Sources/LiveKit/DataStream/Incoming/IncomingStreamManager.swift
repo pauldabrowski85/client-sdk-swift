@@ -38,6 +38,9 @@ actor IncomingStreamManager: Loggable {
         var participantSid: Participant.Sid?
         let dataPacketReceiveGeneration: UInt64
         let continuation: StreamReaderSource.Continuation
+        /// Shared with the reader: the trailer's attributes land here before
+        /// the source finishes.
+        let trailer: StreamTrailerStorage
         let limits: IncomingStreamLimits
         let onStreamRejected: IncomingStreamRejectionHandler?
         var readLength = 0
@@ -442,12 +445,14 @@ actor IncomingStreamManager: Loggable {
             continuation = $0
         }
 
+        let trailer = StreamTrailerStorage()
         let descriptor = Descriptor(
             info: info,
             identity: identity,
             participantSid: participantSid,
             dataPacketReceiveGeneration: dataPacketReceiveGeneration,
             continuation: continuation,
+            trailer: trailer,
             limits: registration.limits,
             onStreamRejected: registration.onStreamRejected,
         )
@@ -485,7 +490,7 @@ actor IncomingStreamManager: Loggable {
                     await predecessor.value
                 }
                 do {
-                    try await registration.handler(source, identity, cancelSource)
+                    try await registration.handler(source, trailer, identity, cancelSource)
                 } catch {
                     self?.log("Text stream handler for topic '\(topic)' threw: \(error)", .warning)
                 }
@@ -497,7 +502,7 @@ actor IncomingStreamManager: Loggable {
             let generation = descriptor.generation
             Task.detached { [weak self] in
                 do {
-                    try await registration.handler(source, identity, cancelSource)
+                    try await registration.handler(source, trailer, identity, cancelSource)
                 } catch {
                     self?.log("Text stream handler for topic '\(topic)' threw: \(error)", .warning)
                 }
@@ -749,6 +754,12 @@ actor IncomingStreamManager: Loggable {
             return
         }
 
+        // Recorded after the sender and encryption checks (a trailer that fails
+        // either must not inject attributes) and before any finish below, so a
+        // reader that has seen the stream end always observes them. Matches the
+        // JS and Rust SDKs, which merge trailer attributes on close.
+        descriptor.trailer.record(trailer.attributes)
+
         if let totalLength = descriptor.info.totalLength {
             guard descriptor.readLength == totalLength else {
                 descriptor.continuation.finish(throwing: StreamError.incomplete)
@@ -769,6 +780,7 @@ actor IncomingStreamManager: Loggable {
     /// Type-erased stream handler.
     private typealias AnyStreamHandler = @Sendable (
         StreamReaderSource,
+        StreamTrailerStorage,
         Participant.Identity,
         @escaping @Sendable () async -> Void
     ) async throws -> Void
@@ -779,8 +791,11 @@ actor IncomingStreamManager: Loggable {
            let registration = byteStreamHandlers[info.topic]
         {
             return ResolvedHandler(
-                handler: { source, identity, _ in
-                    try await registration.handler(ByteStreamReader(info: info, source: source), identity)
+                handler: { source, trailer, identity, _ in
+                    try await registration.handler(
+                        ByteStreamReader(info: info, source: source, trailer: trailer),
+                        identity
+                    )
                 },
                 limits: registration.limits,
                 onStreamRejected: registration.onStreamRejected
@@ -790,9 +805,9 @@ actor IncomingStreamManager: Loggable {
            let registration = textStreamHandlers[info.topic]
         {
             return ResolvedHandler(
-                handler: { source, identity, cancelSource in
+                handler: { source, trailer, identity, cancelSource in
                     try await registration.handler(
-                        TextStreamReader(info: info, source: source, cancelSource: cancelSource),
+                        TextStreamReader(info: info, source: source, trailer: trailer, cancelSource: cancelSource),
                         identity
                     )
                 },

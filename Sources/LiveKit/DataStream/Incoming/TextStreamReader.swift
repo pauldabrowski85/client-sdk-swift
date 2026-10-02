@@ -23,15 +23,30 @@ public final class TextStreamReader: NSObject, AsyncSequence, Sendable {
     public let info: TextStreamInfo
 
     let source: StreamReaderSource
+    private let trailer: StreamTrailerStorage
     private let cancelSource: @Sendable () async -> Void
+
+    /// Attributes the sender attached to the stream's trailer.
+    ///
+    /// ``info`` is fixed when the stream opens and holds only the header's
+    /// attributes. A sender can add more when it closes the stream (for
+    /// example a value it only knows once the content is complete); those
+    /// arrive here. Read this after the sequence has finished or ``readAll()``
+    /// has returned. Before then, and for a trailer with no attributes, it is
+    /// empty. The header's attributes are never changed.
+    public var trailerAttributes: [String: String] {
+        trailer.attributes
+    }
 
     init(
         info: TextStreamInfo,
         source: StreamReaderSource,
+        trailer: StreamTrailerStorage = StreamTrailerStorage(),
         cancelSource: @escaping @Sendable () async -> Void = {}
     ) {
         self.info = info
         self.source = source
+        self.trailer = trailer
         self.cancelSource = cancelSource
     }
 

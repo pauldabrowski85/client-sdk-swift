@@ -23,10 +23,21 @@ public final class ByteStreamReader: NSObject, AsyncSequence, Sendable {
     public let info: ByteStreamInfo
 
     let source: StreamReaderSource
+    private let trailer: StreamTrailerStorage
 
-    init(info: ByteStreamInfo, source: StreamReaderSource) {
+    /// Attributes the sender attached to the stream's trailer.
+    ///
+    /// ``info`` holds only the header's attributes. Read this after the
+    /// sequence has finished or ``readAll()`` has returned; before then, and
+    /// for a trailer with no attributes, it is empty.
+    public var trailerAttributes: [String: String] {
+        trailer.attributes
+    }
+
+    init(info: ByteStreamInfo, source: StreamReaderSource, trailer: StreamTrailerStorage = StreamTrailerStorage()) {
         self.info = info
         self.source = source
+        self.trailer = trailer
     }
 
     /// Reads incoming chunks from the byte stream, concatenating them into a single data object which is returned
