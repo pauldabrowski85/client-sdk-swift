@@ -63,6 +63,8 @@ actor CompleterMapActor<T: Sendable> {
     }
 }
 
+/// Waiters are always resumed outside `_lock`: the runtime resumes a continuation under the task's
+/// status-record lock, and a cancellation handler runs under that same lock while taking `_lock`.
 final class AsyncCompleter<T: Sendable>: @unchecked Sendable, Loggable {
     //
     struct WaitEntry {
@@ -124,14 +126,18 @@ final class AsyncCompleter<T: Sendable>: @unchecked Sendable, Loggable {
 
     func reset(throwing error: Error? = nil) {
         let resetError = LiveKitError.from(error: error) ?? LiveKitError(.cancelled)
-        _lock.sync {
+        // Waiters are cancelled after the lock is released: resuming under `_lock` inverts
+        // against the task status-record lock (upstream 2.18.0).
+        let entries = _lock.sync {
             _resetGeneration &+= 1
             _lastResetError = resetError
-            for entry in _entries.values {
-                entry.cancel(throwing: resetError)
-            }
+            let entries = Array(_entries.values)
             _entries.removeAll()
             _result = nil
+            return entries
+        }
+        for entry in entries {
+            entry.cancel(throwing: resetError)
         }
     }
 
@@ -144,16 +150,18 @@ final class AsyncCompleter<T: Sendable>: @unchecked Sendable, Loggable {
     }
 
     func resume(with result: Result<T, Error>) {
-        _lock.sync {
+        let entries = _lock.sync {
             if let _result {
                 log("\(label) already resolved \(_entries) with \(_result)", .debug)
             }
 
-            for entry in _entries.values {
-                entry.resume(with: result)
-            }
+            let entries = Array(_entries.values)
             _entries.removeAll()
             _result = result
+            return entries
+        }
+        for entry in entries {
+            entry.resume(with: result)
         }
     }
 
@@ -195,20 +203,20 @@ final class AsyncCompleter<T: Sendable>: @unchecked Sendable, Loggable {
                 let timeoutBlock = DispatchWorkItem { [weak self] in
                     guard let self else { return }
                     log("\(label) id: \(entryId) timed out")
-                    _lock.sync {
-                        if let entry = self._entries[entryId] {
-                            entry.timeout()
-                        }
-                        self._entries.removeValue(forKey: entryId)
-                    }
+                    _lock.sync { self._entries.removeValue(forKey: entryId) }?.timeout()
                 }
 
-                let immediateResult: Result<T, Error>? = _lock.sync {
+                // Decided under the lock that registers the waiter, because each is a race
+                // against that registration: a reset since the fast-path read, a `resume` that
+                // found no waiter, and a cancellation `onCancel` saw before the entry existed.
+                // The outcome is carried out of the lock and resumed after it (upstream 2.18.0:
+                // resuming under `_lock` inverts against the task status-record lock).
+                let settled: Result<T, Error>? = _lock.sync {
                     if _resetGeneration != initialState.1 {
                         return .failure(_lastResetError)
                     }
                     if let result = _result { return result }
-                    if cancellationObserved.copy() {
+                    if cancellationObserved.copy() || Task.isCancelled {
                         return .failure(LiveKitError(.cancelled))
                     }
 
@@ -218,17 +226,14 @@ final class AsyncCompleter<T: Sendable>: @unchecked Sendable, Loggable {
                     log("\(label) id: \(entryId) waiting for \(computedTimeout)")
                     return nil
                 }
-                if let immediateResult { continuation.resume(with: immediateResult) }
+                // No entry was stored and the timer was never scheduled on this path, so nothing
+                // else can reach this continuation.
+                if let settled { continuation.resume(with: settled) }
             }
         } onCancel: {
             cancellationObserved.mutate { $0 = true }
             // Cancel only this completer when Task gets cancelled
-            _lock.sync {
-                if let entry = self._entries[entryId] {
-                    entry.cancel()
-                }
-                self._entries.removeValue(forKey: entryId)
-            }
+            _lock.sync { _entries.removeValue(forKey: entryId) }?.cancel()
         }
     }
 }

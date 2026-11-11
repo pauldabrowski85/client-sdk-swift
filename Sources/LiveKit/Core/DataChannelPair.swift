@@ -45,16 +45,31 @@ protocol DataChannelDelegate: AnyObject, Sendable {
 /// to the Room generation that installed them. A replaced channel can finish an already-running
 /// callback, so every receive is revalidated against the exact channel identity and generation
 /// before it can mutate deduplication state or reach a delegate.
+///
+/// ## Live readiness vs. the open latch
+/// Each drain owns a latch for its own channel (``DataChannelDrain/whenOpen``), surfaced here by
+/// ``whenOpen(kind:)``. `room.send(dataPacket:)` awaits the one for the kind it is about to write,
+/// so a never-connected transport fails in bounded time instead of hanging forever — and, more to
+/// the point, so a burst issued before the channel opens is not silently collapsed by the
+/// drop-oldest queue.
+///
+/// Per channel rather than pair-wide: the two are independent SCTP streams, so a lossy blip must
+/// not stall reliable sends, and a lagging reliable channel must not fail a lossy send.
 class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
     // MARK: - Public
 
     let delegates = MulticastDelegate<DataChannelDelegate>(label: "DataChannelDelegate")
-    let openCompleter = AsyncCompleter<Void>(
-        label: "Data channel open",
-        defaultTimeout: .defaultPublisherDataChannelOpen
-    )
 
-    var isOpen: Bool { lossy.isOpen && reliable.isOpen }
+    /// The open latch for the channel a packet of `kind` will be written to.
+    ///
+    /// Per kind, not pair-wide: the two are independent SCTP streams that open independently, so
+    /// gating a lossy send on the reliable channel would stall — or time out — a send its own
+    /// channel was ready to take. rust-sdks resolves the channel per kind on every send
+    /// (`ensure_publisher_connected(kind)` → `data_channel(Publisher, kind)`).
+    func whenOpen(kind: Livekit_DataPacket_Kind) -> AsyncCompleter<Void> {
+        kind == .lossy ? lossy.whenOpen : reliable.whenOpen
+    }
+
     var sendGeneration: UInt64 { _state.sendGeneration }
 
     // MARK: - Provenance
@@ -128,8 +143,7 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
             onMessage: { [weak self] data, channel in
                 self?.handle(received: data, from: channel, kind: .lossy)
             },
-            onStateChange: { [weak self] _ in self?.handleStateChange() },
-            onBufferStatusChange: { isLow in onBufferStatusChange?(isLow, .lossy) }
+            onBufferStatusChange: { isLow in onBufferStatusChange?(isLow, .lossy) },
         )
         reliable = DataChannelDrain(
             label: LKRTCDataChannel.Labels.reliable,
@@ -140,8 +154,7 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
             onMessage: { [weak self] data, channel in
                 self?.handle(received: data, from: channel, kind: .reliable)
             },
-            onStateChange: { [weak self] _ in self?.handleStateChange() },
-            onBufferStatusChange: { isLow in onBufferStatusChange?(isLow, .reliable) }
+            onBufferStatusChange: { isLow in onBufferStatusChange?(isLow, .reliable) },
         )
 
         if let lossyChannel {
@@ -184,13 +197,6 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
         case .reliable:
             reliable.setChannel(channel)
         }
-        handleStateChange()
-    }
-
-    private func handleStateChange() {
-        if isOpen {
-            openCompleter.resume(returning: ())
-        }
     }
 
     func set(maxMessageSize: UInt64) {
@@ -231,8 +237,14 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
         // event for its predecessor.
         lossy.reset(throwing: error)
         reliable.reset(throwing: error)
+        // `reset` only re-arms the drains' latches, because a data track publish is meant to park
+        // across a reconnect. This pair is torn down per connection, so a send parked here fails
+        // with the disconnect instead of waiting out its 15 s timeout — matching every other
+        // completer `Room.cleanUp(withError:)` resets.
+        lossy.whenOpen.reset(throwing: error)
+        reliable.whenOpen.reset(throwing: error)
+        // Negotiated per session (from the SDP answer); the next session must not inherit it.
         set(maxMessageSize: Self.defaultMaxMessageSize)
-        openCompleter.reset(throwing: error)
 
         _state.mutate { state in
             if state.sendGeneration == nextGeneration {
