@@ -367,8 +367,9 @@ final class DataChannelDrain<Stage: SendStage>: NSObject, LKRTCDataChannelDelega
             return
         }
 
-        // Decided here, between serializing and wrapping: after `makeWrites` the token rides
-        // the last write, and settling it here as well would settle it twice. Before the check above it would also turn away an empty submission, which is how
+        // Decided here, between serializing and wrapping: after `makeWrites` the continuation
+        // belongs to a `SendToken` on the last write, and resuming it here as well is a double
+        // resume. Before the check above it would also turn away an empty submission, which is how
         // callers order themselves behind work already in flight.
         //
         // A write that arrives after teardown has nowhere to go: `.fail` settles what was queued
@@ -390,6 +391,11 @@ final class DataChannelDrain<Stage: SendStage>: NSObject, LKRTCDataChannelDelega
             )
         } catch {
             submissionToken?.settle(with: .failure(error))
+            return
+        }
+        // The token rides the last write; with no write nothing would ever settle it.
+        guard !state.writes.isEmpty else {
+            submissionToken?.settle(with: .success(()))
             return
         }
 
