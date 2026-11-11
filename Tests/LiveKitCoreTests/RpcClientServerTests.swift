@@ -3915,6 +3915,8 @@ private enum RpcTestSupport {
         let remote = RemoteParticipant(info: info, room: room, connectionState: .connected)
         room._state.mutate {
             $0.remoteParticipants[identity] = remote
+            // Since 2.18.0 a send on a room that is not connected fails before it reaches the channel.
+            $0.connectionState = .connected
         }
         return remote
     }
