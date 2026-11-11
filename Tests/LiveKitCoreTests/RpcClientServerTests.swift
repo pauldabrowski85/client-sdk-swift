@@ -27,7 +27,7 @@ import LiveKitTestSupport
 
 /// Unit-level coverage of ``RpcClientManager``: caller-side state machine,
 /// pending bookkeeping, timeout codes, cancellation, and sender validation.
-@Suite(.serialized, .tags(.e2e, .rpc))
+@Suite(.serialized, .tags(.e2e, .rpc), TestLimits.e2e)
 struct RpcClientTests {
     // MARK: - v1 caller-side state machine
 
@@ -1424,7 +1424,7 @@ struct RpcPublicationOwnershipTests {
 
 /// Unit-level coverage of ``RpcServerManager``: handler registry, v1 dispatch,
 /// v2 stream dispatch error paths.
-@Suite(.serialized, .tags(.e2e, .rpc))
+@Suite(.serialized, .tags(.e2e, .rpc), TestLimits.e2e)
 struct RpcServerTests {
     // MARK: - v1 server-side handler dispatch
 
@@ -3915,6 +3915,8 @@ private enum RpcTestSupport {
         let remote = RemoteParticipant(info: info, room: room, connectionState: .connected)
         room._state.mutate {
             $0.remoteParticipants[identity] = remote
+            // Since 2.18.0 a send on a room that is not connected fails before it reaches the channel.
+            $0.connectionState = .connected
         }
         return remote
     }
