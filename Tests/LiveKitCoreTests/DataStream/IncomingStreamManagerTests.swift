@@ -207,9 +207,9 @@ struct IncomingStreamManagerTests: Sendable {
         #expect(!opened.copy())
     }
 
-    /// The info is built before the handler lookup, so a stream on a topic nobody handles must not
-    /// trap either. Stream-open callbacks run in order, so reaching the handled stream proves the
-    /// unhandled ones returned.
+    /// A header on a topic nobody handles is dropped before the core, and must not trap either.
+    /// Packets are admitted in order, so reaching the handled stream proves the unhandled ones
+    /// returned.
     @Test func oversizedTotalLengthOnUnhandledTopic() async throws {
         let read = try readingTextStreams()
         feedHeader(streamID: UUID().uuidString, byte: false, totalLength: .max, topic: "unhandled")

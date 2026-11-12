@@ -76,8 +76,9 @@ final class DataStreams: NSObject, @unchecked Sendable, Loggable {
         super.init()
     }
 
-    // The Swift-side handler registry. The FFI reports every opened stream regardless of topic
-    // (`onByteStreamOpened`/`onTextStreamOpened`); we route by `info.topic` to these handlers.
+    // The Swift-side handler registry. The FFI reports every stream it opens
+    // (`onByteStreamOpened`/`onTextStreamOpened`), and admission hands it only streams on a
+    // registered topic; we route by `info.topic` to these handlers.
     private struct ByteEntry {
         let handler: ByteStreamHandler
         let registration: IncomingStreamAdmission.Registration
@@ -176,9 +177,9 @@ final class DataStreams: NSObject, @unchecked Sendable, Loggable {
         return Outgoing(manager: manager, delegate: delegate)
     }
 
-    // Encryption type for *outgoing* stream info. Inbound infos carry the real per-packet value
-    // reported by the FFI, which `handleIncoming` now supplies; there is no equivalent signal for a
-    // stream we're sending, so the room's data-channel setting is the accurate answer there.
+    // Encryption type for *outgoing* stream info. Inbound infos carry the value admission recorded
+    // with the stream's header; there is no equivalent signal for a stream we're sending, so the
+    // room's data-channel setting is the accurate answer there.
     private var currentEncryptionType: EncryptionType {
         room?.e2eeManager?.dataChannelEncryptionType ?? .none
     }
@@ -542,7 +543,7 @@ final class DataStreams: NSObject, @unchecked Sendable, Loggable {
 
     /// Opens a stream on the connection's outgoing manager, with the send context its packets are
     /// delivered with: the data channel's current send generation and the caller's admission. The
-    /// context stays until the stream's trailer is sent or a packet fails.
+    /// context stays until the stream's trailer is sent, a packet fails, or the stream is cancelled.
     ///
     /// A cancel ends the wait at once, since the UniFFI call ignores it, and cancels the context, so
     /// what the abandoned call still emits is not sent. The context keeps the stream's ID until

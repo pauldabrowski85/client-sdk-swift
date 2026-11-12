@@ -1367,6 +1367,10 @@ struct RpcAbsoluteDeadlineTests {
         // call returns as soon as it is cancelled; the withdrawn stream keeps its ID until the
         // core is done with that call.
         #expect(await room.outgoingStreamManager.openStreamCount == (clientProtocol == .v0 ? 0 : 1))
+        // The stream publication's task ends on its own after the cancel, not in step with it.
+        if clientProtocol != .v0 {
+            await waitUntil { await room.rpcClient.activePublicationTaskCount == 0 }
+        }
         let activePublications = await room.rpcClient.activePublicationTaskCount
         #expect(activePublications == (clientProtocol == .v0 ? 1 : 0))
         await channel.releaseSends()

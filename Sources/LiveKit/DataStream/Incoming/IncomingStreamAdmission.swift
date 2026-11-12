@@ -58,7 +58,8 @@ final class IncomingStreamAdmission: @unchecked Sendable, Loggable {
         /// Admitted streams the core has not reported open yet.
         var pending: [UInt64: IncomingStreamSource] = [:]
         /// The core the pending and open streams were handed to. A connection has its own.
-        var core: ObjectIdentifier?
+        /// Weak, not an identifier: the next core can get the address of one that is gone.
+        weak var core: AnyObject?
         /// Streams whose handler has not returned. A handler keeps its stream's slot after the
         /// stream closes, so a flood of short streams cannot start handlers without bound.
         var handlers: [UInt64: IncomingStreamSource] = [:]
@@ -125,8 +126,8 @@ final class IncomingStreamAdmission: @unchecked Sendable, Loggable {
             let generation = receiveGeneration ?? state.receiveGeneration
             guard generation == state.receiveGeneration, state.overflowGeneration == nil else { return }
 
-            let coreID = ObjectIdentifier(core as AnyObject)
-            if state.core != coreID {
+            let coreObject = core as AnyObject
+            if state.core !== coreObject {
                 // What an earlier core was handed and did not open, it never will.
                 let undispatched = Set(state.pending.keys)
                 let abandoned = Array(state.open.values) + state.pending.values.filter { state.open[$0.streamID] !== $0 }
@@ -134,7 +135,7 @@ final class IncomingStreamAdmission: @unchecked Sendable, Loggable {
                 state.open.removeAll()
                 state.pending.removeAll()
                 state.acknowledged = state.forwarded
-                state.core = coreID
+                state.core = coreObject
             }
 
             guard state.forwarded &- state.acknowledged < ingressCapacity else {
@@ -177,10 +178,21 @@ final class IncomingStreamAdmission: @unchecked Sendable, Loggable {
                 state.open[trailer.streamID] = nil
                 // After the sender and encryption checks, since a trailer that fails either must
                 // not inject attributes, and before the core sees the trailer and ends the stream.
+                //
+                // The token goes: the core merges a trailer's attributes into the info it reports
+                // the stream with, where a sender could replace the one stamped on its header.
+                var attributes = trailer.attributes
+                let namesToken = attributes.removeValue(forKey: Self.tokenAttribute) != nil
                 if source.encryptionType == encryptionType {
-                    source.trailer.record(trailer.attributes)
+                    source.trailer.record(attributes)
                 }
-                forward(packet, serialized: serialized, encryptionType: encryptionType, to: core, state: &state, effects: &effects)
+                if namesToken {
+                    let strippedTrailer = trailer.modifying { $0.attributes = attributes }
+                    let stripped = packet.modifying { $0.streamTrailer = strippedTrailer }
+                    forward(stripped, serialized: nil, encryptionType: encryptionType, to: core, state: &state, effects: &effects)
+                } else {
+                    forward(packet, serialized: serialized, encryptionType: encryptionType, to: core, state: &state, effects: &effects)
+                }
             default:
                 return
             }
@@ -440,10 +452,14 @@ final class IncomingStreamAdmission: @unchecked Sendable, Loggable {
         core.handlePacketReceived(packet: data, encryptionType: source.encryptionType.ffiValue)
     }
 
-    /// The core finished `source`, with or without an error.
+    /// The core's reader finished `source`, with or without an error.
     func coreDidEnd(_ source: IncomingStreamSource) {
         state.mutate {
-            if $0.open[source.streamID] === source { $0.open[source.streamID] = nil }
+            guard $0.open[source.streamID] === source else { return }
+            $0.open[source.streamID] = nil
+            // A reader can fail by itself (text that is not UTF-8) while the core keeps the stream
+            // open. Left open there, the core drops the next header that uses this ID.
+            close(source, in: core())
         }
     }
 

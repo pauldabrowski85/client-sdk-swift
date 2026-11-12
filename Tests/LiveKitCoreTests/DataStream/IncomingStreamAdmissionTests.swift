@@ -782,6 +782,112 @@ struct IncomingStreamAdmissionTests: @unchecked Sendable {
         #expect(second.packets.copy().count == 1)
     }
 
+    /// The core merges a trailer's attributes into the info it reports the stream with. A sender
+    /// must not reach the admission token that way.
+    @Test func trailerIsForwardedWithoutTheAdmissionToken() throws {
+        let core = StalledIncomingCore()
+        let admission = IncomingStreamAdmission(core: { core }) { _ in }
+        feedHeader("forged", to: admission, core: core, registration: .init(limits: .default, onStreamRejected: nil))
+
+        let trailer = Livekit_DataPacket.with {
+            $0.participantIdentity = participant.stringValue
+            $0.streamTrailer = Livekit_DataStream.Trailer.with {
+                $0.streamID = "forged"
+                $0.attributes = [IncomingStreamAdmission.tokenAttribute: "0", "kept": "yes"]
+            }
+        }
+        try admission.receive(
+            trailer,
+            serialized: trailer.serializedData(),
+            encryptionType: .none,
+            receiveGeneration: nil,
+            receivedAtContinuousTimeNanoseconds: 0,
+            core: core
+        ) { _ in nil }
+
+        let forwarded = try Livekit_DataPacket(serializedBytes: #require(core.packets.copy().last))
+        #expect(forwarded.streamTrailer.attributes == ["kept": "yes"])
+    }
+
+    /// The same, against the real core: a trailer that names a token right behind its header must
+    /// not keep the stream from its handler, or its slot from the topic.
+    @Test func streamWithAForgedTokenInItsTrailerStillReachesItsHandler() async throws {
+        let handled = StateSync(0)
+        try await manager.registerTextStreamHandler(for: topicName) { reader, _ in
+            _ = try? await reader.readAll()
+            handled.mutate { $0 += 1 }
+        }
+
+        let count = 32
+        for index in 0 ..< count {
+            await sendTextHeader(streamID: "forged-\(index)")
+            manager.handle(.trailer(
+                Livekit_DataStream.Trailer.with {
+                    $0.streamID = "forged-\(index)"
+                    $0.attributes = [IncomingStreamAdmission.tokenAttribute: "forged"]
+                },
+                participant.stringValue,
+                nil,
+                0,
+                .none
+            ))
+        }
+
+        let deadline = Date().addingTimeInterval(5)
+        while handled.copy() < count, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(handled.copy() == count)
+        await waitForNoActiveHandlers()
+        #expect(await manager.activeHandlerCount == 0)
+    }
+
+    /// Text that is not UTF-8 ends the core's reader, but the core keeps the stream open until
+    /// its next packet. The ID must not be free here while the core still holds it: the core
+    /// would drop the next header that uses it, and that stream would keep its slot unopened.
+    @Test func streamIDIsReusableAfterItsReaderFailed() async throws {
+        let outcomes = StateSync<[Result<String, Error>]>([])
+        try await manager.registerTextStreamHandler(for: topicName) { reader, _ in
+            do {
+                let text = try await reader.readAll()
+                outcomes.mutate { $0.append(.success(text)) }
+            } catch {
+                outcomes.mutate { $0.append(.failure(error)) }
+            }
+        }
+        let waitForOutcomes: (Int) async -> Void = { count in
+            let deadline = Date().addingTimeInterval(5)
+            while outcomes.copy().count < count, Date() < deadline {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+        }
+
+        await sendTextHeader(streamID: "reused")
+        manager.handle(.chunk(
+            Livekit_DataStream.Chunk.with {
+                $0.streamID = "reused"
+                $0.chunkIndex = 0
+                $0.content = Data([0xFF, 0xFE])
+            },
+            participant.stringValue,
+            nil,
+            0,
+            .none
+        ))
+        await waitForOutcomes(1)
+        #expect(throws: StreamError.self) { try outcomes.copy().first?.get() }
+        await waitForNoOpenStreams()
+
+        await sendTextHeader(streamID: "reused")
+        await sendTextChunk(streamID: "reused", content: "second", index: 0)
+        await sendTextTrailer(streamID: "reused")
+        await waitForOutcomes(2)
+
+        #expect(try outcomes.copy().last?.get() == "second")
+        await waitForNoActiveHandlers()
+        #expect(await manager.activeHandlerCount == 0)
+    }
+
     /// A header on a topic nobody handles is dropped where it arrives. It is never queued, so a
     /// flood of them holds nothing and needs no recovery.
     @Test func unknownTopicFloodIsDroppedWithoutQueueing() async {
