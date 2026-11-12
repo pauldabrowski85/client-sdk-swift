@@ -30,8 +30,8 @@ struct RoomLazyMemberConcurrencyTests {
                 ObjectIdentifier(room.metricsManager),
                 ObjectIdentifier(room.subscriberDataChannel),
                 ObjectIdentifier(room.publisherDataChannel),
-                ObjectIdentifier(room.incomingStreamManager),
-                ObjectIdentifier(room.outgoingStreamManager),
+                ObjectIdentifier(room.dataStreams),
+                ObjectIdentifier(room.dataStreams.admission),
                 ObjectIdentifier(room.preConnectBuffer),
             ]
             observations.mutate {

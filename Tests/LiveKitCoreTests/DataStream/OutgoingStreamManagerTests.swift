@@ -16,13 +16,43 @@
 
 import Foundation
 @testable import LiveKit
+import LiveKitFFI
 import Testing
 #if canImport(LiveKitTestSupport)
 import LiveKitTestSupport
 #endif
 
+/// Exercises the outgoing data-stream path against the UniFFI `OutgoingDataStreamManager` directly,
+/// with a capturing delegate standing in for the data channel (the same seam the old pure-Swift
+/// `OutgoingStreamManager` offered via its `packetHandler`). Validates that the pre-existing v1
+/// wire behavior — a header, ordered chunks carrying the full payload, and an empty-reason trailer —
+/// is produced by the new Rust core. No network or connected room is needed.
 @Suite(.tags(.dataStream))
 struct OutgoingStreamManagerTests {
+    /// Captures the encoded `DataPacket`s the manager emits, or fails their delivery once
+    /// `failsDelivery` is set.
+    final class CapturingDelegate: OutgoingDataStreamManagerDelegate, @unchecked Sendable {
+        let packets = StateSync<[Livekit_DataPacket]>([])
+        let failsDelivery = StateSync(false)
+
+        func onPacketsAvailable(packets emitted: [Data]) throws {
+            if failsDelivery.copy() {
+                throw PacketDeliveryError.Failed(reason: "transport gone")
+            }
+            for data in emitted {
+                guard let packet = try? Livekit_DataPacket(serializedBytes: data) else { continue }
+                packets.mutate { $0.append(packet) }
+            }
+        }
+    }
+
+    /// Minimal registry — broadcast with no known remote capabilities.
+    final class StubRegistry: RemoteParticipantRegistryDelegate, @unchecked Sendable {
+        func remoteClientProtocol(identity _: String) -> Int32 { 0 }
+        func remoteCapabilities(identity _: String) -> [LiveKitFFI.ClientCapability] { [] }
+        func remoteIdentities() -> [String] { [] }
+    }
+
     @Test func streamBytes() async throws {
         let testChunks = [
             Data(repeating: 0xAB, count: 128),
@@ -33,58 +63,24 @@ struct OutgoingStreamManagerTests {
         let streamID = UUID().uuidString
         let topic = "some-topic"
 
-        let counter = ConcurrentCounter()
+        let delegate = CapturingDelegate()
+        let manager = OutgoingDataStreamManager(delegate: delegate, registry: StubRegistry())
 
-        try await confirmation("Produces header packet") { headerConfirm in
-            try await confirmation("Produces chunk packets") { chunkConfirm in
-                try await confirmation("Produces trailer packet") { trailerConfirm in
-                    let manager = OutgoingStreamManager { packet, _, _ in
-                        // Simulate data channel send
-                        try await Task.sleep(nanoseconds: 10_000_000)
-
-                        switch packet.value {
-                        case let .streamHeader(header):
-                            #expect(header.streamID == streamID)
-                            #expect(header.topic == topic)
-                            #expect(header.mimeType == "application/octet-stream")
-
-                            headerConfirm()
-
-                        case let .streamChunk(chunk):
-                            let currentChunk = await counter.increment()
-                            #expect(chunk.streamID == streamID)
-                            #expect(chunk.chunkIndex == UInt64(currentChunk))
-                            #expect(chunk.content == testChunks[currentChunk])
-
-                            if await counter.getCount() == testChunks.count {
-                                chunkConfirm()
-                            }
-
-                        case let .streamTrailer(trailer):
-                            #expect(trailer.streamID == streamID)
-                            #expect(trailer.reason == "")
-
-                            trailerConfirm()
-
-                        default: Issue.record("Produced unexpected packet type")
-                        }
-                    } sendGenerationProvider: {
-                        0
-                    } encryptionProvider: {
-                        .none
-                    }
-
-                    let writer = try await manager.streamBytes(
-                        options: StreamByteOptions(topic: topic, id: streamID),
-                    )
-
-                    for chunk in testChunks {
-                        try await writer.write(chunk)
-                    }
-                    try await writer.close()
-                }
-            }
+        let writer = try await manager.streamBytes(
+            options: LiveKitFFI.StreamByteOptions(topic: topic, attributes: [:], id: streamID),
+        )
+        for chunk in testChunks {
+            try await writer.write(data: chunk)
         }
+        try await writer.close()
+
+        assertStream(
+            delegate.packets.copy(),
+            streamID: streamID,
+            topic: topic,
+            mimeType: "application/octet-stream",
+            expectedPayload: testChunks.reduce(Data()) { $0 + $1 },
+        )
     }
 
     @Test func streamText() async throws {
@@ -97,542 +93,225 @@ struct OutgoingStreamManagerTests {
         let streamID = UUID().uuidString
         let topic = "some-topic"
 
-        let counter = ConcurrentCounter()
-
-        try await confirmation("Produces header packet") { headerConfirm in
-            try await confirmation("Produces chunk packets") { chunkConfirm in
-                try await confirmation("Produces trailer packet") { trailerConfirm in
-                    let manager = OutgoingStreamManager { packet, _, _ in
-                        // Simulate data channel send
-                        try await Task.sleep(nanoseconds: 10_000_000)
-
-                        switch packet.value {
-                        case let .streamHeader(header):
-                            #expect(header.streamID == streamID)
-                            #expect(header.topic == topic)
-                            #expect(header.mimeType == "text/plain")
-
-                            headerConfirm()
-
-                        case let .streamChunk(chunk):
-                            let currentChunk = await counter.increment()
-                            #expect(chunk.streamID == streamID)
-                            #expect(chunk.chunkIndex == UInt64(currentChunk))
-                            #expect(chunk.content == Data(testChunks[currentChunk].utf8))
-
-                            if await counter.getCount() == testChunks.count {
-                                chunkConfirm()
-                            }
-
-                        case let .streamTrailer(trailer):
-                            #expect(trailer.streamID == streamID)
-                            #expect(trailer.reason == "")
-
-                            trailerConfirm()
-
-                        default: Issue.record("Produced unexpected packet type")
-                        }
-                    } sendGenerationProvider: {
-                        0
-                    } encryptionProvider: {
-                        .none
-                    }
-
-                    let writer = try await manager.streamText(
-                        options: StreamTextOptions(topic: topic, id: streamID),
-                    )
-
-                    for chunk in testChunks {
-                        try await writer.write(chunk)
-                    }
-                    try await writer.close()
-                }
-            }
-        }
-    }
-
-    @Test func errorPropagation() async throws {
-        let testError = LiveKitError(.cancelled, message: "Test error")
-
-        try await confirmation("Error propagates to caller") { confirm in
-            let manager = OutgoingStreamManager { packet, _, _ in
-                switch packet.value {
-                case .streamChunk:
-                    // Wait until first chunk to produce error
-                    throw testError
-                default: break
-                }
-            } sendGenerationProvider: {
-                0
-            } encryptionProvider: {
-                .none
-            }
-
-            let writer = try await manager.streamText(
-                options: StreamTextOptions(topic: "some-topic"),
-            )
-            do {
-                try await writer.write("Hello, world!")
-            } catch {
-                #expect(error as? LiveKitError == testError)
-                confirm()
-            }
-        }
-    }
-
-    @Test func streamCannotCrossDataChannelSendGenerationAfterHeader() async throws {
-        let currentGeneration = StateSync<UInt64>(0)
-        let sentPacketKinds = StateSync<[String]>([])
-        let manager = OutgoingStreamManager { packet, expectedGeneration, _ in
-            guard expectedGeneration == currentGeneration.copy() else {
-                throw LiveKitError(.cancelled, message: "Data channel generation changed")
-            }
-            sentPacketKinds.mutate { kinds in
-                switch packet.value {
-                case .streamHeader: kinds.append("header")
-                case .streamChunk: kinds.append("chunk")
-                case .streamTrailer: kinds.append("trailer")
-                default: kinds.append("other")
-                }
-            }
-        } sendGenerationProvider: {
-            currentGeneration.copy()
-        } encryptionProvider: {
-            .none
-        }
+        let delegate = CapturingDelegate()
+        let manager = OutgoingDataStreamManager(delegate: delegate, registry: StubRegistry())
 
         let writer = try await manager.streamText(
-            options: StreamTextOptions(topic: "generation-bound")
+            options: LiveKitFFI.StreamTextOptions(topic: topic, attributes: [:], id: streamID),
         )
-        #expect(sentPacketKinds.copy() == ["header"])
-        currentGeneration.mutate { $0 = 1 }
-
-        await #expect(throws: LiveKitError.self) {
-            try await writer.write("must-not-cross")
+        for chunk in testChunks {
+            try await writer.write(text: chunk)
         }
+        try await writer.close()
 
-        #expect(sentPacketKinds.copy() == ["header"])
-        #expect(await manager.openStreamCount == 0)
-        await #expect(throws: StreamError.self) {
+        assertStream(
+            delegate.packets.copy(),
+            streamID: streamID,
+            topic: topic,
+            mimeType: "text/plain",
+            expectedPayload: Data(testChunks.reduce("") { $0 + $1 }.utf8),
+        )
+    }
+
+    @Test func writerIsOpenReflectsClose() async throws {
+        let manager = OutgoingDataStreamManager(delegate: CapturingDelegate(), registry: StubRegistry())
+        let ffiWriter = try await manager.streamBytes(
+            options: LiveKitFFI.StreamByteOptions(topic: "some-topic", attributes: [:]),
+        )
+        let writer = LiveKit.ByteStreamWriter(ffiWriter, encryptionType: .none)
+
+        var isOpen = await writer.isOpen
+        #expect(isOpen == true)
+
+        try await writer.close()
+        isOpen = await writer.isOpen
+        #expect(isOpen == false)
+    }
+
+    /// The server routes each packet on its own `destinationIdentities` and broadcasts an empty
+    /// list, so the chunks and trailer of a targeted stream must carry the recipients too. Every
+    /// packet is also reliable: the room picks the channel from the packet's kind.
+    @Test(arguments: [false, true])
+    func everyPacketCarriesDestinationIdentities(oneShot: Bool) async throws {
+        let delegate = CapturingDelegate()
+        let manager = OutgoingDataStreamManager(delegate: delegate, registry: StubRegistry())
+        let options = LiveKit.StreamTextOptions(topic: "some-topic", destinationIdentities: [Participant.Identity(from: "alice")])
+
+        if oneShot {
+            // The stub registry reports no v2 recipient, so this takes the multi-packet path.
+            _ = try await manager.sendText(text: "hello", options: options.ffi)
+        } else {
+            let writer = try await manager.streamText(options: options.ffi)
+            try await writer.write(text: "hello")
             try await writer.close()
         }
-    }
 
-    @Test func sendTextPropagatesTrailerFailureAndTerminalizesDescriptor() async throws {
-        let trailerError = LiveKitError(.cancelled, message: "trailer failed")
-        let sentPacketKinds = StateSync<[String]>([])
-        let manager = OutgoingStreamManager { packet, _, _ in
+        let packets = delegate.packets.copy()
+        let kinds = packets.map { packet -> String in
             switch packet.value {
-            case .streamHeader:
-                sentPacketKinds.mutate { $0.append("header") }
-            case .streamChunk:
-                sentPacketKinds.mutate { $0.append("chunk") }
-            case .streamTrailer:
-                sentPacketKinds.mutate { $0.append("trailer") }
-                throw trailerError
-            default:
-                break
+            case .streamHeader: "header"
+            case .streamChunk: "chunk"
+            case .streamTrailer: "trailer"
+            default: "other"
             }
-        } sendGenerationProvider: {
-            0
-        } encryptionProvider: {
-            .none
         }
-
-        await #expect(throws: LiveKitError.self) {
-            _ = try await manager.sendText(
-                "complete-payload",
-                options: StreamTextOptions(topic: "trailer-failure")
-            )
-        }
-
-        #expect(sentPacketKinds.copy() == ["header", "chunk", "trailer"])
-        #expect(await manager.openStreamCount == 0)
+        #expect(kinds == ["header", "chunk", "trailer"])
+        #expect(packets.allSatisfy { $0.destinationIdentities == ["alice"] })
+        #expect(packets.allSatisfy { $0.kind == .reliable })
     }
 
-    @Test func resetDuringPendingHeaderCannotInstallStaleDescriptor() async throws {
-        let firstHeader = StateSync(true)
-        let firstHeaderEntered = OutgoingTestGate()
-        let releaseFirstHeader = OutgoingTestGate()
-        let manager = OutgoingStreamManager { packet, _, _ in
-            guard case .streamHeader = packet.value else { return }
-            let shouldSuspend = firstHeader.mutate { first -> Bool in
-                defer { first = false }
-                return first
-            }
-            guard shouldSuspend else { return }
-            await firstHeaderEntered.open()
-            await releaseFirstHeader.wait()
-        } sendGenerationProvider: {
-            0
-        } encryptionProvider: {
-            .none
-        }
-        let streamID = "reused-after-reset"
+    /// A close reason travels in the trailer, which the receiver reads as an abnormal end.
+    @Test func closeReasonReachesTrailer() async throws {
+        let delegate = CapturingDelegate()
+        let manager = OutgoingDataStreamManager(delegate: delegate, registry: StubRegistry())
+        let writer = try await LiveKit.TextStreamWriter(manager.streamText(options: LiveKit.StreamTextOptions(topic: "t").ffi), encryptionType: .none)
 
-        let staleOpen = Task {
-            try await manager.streamText(
-                options: StreamTextOptions(topic: "pending-open", id: streamID)
-            )
-        }
-        await firstHeaderEntered.wait()
+        try await writer.close(reason: "because")
 
-        await manager.reset()
-        let replacementWriter = try await manager.streamText(
-            options: StreamTextOptions(topic: "pending-open", id: streamID)
-        )
-        #expect(await manager.openStreamCount == 1)
-
-        await releaseFirstHeader.open()
-        await #expect(throws: StreamError.self) {
-            _ = try await staleOpen.value
+        let reasons = delegate.packets.copy().compactMap { packet -> String? in
+            if case let .streamTrailer(trailer) = packet.value { return trailer.reason }
+            return nil
         }
-        #expect(await replacementWriter.isOpen)
-        #expect(await manager.openStreamCount == 1)
-        try await replacementWriter.close()
-        #expect(await manager.openStreamCount == 0)
+        #expect(reasons == ["because"])
     }
 
-    @Test func concurrentWritesUseOnePerDescriptorFifoAndUniqueChunkIndices() async throws {
-        let firstChunkEntered = OutgoingTestGate()
-        let releaseFirstChunk = OutgoingTestGate()
-        let shouldSuspendFirstChunk = StateSync(true)
-        let observedChunks = StateSync<[(UInt64, String)]>([])
-        let manager = OutgoingStreamManager { packet, _, _ in
-            guard case let .streamChunk(chunk) = packet.value else { return }
-            observedChunks.mutate {
-                $0.append((chunk.chunkIndex, String(decoding: chunk.content, as: UTF8.self)))
-            }
-            let shouldSuspend = shouldSuspendFirstChunk.mutate { first -> Bool in
-                defer { first = false }
-                return first
-            }
-            guard shouldSuspend else { return }
-            await firstChunkEntered.open()
-            await releaseFirstChunk.wait()
-        } sendGenerationProvider: {
-            0
-        } encryptionProvider: {
-            .none
-        }
-        let writer = try await manager.streamText(
-            options: StreamTextOptions(topic: "concurrent-writes")
+    /// A delivery failure surfaces to the `write` that caused it and closes the stream, so the
+    /// writer stops reporting itself open. Restores v1's `errorPropagation` spec.
+    @Test func deliveryFailureFailsWriteAndClosesStream() async throws {
+        let delegate = CapturingDelegate()
+        let manager = OutgoingDataStreamManager(delegate: delegate, registry: StubRegistry())
+        let ffiWriter = try await manager.streamText(
+            options: LiveKitFFI.StreamTextOptions(topic: "some-topic", attributes: [:]),
         )
-        let queuedWrites = StateSync(0)
-        await manager.setOperationObserver { operation in
-            guard operation == .write else { return }
-            queuedWrites.mutate { $0 += 1 }
+        let writer = LiveKit.TextStreamWriter(ffiWriter, encryptionType: .none)
+
+        delegate.failsDelivery.mutate { $0 = true }
+        await #expect(throws: StreamError.sendFailed) {
+            try await writer.write("hello")
         }
-
-        let firstWrite = Task { try await writer.write("first") }
-        await firstChunkEntered.wait()
-        let secondWrite = Task { try await writer.write("second") }
-        let deadline = Date().addingTimeInterval(5)
-        while queuedWrites.copy() < 2, Date() < deadline {
-            await Task.yield()
-        }
-        #expect(queuedWrites.copy() == 2)
-
-        await releaseFirstChunk.open()
-        try await firstWrite.value
-        try await secondWrite.value
-
-        #expect(observedChunks.copy().map(\.0) == [0, 1])
-        #expect(observedChunks.copy().map(\.1) == ["first", "second"])
-        try await writer.close()
+        let isOpen = await writer.isOpen
+        #expect(!isOpen)
     }
 
-    @Test func closeQueuedBehindSuspendedWriteCannotSendTrailerBeforeChunk() async throws {
-        let firstChunkEntered = OutgoingTestGate()
-        let releaseFirstChunk = OutgoingTestGate()
-        let packetOrder = StateSync<[String]>([])
-        let manager = OutgoingStreamManager { packet, _, _ in
-            switch packet.value {
-            case .streamHeader:
-                packetOrder.mutate { $0.append("header") }
-            case .streamChunk:
-                packetOrder.mutate { $0.append("chunk") }
-                await firstChunkEntered.open()
-                await releaseFirstChunk.wait()
-            case .streamTrailer:
-                packetOrder.mutate { $0.append("trailer") }
-            default:
-                break
-            }
-        } sendGenerationProvider: {
-            0
-        } encryptionProvider: {
-            .none
+    // MARK: - Helpers
+
+    private func assertStream(
+        _ packets: [Livekit_DataPacket],
+        streamID: String,
+        topic: String,
+        mimeType: String,
+        expectedPayload: Data,
+    ) {
+        let headers = packets.compactMap { packet -> Livekit_DataStream.Header? in
+            if case let .streamHeader(header) = packet.value { return header }
+            return nil
         }
-        let writer = try await manager.streamText(
-            options: StreamTextOptions(topic: "write-before-close")
-        )
-        let closeQueued = StateSync(false)
-        await manager.setOperationObserver { operation in
-            if operation == .close { closeQueued.mutate { $0 = true } }
+        #expect(headers.count == 1)
+        if let header = headers.first {
+            #expect(header.streamID == streamID)
+            #expect(header.topic == topic)
+            #expect(header.mimeType == mimeType)
         }
 
-        let writeTask = Task { try await writer.write("payload") }
-        await firstChunkEntered.wait()
-        let closeTask = Task { try await writer.close() }
-        let deadline = Date().addingTimeInterval(5)
-        while !closeQueued.copy(), Date() < deadline {
-            await Task.yield()
+        let chunks = packets.compactMap { packet -> Livekit_DataStream.Chunk? in
+            if case let .streamChunk(chunk) = packet.value { return chunk }
+            return nil
         }
-        #expect(closeQueued.copy())
-        #expect(packetOrder.copy() == ["header", "chunk"])
-
-        await releaseFirstChunk.open()
-        try await writeTask.value
-        try await closeTask.value
-        #expect(packetOrder.copy() == ["header", "chunk", "trailer"])
-        #expect(await manager.openStreamCount == 0)
-    }
-
-    @Test func cancellingQueuedWriteTerminalizesItsExactDescriptor() async throws {
-        let firstChunkEntered = OutgoingTestGate()
-        let releaseFirstChunk = OutgoingTestGate()
-        let packetOrder = StateSync<[String]>([])
-        let manager = OutgoingStreamManager { packet, _, _ in
-            switch packet.value {
-            case .streamHeader:
-                packetOrder.mutate { $0.append("header") }
-            case .streamChunk:
-                packetOrder.mutate { $0.append("chunk") }
-                if packetOrder.copy().count == 2 {
-                    await firstChunkEntered.open()
-                    await releaseFirstChunk.wait()
-                }
-            default:
-                break
-            }
-        } sendGenerationProvider: {
-            0
-        } encryptionProvider: {
-            .none
+        // Robust to any re-chunking: assert the reassembled payload and sequential indices rather
+        // than a one-write-per-chunk correspondence.
+        let assembled = chunks.reduce(Data()) { $0 + $1.content }
+        #expect(assembled == expectedPayload)
+        for (index, chunk) in chunks.enumerated() {
+            #expect(chunk.chunkIndex == UInt64(index))
         }
-        let streamID = "cancel-queued-write"
-        let writer = try await manager.streamText(
-            options: StreamTextOptions(topic: "cancel-queued-write", id: streamID)
-        )
-        let writeOperationCount = StateSync(0)
-        await manager.setOperationObserver { operation in
-            guard operation == .write else { return }
-            writeOperationCount.mutate { $0 += 1 }
+        #expect(chunks.allSatisfy { $0.streamID == streamID })
+
+        let trailers = packets.compactMap { packet -> Livekit_DataStream.Trailer? in
+            if case let .streamTrailer(trailer) = packet.value { return trailer }
+            return nil
         }
-
-        let firstWrite = Task { try await writer.write("first") }
-        await firstChunkEntered.wait()
-        let cancelledWrite = Task { try await writer.write("cancelled") }
-        let queuedDeadline = Date().addingTimeInterval(5)
-        while writeOperationCount.copy() < 2, Date() < queuedDeadline {
-            await Task.yield()
-        }
-        #expect(writeOperationCount.copy() == 2)
-        cancelledWrite.cancel()
-
-        await waitForDescriptorCleanup(in: manager)
-        #expect(await manager.openStreamCount == 0)
-        let replacementWriter = try await manager.streamText(
-            options: StreamTextOptions(topic: "cancel-queued-write", id: streamID)
-        )
-        #expect(await replacementWriter.isOpen)
-        #expect(await manager.openStreamCount == 1)
-        await releaseFirstChunk.open()
-        await #expect(throws: CancellationError.self) {
-            try await cancelledWrite.value
-        }
-
-        _ = await firstWrite.result
-        #expect(await replacementWriter.isOpen)
-        #expect(packetOrder.copy() == ["header", "chunk", "header"])
-        try await replacementWriter.close()
-        #expect(await manager.openStreamCount == 0)
-    }
-
-    @Test func cancellingQueuedCloseTerminalizesItsExactDescriptor() async throws {
-        let firstChunkEntered = OutgoingTestGate()
-        let releaseFirstChunk = OutgoingTestGate()
-        let packetOrder = StateSync<[String]>([])
-        let manager = OutgoingStreamManager { packet, _, _ in
-            switch packet.value {
-            case .streamHeader:
-                packetOrder.mutate { $0.append("header") }
-            case .streamChunk:
-                packetOrder.mutate { $0.append("chunk") }
-                await firstChunkEntered.open()
-                await releaseFirstChunk.wait()
-            case .streamTrailer:
-                packetOrder.mutate { $0.append("trailer") }
-            default:
-                break
-            }
-        } sendGenerationProvider: {
-            0
-        } encryptionProvider: {
-            .none
-        }
-        let streamID = "cancel-queued-close"
-        let writer = try await manager.streamText(
-            options: StreamTextOptions(topic: "cancel-queued-close", id: streamID)
-        )
-        let closeQueued = StateSync(false)
-        await manager.setOperationObserver { operation in
-            if operation == .close { closeQueued.mutate { $0 = true } }
-        }
-
-        let writeTask = Task { try await writer.write("payload") }
-        await firstChunkEntered.wait()
-        let closeTask = Task { try await writer.close() }
-        let queuedDeadline = Date().addingTimeInterval(5)
-        while !closeQueued.copy(), Date() < queuedDeadline {
-            await Task.yield()
-        }
-        #expect(closeQueued.copy())
-        closeTask.cancel()
-
-        await waitForDescriptorCleanup(in: manager)
-        #expect(await manager.openStreamCount == 0)
-        let replacementWriter = try await manager.streamText(
-            options: StreamTextOptions(topic: "cancel-queued-close", id: streamID)
-        )
-        #expect(await replacementWriter.isOpen)
-        #expect(await manager.openStreamCount == 1)
-        await releaseFirstChunk.open()
-        await #expect(throws: CancellationError.self) {
-            try await closeTask.value
-        }
-        _ = await writeTask.result
-
-        #expect(await replacementWriter.isOpen)
-        #expect(packetOrder.copy() == ["header", "chunk", "header"])
-        try await replacementWriter.close()
-        #expect(await manager.openStreamCount == 0)
-    }
-
-    @Test func cancellingV2HeaderTerminalizesItsExactDescriptor() async throws {
-        let headerEntered = OutgoingTestGate()
-        let releaseHeader = OutgoingTestGate()
-        let packetOrder = StateSync<[String]>([])
-        let manager = OutgoingStreamManager { packet, _, _ in
-            guard case .streamHeader = packet.value else { return }
-            packetOrder.mutate { $0.append("header") }
-            await headerEntered.open()
-            await releaseHeader.wait()
-        } sendGenerationProvider: {
-            0
-        } encryptionProvider: {
-            .none
-        }
-
-        let openTask = Task {
-            try await manager.streamText(
-                options: StreamTextOptions(topic: "cancel-v2-header")
-            )
-        }
-        await headerEntered.wait()
-        openTask.cancel()
-
-        await waitForDescriptorCleanup(in: manager)
-        #expect(packetOrder.copy() == ["header"])
-        #expect(await manager.openStreamCount == 0)
-        await releaseHeader.open()
-        _ = await openTask.result
-    }
-
-    @Test(arguments: [0, 1, 2, 3])
-    func cancellingEveryV2PayloadChunkTerminalizesItsExactDescriptor(
-        blockedChunkIndex: Int
-    ) async throws {
-        let chunkEntered = OutgoingTestGate()
-        let releaseChunk = OutgoingTestGate()
-        let observedChunkIndices = StateSync<[UInt64]>([])
-        let manager = OutgoingStreamManager { packet, _, _ in
-            guard case let .streamChunk(chunk) = packet.value else { return }
-            observedChunkIndices.mutate { $0.append(chunk.chunkIndex) }
-            guard chunk.chunkIndex == UInt64(blockedChunkIndex) else { return }
-            await chunkEntered.open()
-            await releaseChunk.wait()
-        } sendGenerationProvider: {
-            0
-        } encryptionProvider: {
-            .none
-        }
-        let writer = try await manager.streamText(
-            options: StreamTextOptions(topic: "cancel-v2-chunk-\(blockedChunkIndex)")
-        )
-        let payload = String(repeating: "x", count: 4 * 15 * 1024)
-
-        let writeTask = Task { try await writer.write(payload) }
-        await chunkEntered.wait()
-        writeTask.cancel()
-
-        await waitForDescriptorCleanup(in: manager)
-        #expect(observedChunkIndices.copy() == (0 ... UInt64(blockedChunkIndex)).map { $0 })
-        #expect(await manager.openStreamCount == 0)
-        await releaseChunk.open()
-        _ = await writeTask.result
-    }
-
-    @Test func cancellingV2TrailerTerminalizesItsExactDescriptor() async throws {
-        let trailerEntered = OutgoingTestGate()
-        let releaseTrailer = OutgoingTestGate()
-        let packetOrder = StateSync<[String]>([])
-        let manager = OutgoingStreamManager { packet, _, _ in
-            switch packet.value {
-            case .streamHeader:
-                packetOrder.mutate { $0.append("header") }
-            case .streamChunk:
-                packetOrder.mutate { $0.append("chunk") }
-            case .streamTrailer:
-                packetOrder.mutate { $0.append("trailer") }
-                await trailerEntered.open()
-                await releaseTrailer.wait()
-            default:
-                break
-            }
-        } sendGenerationProvider: {
-            0
-        } encryptionProvider: {
-            .none
-        }
-        let writer = try await manager.streamText(
-            options: StreamTextOptions(topic: "cancel-v2-trailer")
-        )
-        try await writer.write("payload")
-
-        let closeTask = Task { try await writer.close() }
-        await trailerEntered.wait()
-        closeTask.cancel()
-
-        await waitForDescriptorCleanup(in: manager)
-        #expect(packetOrder.copy() == ["header", "chunk", "trailer"])
-        #expect(await manager.openStreamCount == 0)
-        await releaseTrailer.open()
-        _ = await closeTask.result
-    }
-
-    private func waitForDescriptorCleanup(in manager: OutgoingStreamManager) async {
-        let deadline = Date().addingTimeInterval(5)
-        while await manager.openStreamCount != 0, Date() < deadline {
-            await Task.yield()
-        }
+        #expect(trailers.count == 1)
+        #expect(trailers.first?.reason == "")
+        #expect(trailers.first?.streamID == streamID)
     }
 }
 
-private actor OutgoingTestGate {
-    private var isOpen = false
-    private var waiters: [CheckedContinuation<Void, Never>] = []
+// MARK: - Options
 
-    func wait() async {
-        guard !isOpen else { return }
-        await withCheckedContinuation { waiters.append($0) }
+extension OutgoingStreamManagerTests {
+    @Test func optionDefaultsMapToFFIOptions() {
+        let text = LiveKit.StreamTextOptions(topic: "t").ffi
+        #expect(text.operationType == .create)
+        #expect(text.generated == false)
+        #expect(text.compress == true)
+        #expect(LiveKit.StreamByteOptions(topic: "t").ffi.compress == true)
     }
 
-    func open() {
-        isOpen = true
-        let continuations = waiters
-        waiters.removeAll()
-        continuations.forEach { $0.resume() }
+    @Test func textOptionsMapCompletelyToFFIOptions() {
+        let ffi = LiveKit.StreamTextOptions(
+            topic: "topic",
+            attributes: ["k": "v"],
+            destinationIdentities: [Participant.Identity(from: "alice"), Participant.Identity(from: "bob")],
+            id: "sid",
+            operationType: .reaction,
+            version: 2,
+            attachedStreamIDs: ["a"],
+            replyToStreamID: "r",
+            generated: true,
+            compress: false,
+        ).ffi
+
+        #expect(ffi.topic == "topic")
+        #expect(ffi.attributes == ["k": "v"])
+        #expect(ffi.destinationIdentities == ["alice", "bob"])
+        #expect(ffi.id == "sid")
+        #expect(ffi.operationType == .reaction)
+        #expect(ffi.version == 2)
+        #expect(ffi.attachedStreamIds == ["a"])
+        #expect(ffi.replyToStreamId == "r")
+        #expect(ffi.generated == true)
+        #expect(ffi.compress == false)
+    }
+
+    @Test func byteOptionsMapCompletelyToFFIOptions() {
+        let ffi = LiveKit.StreamByteOptions(
+            topic: "topic",
+            attributes: ["k": "v"],
+            destinationIdentities: [Participant.Identity(from: "alice")],
+            id: "sid",
+            mimeType: "application/pdf",
+            name: "doc.pdf",
+            totalSize: 99,
+            compress: false,
+        ).ffi
+
+        #expect(ffi.topic == "topic")
+        #expect(ffi.attributes == ["k": "v"])
+        #expect(ffi.destinationIdentities == ["alice"])
+        #expect(ffi.id == "sid")
+        #expect(ffi.mimeType == "application/pdf")
+        #expect(ffi.name == "doc.pdf")
+        #expect(ffi.totalLength == 99)
+        #expect(ffi.compress == false)
+    }
+
+    @Test(arguments: [
+        (LiveKit.TextStreamInfo.OperationType.create, LiveKitFFI.OperationType.create),
+        (.update, .update),
+        (.delete, .delete),
+        (.reaction, .reaction),
+    ])
+    func operationTypeMapsToFFI(_ operationType: LiveKit.TextStreamInfo.OperationType, _ expected: LiveKitFFI.OperationType) {
+        #expect(operationType.ffiValue == expected)
+        #expect(LiveKit.StreamTextOptions(topic: "t", operationType: operationType).ffi.operationType == expected)
+    }
+
+    /// The registry reports these to the core, which picks inline and compressed framing from them.
+    @Test(arguments: [
+        (LiveKit.ClientCapability.packetTrailer, LiveKitFFI.ClientCapability.packetTrailer),
+        (.compressionDeflateRaw, .compressionDeflateRaw),
+    ])
+    func capabilityMapsToFFI(_ capability: LiveKit.ClientCapability, _ expected: LiveKitFFI.ClientCapability) {
+        #expect(capability.ffiValue == expected)
     }
 }

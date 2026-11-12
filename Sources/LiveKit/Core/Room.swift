@@ -19,7 +19,7 @@
 import Combine
 import Foundation
 
-internal import LiveKitUniFFI
+internal import LiveKitFFI
 internal import LiveKitWebRTC
 
 #if canImport(Network)
@@ -141,20 +141,10 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
         self?.notify(bufferStatus: isLow, of: kind)
     })
 
-    lazy var incomingStreamManager = IncomingStreamManager { [weak self] receiveGeneration in
-        self?.incomingStreamIngressDidOverflow(receiveGeneration: receiveGeneration)
-    }
-    lazy var outgoingStreamManager = OutgoingStreamManager { [weak self] packet, sendGeneration, admission in
-        try await self?.send(
-            dataPacket: packet,
-            expectedDataChannelSendGeneration: sendGeneration,
-            admission: admission
-        )
-    } sendGenerationProvider: { [weak self] in
-        self?.publisherDataChannel.sendGeneration ?? 0
-    } encryptionProvider: { [weak self] in
-        self?.e2eeManager?.dataChannelEncryptionType ?? .none
-    }
+    // The data stream subsystem (the topic→handler registry, the outgoing manager, and packet
+    // routing) behind one reference. Staged as the room-scoped dependency tier, so it is present
+    // whatever the stage: stream handlers survive reconnects and can be registered before connect.
+    var dataStreams: DataStreams { _state.stage.dataStreams }
 
     // MARK: - Data Tracks
 
@@ -313,7 +303,8 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
 
         // Dependency plane: which per-connection / per-join subsystems exist. Payloads are staged
         // and retired only through its transitions (connect / configureTransports / cleanUp).
-        var stage: DependencyStage = .idle
+        // No default: the room-scoped tier every stage carries has to be supplied by `Room.init`.
+        var stage: DependencyStage
 
         var transport: TransportMode? { stage.join?.transport }
 
@@ -399,10 +390,17 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
         AudioManager.prepare()
         #endif
 
+        // Built before `super.init()`, so without the back-reference it needs; `attach` supplies
+        // that below, while the room is still unreachable to anything else.
+        let dataStreams = DataStreams()
         _state = StateSync(State(connectOptions: connectOptions ?? ConnectOptions(),
-                                 roomOptions: roomOptions ?? RoomOptions()))
+                                 roomOptions: roomOptions ?? RoomOptions(),
+                                 stage: .idle(IdleDependencies(dataStreams: dataStreams))))
 
         super.init()
+
+        dataStreams.attach(room: self)
+
         // log sdk & os versions
         log("sdk: \(LiveKitSDK.version), ffi: \(LiveKitSDK.ffiVersion), os: \(String(describing: Utils.os()))(\(Utils.osVersionString())), modelId: \(String(describing: Utils.modelIdentifier() ?? "unknown"))")
 
@@ -413,8 +411,6 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
         _ = localParticipant
         _ = subscriberDataChannel
         _ = publisherDataChannel
-        _ = incomingStreamManager
-        _ = outgoingStreamManager
         _ = preConnectBuffer
 
         signalClient._delegate.set(delegate: self)
@@ -540,7 +536,7 @@ public class Room: NSObject, @unchecked Sendable, ObservableObject, Loggable {
 
         // Connection-scoped subsystems (data tracks, the E2EE manager derived from the room
         // options): carried across full reconnects, released on disconnect.
-        let dependencies = ConnectionDependencies(room: self, roomOptions: state.roomOptions)
+        let dependencies = ConnectionDependencies(idle: state.stage.idle, room: self, roomOptions: state.roomOptions)
 
         try _state.mutate {
             try $0.stage.begin(dependencies)
@@ -734,17 +730,23 @@ extension Room {
         await activeParticipantCompleters.reset(throwing: disconnectError)
         // Fail open data streams so their handlers return; a handler blocked on a
         // reader that will never finish would stall its topic's ordered queue.
-        await incomingStreamManager.reset(to: nextDataPacketReceiveGeneration)
+        // The next generation goes in here, before the transports go down, so a
+        // packet the old transport still delivers cannot open a stream.
+        dataStreams.reset(to: nextDataPacketReceiveGeneration)
 
         await signalClient.cleanUp(withError: disconnectError)
         // Cancel all track stats timers before closing transports to prevent
         // stats collection from accessing destroyed WebRTC channels.
         cancelTimers()
         await cleanUpRTC(withError: disconnectError)
+        // Both branches fail open data streams (`dataStreams.reset()`) so their handlers return; a
+        // handler blocked on a reader that will never finish would stall its topic's ordered queue.
+        // After the transports are down, so no late packet can open a reader that outlives the abort.
         var retiredConnection: ConnectionDependencies?
         if isFullReconnect {
             // Data tracks are connection-scoped: across a full reconnect only their transport
-            // channels are swapped so published tracks can be republished.
+            // channels are swapped so published tracks can be republished. First after
+            // `cleanUpRTC`: until this re-arms the publish gates, the stale ones let a publish through.
             dataTracks?.handleTransportsTeardown(reconnecting: _state.isReconnectingWithMode != nil)
             // Remote data tracks outlive the reconnect — the subsystem re-attaches them to the
             // recreated participants. Detach them here, before `cleanUpParticipants` reports an
@@ -752,7 +754,10 @@ extension Room {
             for participant in _state.remoteParticipants.values {
                 participant.detachDataTracks()
             }
+            dataStreams.reset()
+            _state.stage.connection?.renewOutgoingDataStreams(room: self)
         } else {
+            dataStreams.reset()
             retiredConnection = _state.mutate { $0.stage.end() }.connection
         }
         await cleanUpParticipants(isFullReconnect: isFullReconnect)
@@ -788,6 +793,7 @@ extension Room {
                 connectionState: .disconnected,
                 reconnectTask: $0.reconnectTask,
                 disconnectError: LiveKitError.from(error: disconnectError),
+                stage: $0.stage,
             )
         }
     }
@@ -861,7 +867,7 @@ extension Room {
     func setupRpc() async {
         await rpcClient.attach(to: self)
         await rpcServer.attach(to: self)
-        await incomingStreamManager.registerTextStreamHandlerIfNeeded(
+        dataStreams.registerTextStreamHandlerIfNeeded(
             for: RpcStreamTopic.request,
             limits: RpcStreamLimits.incomingRequest,
             onStreamRejected: { [weak rpcServer] rejection in
@@ -871,7 +877,7 @@ extension Room {
         ) { [weak rpcServer] reader, identity in
             await rpcServer?.handleIncomingRequestStream(reader: reader, callerIdentity: identity)
         }
-        await incomingStreamManager.registerTextStreamHandlerIfNeeded(
+        dataStreams.registerTextStreamHandlerIfNeeded(
             for: RpcStreamTopic.response,
             limits: RpcStreamLimits.incomingResponse,
             onStreamRejected: { [weak rpcClient] rejection in
@@ -938,7 +944,7 @@ extension Room {
             dataPacketReceiveGeneration: receiveGeneration,
             participant: participant
         )
-        await incomingStreamManager.closeStreams(
+        dataStreams.closeStreams(
             from: identity,
             participantSid: sid,
             dataPacketReceiveGeneration: receiveGeneration
@@ -1045,6 +1051,7 @@ extension Room: DataChannelDelegate {
     func dataChannel(
         _: DataChannelPair,
         didReceiveDataPacket dataPacket: Livekit_DataPacket,
+        serialized: Data?,
         encryptionType: EncryptionType,
         receiveGeneration: UInt64,
         receivedAtContinuousTimeNanoseconds: UInt64
@@ -1096,31 +1103,18 @@ extension Room: DataChannelDelegate {
                 dataPacketReceiveGeneration: receiveGeneration,
                 receivedAtContinuousTimeNanoseconds: receivedAtContinuousTimeNanoseconds
             )
-        case let .streamHeader(header):
-            incomingStreamManager.handle(.header(
-                header,
-                dataPacket.participantIdentity,
-                dataPacket.participantSid.isEmpty ? nil : Participant.Sid(from: dataPacket.participantSid),
-                receiveGeneration,
-                encryptionType,
-                receivedAtContinuousTimeNanoseconds
-            ))
-        case let .streamChunk(chunk):
-            incomingStreamManager.handle(.chunk(
-                chunk,
-                dataPacket.participantIdentity,
-                dataPacket.participantSid.isEmpty ? nil : Participant.Sid(from: dataPacket.participantSid),
-                receiveGeneration,
-                encryptionType
-            ))
-        case let .streamTrailer(trailer):
-            incomingStreamManager.handle(.trailer(
-                trailer,
-                dataPacket.participantIdentity,
-                dataPacket.participantSid.isEmpty ? nil : Participant.Sid(from: dataPacket.participantSid),
-                receiveGeneration,
-                encryptionType
-            ))
+        case .streamHeader, .streamChunk, .streamTrailer:
+            // The whole (already-decrypted, deduped) packet goes to admission, which checks its
+            // sender and receive generation and then hands it to the UniFFI incoming manager. The
+            // encryption type travels beside it because decryption consumed the packet field that
+            // carried it.
+            dataStreams.handleIncoming(
+                dataPacket,
+                serialized: serialized,
+                encryptionType: encryptionType,
+                receiveGeneration: receiveGeneration,
+                receivedAtContinuousTimeNanoseconds: receivedAtContinuousTimeNanoseconds
+            )
         default: return
         }
     }

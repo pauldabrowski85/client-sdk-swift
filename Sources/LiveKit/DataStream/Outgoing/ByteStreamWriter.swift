@@ -16,57 +16,78 @@
 
 import Foundation
 
+internal import LiveKitFFI
+
 /// Asynchronously write to an open byte stream.
+///
+/// - Important: Call and await ``close(reason:)`` when you are done. Releasing a writer without
+///   closing it does not send the end of the stream, so receivers keep waiting for it until you
+///   disconnect.
 @objcMembers
 public final class ByteStreamWriter: NSObject, Sendable {
     /// Information about the outgoing byte stream.
     public let info: ByteStreamInfo
 
-    private let destination: StreamWriterDestination
+    private let writer: LiveKitFFI.ByteStreamWriter
 
-    /// Whether or not the stream is still open.
+    /// What this stream's packets are sent with; it also keeps the cause of a failed delivery.
+    private let context: OutgoingStreamSendContext?
+
+    /// Whether or not the stream is still open. Reflects the FFI writer's state, so it becomes
+    /// `false` once the stream is closed locally or a send fails (e.g. the room disconnected).
     public var isOpen: Bool {
-        get async { await destination.isOpen }
+        get async { await writer.isOpen() }
     }
 
     /// Write data to the stream.
     ///
     /// - Parameter data: Data to be sent.
-    /// - Throws: Throws an error if the stream has been closed or data
-    ///   cannot be sent to remote participants.
+    /// - Throws: ``StreamError/alreadyClosed`` if the stream is closed, or
+    ///   ``StreamError/sendFailed`` or another ``StreamError`` if the data cannot be delivered, for
+    ///   example because the room disconnected. Then ``isOpen`` is `false`. `CancellationError` at
+    ///   once if the calling task is cancelled, but the write can still go out.
     ///
     public func write(_ data: Data) async throws {
-        try await destination.write(data)
+        try checkNotCancelled()
+        do {
+            try await abandoningOnCancel { [writer] in try await writer.write(data: data) }
+        } catch let error as LiveKitFFI.DataStreamError {
+            throw context?.sendFailure(for: error) ?? StreamError(error)
+        }
     }
 
     /// Close the stream.
     ///
     /// - Parameter reason: A textual description of why the stream is being closed. Absense
     ///   of a reason indicates a normal closure.
-    /// - Throws: Throws an error if the stream has already been closed or closure
-    ///   cannot be communicated to remote participants.
+    /// - Throws: ``StreamError/alreadyClosed`` if the stream is already closed, or another
+    ///   ``StreamError`` if the end of the stream cannot be delivered. `CancellationError` at once
+    ///   if the calling task is cancelled, but the stream can still close.
     ///
     public func close(reason: String? = nil) async throws {
-        try await destination.close(reason: reason)
-    }
-
-    init(info: ByteStreamInfo, destination: StreamWriterDestination) {
-        self.info = info
-        self.destination = destination
-    }
-}
-
-extension ByteStreamWriter {
-    /// Write the contents of the file located at the given URL to the stream.
-    func write(contentsOf fileURL: URL) async throws {
-        try await Task { [weak self] in
-            guard let self else { return }
-            let reader = try AsyncFileStream(readingFrom: fileURL)
-            for try await chunk in reader.chunks() {
-                try await write(chunk)
+        try checkNotCancelled()
+        do {
+            try await abandoningOnCancel { [writer] in
+                if let reason {
+                    try await writer.closeWithReason(reason: reason)
+                } else {
+                    try await writer.close()
+                }
             }
-        }.value
+        } catch let error as LiveKitFFI.DataStreamError {
+            throw context?.sendFailure(for: error) ?? StreamError(error)
+        }
     }
 
-    private static let fileReadChunkSize = 4096
+    init(_ writer: LiveKitFFI.ByteStreamWriter, encryptionType: EncryptionType, context: OutgoingStreamSendContext? = nil) {
+        self.writer = writer
+        self.context = context
+        info = ByteStreamInfo(writer.info(), encryptionType: encryptionType)
+    }
+
+    /// A cancelled stream gave its ID back. The core does not know, so what it would still send
+    /// could leave with the context of a later stream that took the ID.
+    private func checkNotCancelled() throws {
+        if context?.isCancelled == true { throw StreamError.terminated }
+    }
 }

@@ -68,6 +68,7 @@ struct RoomLocalTrackAutoRepublishTests {
         ))
         let oldGeneration = room.dataPacketReceiveGeneration
         let connection = ConnectionDependencies(
+            idle: room._state.stage.idle,
             room: room,
             roomOptions: room._state.roomOptions
         )

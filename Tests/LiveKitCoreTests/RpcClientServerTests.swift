@@ -251,7 +251,8 @@ struct RpcClientTests {
             try await RpcTestSupport.installRemote(in: room, identity: destination, clientProtocol: .v0)
             room.publisherDataChannel = MockDataChannelPair { _ in }
 
-            await room.rpcClient.setAfterPublish { requestId in
+            await room.rpcClient.setAfterPublish { [weak room] requestId in
+                guard let room else { return }
                 // Step 1: deliver the response, resolving the completer with "real-response".
                 await RpcTestSupport.deliverResponse(
                     in: room,
@@ -387,7 +388,8 @@ struct RpcClientTests {
 
             room.publisherDataChannel = MockDataChannelPair { _ in }
 
-            await room.rpcClient.setAfterPublish { requestId in
+            await room.rpcClient.setAfterPublish { [weak room] requestId in
+                guard let room else { return }
                 await collector.append(requestId)
                 await RpcTestSupport.deliverAck(in: room, requestId: requestId, from: destination)
                 await RpcTestSupport.deliverResponse(
@@ -420,6 +422,353 @@ struct RpcClientTests {
             let observedIds = await collector.values
             #expect(observedIds.count == 5)
             #expect(Set(observedIds).count == 5) // distinct
+            #expect(await room.rpcClient.pendingCount == 0)
+        }
+    }
+
+    // MARK: - Cancellation
+
+    enum RpcWait: CaseIterable {
+        case ack, response
+    }
+
+    /// A call in flight, and a completer that receives what it returns.
+    struct WaitingCall {
+        let requestId: String
+        let completer: AsyncCompleter<String>
+        let task: AnyTaskCancellable
+        let result: AsyncCompleter<Result<String, Error>>
+    }
+
+    private static let destination = Participant.Identity(from: "test-destination")
+
+    /// Starts a v1 call that no remote answers and returns once the call waits on its completer.
+    /// With `acked`, the ack arrives first, so the call waits for the response only.
+    private func startWaitingCall(in room: Room, acked: Bool) async throws -> WaitingCall {
+        // A call needs the exact connection of its destination; `.v0` keeps it on packets.
+        try await RpcTestSupport.installRemote(in: room, identity: Self.destination, clientProtocol: .v0)
+        room.publisherDataChannel = MockDataChannelPair { _ in }
+        let published = AsyncCompleter<String>(label: "RPC published", defaultTimeout: 5)
+        await room.rpcClient.setAfterPublish { requestId in
+            if acked { await RpcTestSupport.deliverAck(in: room, requestId: requestId, from: Self.destination) }
+            published.resume(returning: requestId)
+        }
+
+        let result = AsyncCompleter<Result<String, Error>>(label: "RPC returned", defaultTimeout: 5)
+        let task = Task {
+            do {
+                let response = try await room.localParticipant.performRpc(
+                    destinationIdentity: Self.destination,
+                    method: "method",
+                    payload: "x",
+                    responseTimeout: 30,
+                )
+                result.resume(returning: .success(response))
+            } catch {
+                result.resume(returning: .failure(error))
+            }
+        }.cancellable()
+
+        let requestId = try await published.wait()
+        let completer = try #require(await room.rpcClient.pendingResponses[requestId]?.completer)
+        await completer.waitForRegistration(timeout: 5)
+        // The hook captures the room, which holds the hook.
+        await room.rpcClient.setAfterPublish(nil)
+        #expect(await room.rpcClient.pendingAcks.contains(requestId) == !acked)
+        return WaitingCall(requestId: requestId, completer: completer, task: task, result: result)
+    }
+
+    /// Expects that the manager holds no pending ack, pending response, or ack watchdog.
+    private func expectNothingPending(in room: Room, sourceLocation: SourceLocation = #_sourceLocation) async {
+        #expect(await room.rpcClient.pendingAcks.isEmpty, sourceLocation: sourceLocation)
+        #expect(await room.rpcClient.pendingResponses.isEmpty, sourceLocation: sourceLocation)
+        #expect(await room.rpcClient.ackWatchdogs.isEmpty, sourceLocation: sourceLocation)
+    }
+
+    /// Cancelling the task that awaits `performRpc` while the call waits for the ack or the
+    /// response throws `CancellationError` at once and leaves no pending state.
+    @Test(arguments: RpcWait.allCases)
+    func performRpcThrowsCancellationErrorWhenCancelled(waitingFor wait: RpcWait) async throws {
+        try await TestEnvironment.withRoom { room in
+            let call = try await startWaitingCall(in: room, acked: wait == .response)
+            call.task.cancel()
+
+            await #expect(throws: CancellationError.self) { try await call.result.wait().get() }
+            await expectNothingPending(in: room)
+        }
+    }
+
+    /// An ack, a response packet, or a response stream that arrives after its call was cancelled
+    /// finds nothing to resolve and leaves no pending state.
+    @Test func performRpcDropsLateResponseAfterCancel() async throws {
+        try await TestEnvironment.withRoom { room in
+            let call = try await startWaitingCall(in: room, acked: false)
+            call.task.cancel()
+            await #expect(throws: CancellationError.self) { try await call.result.wait().get() }
+
+            await RpcTestSupport.deliverAck(in: room, requestId: call.requestId, from: Self.destination)
+            await RpcTestSupport.deliverResponse(in: room, requestId: call.requestId, payload: "late", error: nil, from: Self.destination)
+            await room.rpcClient.handleIncomingResponseStream(
+                reader: RpcTestSupport.makeResponseReader(in: room, from: Self.destination, requestId: call.requestId, payload: "late"),
+                senderIdentity: Self.destination,
+            )
+
+            await expectNothingPending(in: room)
+        }
+    }
+
+    /// A response stream for a call that is no longer pending is dropped unread, so a stream that
+    /// fails to read cannot report its failure as an error.
+    @Test func performRpcDropsLateResponseStreamUnread() async throws {
+        try await TestEnvironment.withRoom { room in
+            let call = try await startWaitingCall(in: room, acked: true)
+            call.task.cancel()
+            await #expect(throws: CancellationError.self) { try await call.result.wait().get() }
+
+            let reader = RpcTestSupport.makeResponseReader(in: room, from: Self.destination, requestId: call.requestId, error: StreamError.terminated)
+            await room.rpcClient.handleIncomingResponseStream(reader: reader, senderIdentity: Self.destination)
+
+            #expect(reader.reads.copy() == 0)
+            await expectNothingPending(in: room)
+        }
+    }
+
+    /// A call whose task is already cancelled when it starts throws `CancellationError`, sends no
+    /// request, and leaves nothing pending, by the packet (`.v0`) or the stream (`.v1`) transport.
+    @Test(arguments: [ClientProtocol.v0, .v1])
+    func performRpcCancelledBeforeStartSendsNothing(remoteProtocol: ClientProtocol) async throws {
+        try await TestEnvironment.withRoom { room in
+            try await RpcTestSupport.installRemote(in: room, identity: Self.destination, clientProtocol: remoteProtocol)
+            let sent = StateSync(0)
+            room.publisherDataChannel = MockDataChannelPair { _ in sent.mutate { $0 += 1 } }
+
+            let result = AsyncCompleter<Result<String, Error>>(label: "RPC returned", defaultTimeout: 5)
+            Task {
+                withUnsafeCurrentTask { $0?.cancel() }
+                do {
+                    let response = try await room.localParticipant.performRpc(
+                        destinationIdentity: Self.destination,
+                        method: "method",
+                        payload: "x",
+                    )
+                    result.resume(returning: .success(response))
+                } catch {
+                    result.resume(returning: .failure(error))
+                }
+            }
+
+            await #expect(throws: CancellationError.self) { try await result.wait().get() }
+            #expect(sent.copy() == 0)
+            await expectNothingPending(in: room)
+        }
+    }
+
+    /// A cancel while a v1 request waits for the data channel to open throws `CancellationError`,
+    /// not the channel's `LiveKitError(.cancelled)`, and leaves nothing pending.
+    @Test func performRpcCancelledDuringPublishThrowsCancellationError() async throws {
+        try await TestEnvironment.withRoom { room in
+            try await RpcTestSupport.installRemote(in: room, identity: Self.destination, clientProtocol: .v0)
+            let channel = UnopenedDataChannelPair { _ in }
+            room.publisherDataChannel = channel
+
+            let result = AsyncCompleter<Result<String, Error>>(label: "RPC returned", defaultTimeout: 5)
+            let task = Task {
+                do {
+                    let response = try await room.localParticipant.performRpc(
+                        destinationIdentity: Self.destination,
+                        method: "method",
+                        payload: "x",
+                    )
+                    result.resume(returning: .success(response))
+                } catch {
+                    result.resume(returning: .failure(error))
+                }
+            }
+            await channel.opened.waitForRegistration(timeout: 5)
+            #expect(await room.rpcClient.pendingResponses.count == 1)
+            task.cancel()
+
+            await #expect(throws: CancellationError.self) { try await result.wait().get() }
+            await expectNothingPending(in: room)
+        }
+    }
+
+    /// A response stream whose read fails after its call was cancelled finds the call gone. The
+    /// handler returns without resuming the call's completer again, and nothing is left pending.
+    @Test func performRpcIgnoresReadFailureAfterCancel() async throws {
+        try await TestEnvironment.withRoom { room in
+            let call = try await startWaitingCall(in: room, acked: true)
+            let reader = GatedFailingReader(RpcTestSupport.makeResponseReader(in: room, from: Self.destination, requestId: call.requestId).info)
+            let handled = AsyncCompleter<Void>(label: "Response stream handled", defaultTimeout: 5)
+            Task {
+                await room.rpcClient.handleIncomingResponseStream(reader: reader, senderIdentity: Self.destination)
+                handled.resume(returning: ())
+            }
+            try await reader.entered.wait()
+
+            call.task.cancel()
+            await #expect(throws: CancellationError.self) { try await call.result.wait().get() }
+            await expectNothingPending(in: room)
+
+            reader.release.resume(returning: ())
+            try await handled.wait()
+
+            #expect(reader.reads.copy() == 1)
+            await expectNothingPending(in: room)
+            // A wait with no time left returns a cached result at once, so it shows whether
+            // anything resumed the cancelled call's completer.
+            let error = await #expect(throws: LiveKitError.self) { try await call.completer.wait(timeout: 0) }
+            #expect(error?.type == .timedOut)
+        }
+    }
+
+    /// The same waiting call, left uncancelled, still returns the response that ends its wait.
+    @Test func performRpcReturnsResponseAfterWaiting() async throws {
+        try await TestEnvironment.withRoom { room in
+            let call = try await startWaitingCall(in: room, acked: true)
+            await RpcTestSupport.deliverResponse(in: room, requestId: call.requestId, payload: "response", error: nil, from: Self.destination)
+
+            #expect(try await call.result.wait().get() == "response")
+            await expectNothingPending(in: room)
+        }
+    }
+
+    // MARK: - v2 caller timing
+
+    /// A v2 remote that acks and responds the moment the request is published resolves the call
+    /// and leaves nothing pending, so a second call works and gets a fresh request ID.
+    @Test func v2ResponseImmediatelyAfterPublish() async throws {
+        try await TestEnvironment.withRoom { room in
+            let destination = Participant.Identity(from: "v2-destination")
+            try await RpcTestSupport.installRemote(in: room, identity: destination, clientProtocol: .v2)
+            room.publisherDataChannel = MockDataChannelPair { _ in }
+            let requestIds = TestStringCollector()
+
+            await room.rpcClient.setAfterPublish { [weak room] requestId in
+                guard let room else { return }
+                await requestIds.append(requestId)
+                await RpcTestSupport.deliverAck(in: room, requestId: requestId, from: destination)
+                let reader = RpcTestSupport.makeResponseReader(in: room, from: destination, requestId: requestId, payload: "response-\(requestId)")
+                await room.rpcClient.handleIncomingResponseStream(reader: reader, senderIdentity: destination)
+            }
+
+            let first = try await room.localParticipant.performRpc(destinationIdentity: destination, method: "fast", payload: "p1")
+            let second = try await room.localParticipant.performRpc(destinationIdentity: destination, method: "fast", payload: "p2")
+
+            let ids = await requestIds.values
+            #expect(ids.count == 2)
+            #expect(Set(ids).count == 2)
+            #expect([first, second] == ids.map { "response-\($0)" })
+            #expect(await room.rpcClient.pendingCount == 0)
+        }
+    }
+
+    /// The ack and the response arrive while the request stream is still being published: the
+    /// mocked channel handles them before the header's send returns. The pending call is registered
+    /// before the publish starts, so it still matches.
+    @Test func v2ResponseArrivesDuringPublish() async throws {
+        try await TestEnvironment.withRoom { room in
+            let destination = Participant.Identity(from: "v2-destination")
+            try await RpcTestSupport.installRemote(in: room, identity: destination, clientProtocol: .v2)
+            let responded = StateSync(false)
+
+            room.publisherDataChannel = AwaitingDataChannelPair { [weak room] packet in
+                guard let room, case let .streamHeader(header) = packet.value, header.topic == RpcStreamTopic.request,
+                      let requestId = header.attributes[RpcStreamAttribute.requestId] else { return }
+                await RpcTestSupport.deliverAck(in: room, requestId: requestId, from: destination)
+                let reader = RpcTestSupport.makeResponseReader(in: room, from: destination, requestId: requestId, payload: "during")
+                await room.rpcClient.handleIncomingResponseStream(reader: reader, senderIdentity: destination)
+                responded.mutate { $0 = true }
+            }
+            // Runs once the publish has returned.
+            let respondedBeforePublishEnded = StateSync<Bool?>(nil)
+            await room.rpcClient.setAfterPublish { _ in
+                respondedBeforePublishEnded.mutate { $0 = responded.copy() }
+            }
+
+            let response = try await room.localParticipant.performRpc(destinationIdentity: destination, method: "midflight", payload: "p")
+            #expect(response == "during")
+            #expect(responded.copy())
+            // The call was already answered when its publish returned, so the hook did not run.
+            #expect(respondedBeforePublishEnded.copy() == nil)
+            #expect(await room.rpcClient.pendingCount == 0)
+        }
+    }
+
+    /// An ack and response that arrive after the ack watchdog failed the call with
+    /// `connectionTimeout` change nothing: the call keeps that error and nothing is left pending.
+    @Test func v2LateAckAfterConnectionTimeoutIsIgnored() async throws {
+        try await TestEnvironment.withRoom { room in
+            let destination = Participant.Identity(from: "v2-destination")
+            try await RpcTestSupport.installRemote(in: room, identity: destination, clientProtocol: .v2)
+            room.publisherDataChannel = MockDataChannelPair { _ in }
+            let requestIds = TestStringCollector()
+
+            await room.rpcClient.setAfterPublish { [weak room] requestId in
+                guard let room else { return }
+                await requestIds.append(requestId)
+                await room.rpcClient.fireAckTimeoutIfPending(requestId: requestId)
+            }
+
+            let error = try #require(await #expect(throws: RpcError.self) {
+                _ = try await room.localParticipant.performRpc(destinationIdentity: destination, method: "late", payload: "p")
+            })
+            #expect(error.code == RpcError.BuiltInError.connectionTimeout.code)
+
+            let requestId = try #require(await requestIds.values.first)
+            await RpcTestSupport.deliverAck(in: room, requestId: requestId, from: destination)
+            let reader = RpcTestSupport.makeResponseReader(in: room, from: destination, requestId: requestId, payload: "too-late")
+            await room.rpcClient.handleIncomingResponseStream(reader: reader, senderIdentity: destination)
+            #expect(await room.rpcClient.pendingCount == 0)
+        }
+    }
+
+    /// Five concurrent calls to a v2 remote each get the response to their own request: the remote
+    /// answers each request stream with its own payload.
+    @Test func v2ConcurrentCallsGetTheirOwnResponses() async throws {
+        try await TestEnvironment.withRoom { room in
+            let destination = Participant.Identity(from: "v2-destination")
+            try await RpcTestSupport.installRemote(in: room, identity: destination, clientProtocol: .v2)
+            let requestIdsByStream = StateSync<[String: String]>([:])
+            let payloadsByRequest = StateSync<[String: String]>([:])
+
+            room.publisherDataChannel = MockDataChannelPair { packet in
+                switch packet.value {
+                case let .streamHeader(header) where header.topic == RpcStreamTopic.request:
+                    guard let requestId = header.attributes[RpcStreamAttribute.requestId] else { return }
+                    requestIdsByStream.mutate { $0[header.streamID] = requestId }
+                case let .streamChunk(chunk):
+                    guard let requestId = requestIdsByStream.copy()[chunk.streamID] else { return }
+                    payloadsByRequest.mutate { $0[requestId, default: ""] += String(bytes: chunk.content, encoding: .utf8) ?? "" }
+                default:
+                    break
+                }
+            }
+
+            // Runs once the request stream has been published, so its whole payload is recorded.
+            await room.rpcClient.setAfterPublish { [weak room] requestId in
+                guard let room else { return }
+                let payload = payloadsByRequest.copy()[requestId] ?? ""
+                await RpcTestSupport.deliverAck(in: room, requestId: requestId, from: destination)
+                let reader = RpcTestSupport.makeResponseReader(in: room, from: destination, requestId: requestId, payload: "response-\(payload)")
+                await room.rpcClient.handleIncomingResponseStream(reader: reader, senderIdentity: destination)
+            }
+
+            let responses = try await withThrowingTaskGroup(of: (Int, String).self) { group in
+                for index in 1 ... 5 {
+                    group.addTask {
+                        try await (index, room.localParticipant.performRpc(destinationIdentity: destination, method: "echo", payload: "request-\(index)"))
+                    }
+                }
+                var responses: [Int: String] = [:]
+                for try await (index, response) in group {
+                    responses[index] = response
+                }
+                return responses
+            }
+
+            #expect(responses == Dictionary(uniqueKeysWithValues: (1 ... 5).map { ($0, "response-request-\($0)") }))
+            #expect(Set(payloadsByRequest.copy().keys).count == 5)
             #expect(await room.rpcClient.pendingCount == 0)
         }
     }
@@ -735,7 +1084,8 @@ struct RpcAbsoluteDeadlineTests {
             (error as? RpcError)?.code == RpcError.BuiltInError.responseTimeout.code
         }
         channel.releaseSends()
-        await Task.yield()
+        // A withdrawn stream keeps its ID until the core is done with the call that opened it.
+        await waitUntil { await room.outgoingStreamManager.openStreamCount == 0 }
 
         #expect(packets.copy().isEmpty)
         #expect(await room.rpcClient.pendingCount == 0)
@@ -950,9 +1300,11 @@ struct RpcAbsoluteDeadlineTests {
         #expect(packets.copy().count == 1)
         #expect(await room.rpcClient.pendingCount == 0)
         #expect(await room.outgoingStreamManager.openStreamCount == 0)
-        #expect(await room.rpcClient.activePublicationTaskCount == 1)
+        // Since 2.19.0 the core sends a stream's packets. Its call returns as soon as the
+        // publication is cancelled, and the send still held by the channel is the core's own.
+        let activePublications = await room.rpcClient.activePublicationTaskCount
+        #expect(activePublications == 0)
         await channel.releaseSends()
-        await waitUntil { await room.rpcClient.activePublicationTaskCount == 0 }
         _ = await call.result
         #expect(packets.copy().count == 1)
         #expect(await room.outgoingStreamManager.openStreamCount == 0)
@@ -991,9 +1343,10 @@ struct RpcAbsoluteDeadlineTests {
                     5,
                     0
                 )
-            } catch let error as LiveKitError {
-                observedCancellation.mutate { $0 = error.type == .cancelled }
-            } catch {}
+            } catch {
+                // Since 2.19.0 a cancelled caller gets `CancellationError`.
+                observedCancellation.mutate { $0 = error is CancellationError }
+            }
         }
         _ = try await channel.preflightPassed.wait()
         call.cancel()
@@ -1010,10 +1363,15 @@ struct RpcAbsoluteDeadlineTests {
         #expect(observedCancellation.copy())
         #expect(packets.copy().isEmpty)
         #expect(await room.rpcClient.pendingCount == 0)
-        #expect(await room.outgoingStreamManager.openStreamCount == 0)
-        #expect(await room.rpcClient.activePublicationTaskCount == 1)
+        // A packet publication waits in the channel. A stream publication is the core's, whose
+        // call returns as soon as it is cancelled; the withdrawn stream keeps its ID until the
+        // core is done with that call.
+        #expect(await room.outgoingStreamManager.openStreamCount == (clientProtocol == .v0 ? 0 : 1))
+        let activePublications = await room.rpcClient.activePublicationTaskCount
+        #expect(activePublications == (clientProtocol == .v0 ? 1 : 0))
         await channel.releaseSends()
         await waitUntil { await room.rpcClient.activePublicationTaskCount == 0 }
+        await waitUntil { await room.outgoingStreamManager.openStreamCount == 0 }
         _ = await call.result
         #expect(packets.copy().isEmpty)
         #expect(await room.outgoingStreamManager.openStreamCount == 0)
@@ -1544,6 +1902,7 @@ struct RpcServerTests {
         room.dataChannel(
             MockDataChannelPair { _ in },
             didReceiveDataPacket: packet,
+            serialized: nil,
             encryptionType: .none,
             receiveGeneration: room.dataPacketReceiveGeneration,
             receivedAtContinuousTimeNanoseconds: RpcContinuousClock.nowNanoseconds()
@@ -2014,7 +2373,7 @@ struct RpcServerTests {
         func makeReader(
             publisherParticipantSid: Participant.Sid,
             dataPacketReceiveGeneration: UInt64
-        ) -> TextStreamReader {
+        ) -> StubTextStreamReader {
             switch self {
             case .missingMethod:
                 RpcTestSupport.makeRequestReader(
@@ -2270,7 +2629,7 @@ struct RpcStreamResourceLimitTests {
             .none
         ))
         room.incomingStreamManager.handle(.chunk(
-            chunk(id: streamID, count: 1),
+            chunk(id: streamID, count: 1, index: 1),
             caller.stringValue,
             sid,
             room.dataPacketReceiveGeneration,
@@ -2339,7 +2698,7 @@ struct RpcStreamResourceLimitTests {
                 .none
             ))
             room.incomingStreamManager.handle(.chunk(
-                chunk(id: streamID, count: 1),
+                chunk(id: streamID, count: 1, index: 1),
                 self.caller.stringValue,
                 sid,
                 room.dataPacketReceiveGeneration,
@@ -2456,10 +2815,9 @@ struct RpcStreamResourceLimitTests {
         _ = try await responseAdmitted.wait()
         let cancellationStartedAt = RpcContinuousClock.nowNanoseconds()
         call.cancel()
-        await #expect {
+        // Since 2.19.0 a cancelled caller gets `CancellationError`.
+        await #expect(throws: CancellationError.self) {
             try await call.value
-        } throws: { error in
-            (error as? LiveKitError)?.type == .cancelled
         }
         #expect(RpcContinuousClock.nowNanoseconds() - cancellationStartedAt < 1_000_000_000)
         await waitUntil { await room.incomingStreamManager.openStreamCount == 0 }
@@ -3219,8 +3577,12 @@ struct RpcStreamResourceLimitTests {
         )
         let sid = try #require(participant.sid)
         let overloadResponses = StateSync<[Livekit_RpcError]>([])
+        // Since 2.19.0 the core hands a connection's stream packets to the channel one batch at
+        // a time, so a held response stream holds the ones behind it inside the core. Packet
+        // responses still reach the channel side by side.
+        let blockedTarget = clientProtocol == .v1 ? 1 : RpcInvocationLimits.maximumInFlightPerConnection
         let channel = RpcBlockedResponsePublicationDataChannelPair(
-            blockedTarget: RpcInvocationLimits.maximumInFlightPerConnection
+            blockedTarget: blockedTarget
         ) { packet in
             guard case let .rpcResponse(response) = packet.value,
                   case let .error(error) = response.value,
@@ -3245,12 +3607,17 @@ struct RpcStreamResourceLimitTests {
             )
         }
         _ = try await channel.blockedTargetReached.wait()
-
-        #expect(channel.blockedResponseCount.copy() == RpcInvocationLimits.maximumInFlightPerConnection)
-        #expect(room.rpcServer.activeInvocationCount == RpcInvocationLimits.maximumInFlightPerConnection)
         let expectedOpenStreamCount = clientProtocol == .v1
             ? RpcInvocationLimits.maximumInFlightPerConnection
             : 0
+        await waitUntil {
+            let openStreamCount = await room.outgoingStreamManager.openStreamCount
+            return room.rpcServer.activeInvocationCount == RpcInvocationLimits.maximumInFlightPerConnection &&
+                openStreamCount == expectedOpenStreamCount
+        }
+
+        #expect(channel.blockedResponseCount.copy() == blockedTarget)
+        #expect(room.rpcServer.activeInvocationCount == RpcInvocationLimits.maximumInFlightPerConnection)
         #expect(await room.outgoingStreamManager.openStreamCount == expectedOpenStreamCount)
 
         room.rpcServer.enqueueIncomingRequest(
@@ -3267,7 +3634,7 @@ struct RpcStreamResourceLimitTests {
         await waitUntil { overloadResponses.copy().count == 1 }
 
         #expect(overloadResponses.copy().count == 1)
-        #expect(channel.blockedResponseCount.copy() == RpcInvocationLimits.maximumInFlightPerConnection)
+        #expect(channel.blockedResponseCount.copy() == blockedTarget)
         #expect(room.rpcServer.activeInvocationCount == RpcInvocationLimits.maximumInFlightPerConnection)
         #expect(await room.outgoingStreamManager.openStreamCount == expectedOpenStreamCount)
 
@@ -3552,9 +3919,11 @@ struct RpcStreamResourceLimitTests {
         }
     }
 
-    private func chunk(id: String, count: Int) -> Livekit_DataStream.Chunk {
+    private func chunk(id: String, count: Int, index: UInt64 = 0) -> Livekit_DataStream.Chunk {
         Livekit_DataStream.Chunk.with {
             $0.streamID = id
+            // The core takes a stream's chunks in order of their index, and drops a repeated one.
+            $0.chunkIndex = index
             $0.content = Data(repeating: 0x61, count: count)
         }
     }
@@ -3646,7 +4015,7 @@ enum RpcStreamPublicationBoundary: CaseIterable, CustomTestStringConvertible, Se
         }
     }
 
-    var nextOperation: OutgoingStreamManager.OperationKind {
+    var nextOperation: OutgoingStreamOperationKind {
         switch self {
         case .afterHeader: .write
         case .afterPayload: .close
@@ -3918,6 +4287,8 @@ private enum RpcTestSupport {
             // Since 2.18.0 a send on a room that is not connected fails before it reaches the channel.
             $0.connectionState = .connected
         }
+        // Since 2.19.0 the data stream managers belong to a connection.
+        try room.ensureDataStreamConnection()
         return remote
     }
 
@@ -3984,41 +4355,29 @@ private enum RpcTestSupport {
 
     /// Builds a v2 request-stream reader. Pass `nil` for any attribute to omit
     /// it from the wire — used by negative tests that exercise the missing-attr
-    /// error paths in `RpcServerManager.handleIncomingRequestStream`.
+    /// error paths in `RpcServerManager.handleIncomingRequestStream`. Pass an
+    /// `error` to simulate a peer-closed or decrypt-failed stream, which
+    /// exercises the `APPLICATION_ERROR` fast-fail branch.
     static func makeRequestReader(
         requestId: String?,
         method: String?,
-        payload: String,
+        payload: String = "",
         timeoutMs: UInt32?,
         version: String? = RPC_STREAM_VERSION,
         publisherParticipantSid: Participant.Sid? = nil,
         dataPacketReceiveGeneration: UInt64? = nil,
-    ) -> TextStreamReader {
+        error: Error? = nil,
+    ) -> StubTextStreamReader {
         var attributes: [String: String] = [:]
         if let requestId { attributes[RpcStreamAttribute.requestId] = requestId }
         if let method { attributes[RpcStreamAttribute.method] = method }
         if let timeoutMs { attributes[RpcStreamAttribute.timeoutMs] = String(timeoutMs) }
         if let version { attributes[RpcStreamAttribute.version] = version }
-        let info = TextStreamInfo(
-            id: UUID().uuidString,
-            topic: RpcStreamTopic.request,
-            timestamp: Date(),
-            totalLength: nil,
-            attributes: attributes,
-            encryptionType: .none,
-            operationType: .create,
-            version: 0,
-            replyToStreamID: nil,
-            attachedStreamIDs: [],
-            generated: false,
-            publisherParticipantSid: publisherParticipantSid,
-            dataPacketReceiveGeneration: dataPacketReceiveGeneration,
-        )
-        let source = StreamReaderSource { continuation in
-            if let data = payload.data(using: .utf8) { continuation.yield(data) }
-            continuation.finish()
-        }
-        return TextStreamReader(info: info, source: source)
+        return StubTextStreamReader(topic: RpcStreamTopic.request,
+                                    attributes: attributes,
+                                    result: error.map { .failure($0) } ?? .success(payload),
+                                    publisherParticipantSid: publisherParticipantSid,
+                                    dataPacketReceiveGeneration: dataPacketReceiveGeneration)
     }
 
     /// Builds a v2 response-stream reader. Pass `nil` for `requestId` to omit
@@ -4026,32 +4385,37 @@ private enum RpcTestSupport {
     /// `RpcClientManager.handleIncomingResponseStream`'s missing-id branch.
     static func makeResponseReader(
         requestId: String?,
-        payload: String,
+        payload: String = "",
         publisherParticipantSid: Participant.Sid? = nil,
-        dataPacketReceiveGeneration: UInt64? = nil
-    ) -> TextStreamReader {
+        dataPacketReceiveGeneration: UInt64? = nil,
+        error: Error? = nil,
+    ) -> StubTextStreamReader {
         var attributes: [String: String] = [:]
         if let requestId { attributes[RpcStreamAttribute.requestId] = requestId }
-        let info = TextStreamInfo(
-            id: UUID().uuidString,
-            topic: RpcStreamTopic.response,
-            timestamp: Date(),
-            totalLength: nil,
-            attributes: attributes,
-            encryptionType: .none,
-            operationType: .create,
-            version: 0,
-            replyToStreamID: nil,
-            attachedStreamIDs: [],
-            generated: false,
-            publisherParticipantSid: publisherParticipantSid,
-            dataPacketReceiveGeneration: dataPacketReceiveGeneration,
+        return StubTextStreamReader(topic: RpcStreamTopic.response,
+                                    attributes: attributes,
+                                    result: error.map { .failure($0) } ?? .success(payload),
+                                    publisherParticipantSid: publisherParticipantSid,
+                                    dataPacketReceiveGeneration: dataPacketReceiveGeneration)
+    }
+
+    /// A response stream that carries the exact connection `identity` has in `room`, as a stream
+    /// from that participant does.
+    static func makeResponseReader(
+        in room: Room,
+        from identity: Participant.Identity,
+        requestId: String?,
+        payload: String = "",
+        error: Error? = nil,
+    ) -> StubTextStreamReader {
+        let connection = currentConnection(in: room, identity: identity)
+        return makeResponseReader(
+            requestId: requestId,
+            payload: payload,
+            publisherParticipantSid: connection?.sid,
+            dataPacketReceiveGeneration: connection?.dataPacketReceiveGeneration,
+            error: error
         )
-        let source = StreamReaderSource { continuation in
-            if let data = payload.data(using: .utf8) { continuation.yield(data) }
-            continuation.finish()
-        }
-        return TextStreamReader(info: info, source: source)
     }
 
     /// Builds a v2 request-stream reader whose `readAll()` throws — simulates
@@ -4064,31 +4428,11 @@ private enum RpcTestSupport {
         error: Error = StreamError.terminated,
         publisherParticipantSid: Participant.Sid? = nil,
         dataPacketReceiveGeneration: UInt64? = nil,
-    ) -> TextStreamReader {
-        let info = TextStreamInfo(
-            id: UUID().uuidString,
-            topic: RpcStreamTopic.request,
-            timestamp: Date(),
-            totalLength: nil,
-            attributes: [
-                RpcStreamAttribute.requestId: requestId,
-                RpcStreamAttribute.method: method,
-                RpcStreamAttribute.timeoutMs: String(timeoutMs),
-                RpcStreamAttribute.version: RPC_STREAM_VERSION,
-            ],
-            encryptionType: .none,
-            operationType: .create,
-            version: 0,
-            replyToStreamID: nil,
-            attachedStreamIDs: [],
-            generated: false,
-            publisherParticipantSid: publisherParticipantSid,
-            dataPacketReceiveGeneration: dataPacketReceiveGeneration,
-        )
-        let source = StreamReaderSource { continuation in
-            continuation.finish(throwing: error)
-        }
-        return TextStreamReader(info: info, source: source)
+    ) -> StubTextStreamReader {
+        makeRequestReader(requestId: requestId, method: method, timeoutMs: timeoutMs,
+                          publisherParticipantSid: publisherParticipantSid,
+                          dataPacketReceiveGeneration: dataPacketReceiveGeneration,
+                          error: error)
     }
 
     /// Builds a v2 response-stream reader whose `readAll()` throws — used to
@@ -4098,14 +4442,39 @@ private enum RpcTestSupport {
         error: Error = StreamError.terminated,
         publisherParticipantSid: Participant.Sid? = nil,
         dataPacketReceiveGeneration: UInt64? = nil,
-    ) -> TextStreamReader {
-        let info = TextStreamInfo(
+    ) -> StubTextStreamReader {
+        makeResponseReader(requestId: requestId,
+                           publisherParticipantSid: publisherParticipantSid,
+                           dataPacketReceiveGeneration: dataPacketReceiveGeneration,
+                           error: error)
+    }
+}
+
+/// Stands in for the FFI-backed reader the RPC managers consume, so a test can hand them a
+/// payload — or a read failure — without a connection.
+struct StubTextStreamReader: TextStreamReading {
+    let info: TextStreamInfo
+    private let result: Result<String, Error>
+    /// How many times `readAll()` ran.
+    let reads = StateSync(0)
+    /// How many times `cancel()` ran.
+    let cancels = StateSync(0)
+
+    init(
+        topic: String,
+        attributes: [String: String],
+        result: Result<String, Error>,
+        publisherParticipantSid: Participant.Sid? = nil,
+        dataPacketReceiveGeneration: UInt64? = nil
+    ) {
+        info = TextStreamInfo(
             id: UUID().uuidString,
-            topic: RpcStreamTopic.response,
+            topic: topic,
             timestamp: Date(),
             totalLength: nil,
-            attributes: [RpcStreamAttribute.requestId: requestId],
+            attributes: attributes,
             encryptionType: .none,
+            mimeType: "text/plain",
             operationType: .create,
             version: 0,
             replyToStreamID: nil,
@@ -4114,11 +4483,79 @@ private enum RpcTestSupport {
             publisherParticipantSid: publisherParticipantSid,
             dataPacketReceiveGeneration: dataPacketReceiveGeneration,
         )
-        let source = StreamReaderSource { continuation in
-            continuation.finish(throwing: error)
-        }
-        return TextStreamReader(info: info, source: source)
+        self.result = result
     }
+
+    func readAll() async throws -> String {
+        reads.mutate { $0 += 1 }
+        return try result.get()
+    }
+
+    func cancel() async {
+        cancels.mutate { $0 += 1 }
+    }
+}
+
+/// A mocked data channel whose send waits for `onSend`, so whatever a packet triggers finishes
+/// before the publish that sent it does.
+private final class AwaitingDataChannelPair: MockDataChannelPair, @unchecked Sendable {
+    private let onSend: @Sendable (Livekit_DataPacket) async -> Void
+
+    init(onSend: @escaping @Sendable (Livekit_DataPacket) async -> Void) {
+        self.onSend = onSend
+        super.init { _ in }
+    }
+
+    override func send(dataPacket packet: Livekit_DataPacket) async throws {
+        await onSend(packet)
+    }
+
+    override func send(dataPacket packet: Livekit_DataPacket, expectedSendGeneration: UInt64) async throws {
+        guard expectedSendGeneration == sendGeneration else {
+            throw LiveKitError(.invalidState, message: "Mock data-channel send generation changed")
+        }
+        await onSend(packet)
+    }
+
+    override func send(
+        dataPacket packet: Livekit_DataPacket,
+        expectedSendGeneration: UInt64,
+        admission: DataChannelSendAdmission
+    ) async throws {
+        guard expectedSendGeneration == sendGeneration else {
+            throw LiveKitError(.invalidState, message: "Mock data-channel send generation changed")
+        }
+        if let error = admission.preflight() { throw error }
+        await onSend(packet)
+    }
+}
+
+/// A mocked data channel that never opens, so a send waits on `opened` until its task is cancelled.
+private final class UnopenedDataChannelPair: MockDataChannelPair, @unchecked Sendable {
+    let opened = AsyncCompleter<Void>(label: "Mock data channel open", defaultTimeout: 10)
+
+    override func whenOpen(kind _: Livekit_DataPacket_Kind) -> AsyncCompleter<Void> { opened }
+}
+
+/// A response stream whose read reports when it starts, waits for `release`, and then fails.
+private struct GatedFailingReader: TextStreamReading {
+    let info: TextStreamInfo
+    let reads = StateSync(0)
+    let entered = AsyncCompleter<Void>(label: "Response read started", defaultTimeout: 5)
+    let release = AsyncCompleter<Void>(label: "Response read released", defaultTimeout: 5)
+
+    init(_ info: TextStreamInfo) {
+        self.info = info
+    }
+
+    func readAll() async throws -> String {
+        reads.mutate { $0 += 1 }
+        entered.resume(returning: ())
+        try await release.wait()
+        throw StreamError.terminated
+    }
+
+    func cancel() async {}
 }
 
 /// Async-safe append-only collector used to assert across concurrently-running tasks.

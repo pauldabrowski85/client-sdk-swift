@@ -40,7 +40,6 @@ extension Room {
 
     // Resets state of transports
     func cleanUpRTC(withError disconnectError: Error? = nil) async {
-        await outgoingStreamManager.reset()
         // Close data channels
         publisherDataChannel.reset(throwing: disconnectError)
         subscriberDataChannel.reset(throwing: disconnectError)
@@ -150,10 +149,17 @@ extension Room {
             log("publisher is not .connected", .error)
         }
 
+        // A data stream packet sent on behalf of another identity already names it, and the
+        // server decides whether to accept that. Every other packet is sent as the local participant.
+        let keepsIdentity = switch packet.value {
+        case .streamHeader, .streamChunk, .streamTrailer: !packet.participantIdentity.isEmpty
+        default: false
+        }
+
         // `modifying` is consuming: with no other owner this stamps in place,
         // where the per-field setters used to deep-copy the whole payload.
         let stamped = packet.modifying {
-            if let identity = localParticipant.identity?.stringValue {
+            if !keepsIdentity, let identity = localParticipant.identity?.stringValue {
                 $0.participantIdentity = identity
             }
             if let sid = localParticipant.sid?.stringValue {
@@ -332,6 +338,10 @@ extension Room {
 
     // full connect sequence, doesn't update connection state
     func fullConnectSequence(_ url: URL, _ token: String) async throws {
+        // Taken before any peer connection or the signal socket exists, so every attempt (initial
+        // connect, full reconnect, region failover) times itself from scratch. See
+        // `Transport.set(connectionSetupTime:)`.
+        let connectStartedAt = ProcessInfo.processInfo.systemUptime
         var singlePC = _state.roomOptions.singlePeerConnection
 
         // Built before the socket opens so its offer rides along with the JOIN request, removing
@@ -375,6 +385,9 @@ extension Room {
             // `.reconnect` response leaves the early publisher unowned, so the catch below must
             // still close it.
             if case .join = connectResponse { isAdopted = true }
+            // The JOIN built new transports; their start time covers video published before the
+            // primary transport connects.
+            if isAdopted { await _state.transport?.publisher.set(connectStartedAt: connectStartedAt) }
             connectSpan?.record("pc_created")
             // Check cancellation after configuring transports
             try Task.checkCancellation()
@@ -402,6 +415,8 @@ extension Room {
             // Wait for transport...
             try await primaryTransportConnectedCompleter.wait(timeout: _state.connectOptions.primaryTransportConnectTimeout)
             try Task.checkCancellation()
+
+            if isAdopted { await recordConnectionSetupTime(startedAt: connectStartedAt) }
         } catch {
             // Once adopted, the staged join owns teardown through `cleanUp()`.
             if !isAdopted { await earlyPublisher?.close() }
@@ -410,6 +425,15 @@ extension Room {
 
         connectSpan?.record("engine")
         connectSpan?.record("pc_connected")
+    }
+
+    /// Hands the time from `startedAt` (`ProcessInfo.systemUptime`) to the primary transport
+    /// connecting to the publisher, which lowers the video start bitrate hint for a slow
+    /// connection. See `Transport.set(connectionSetupTime:)`.
+    private func recordConnectionSetupTime(startedAt: TimeInterval) async {
+        let connectionSetupTime = ProcessInfo.processInfo.systemUptime - startedAt
+        log("Connection setup took \(Int((connectionSetupTime * 1000).rounded())) ms")
+        await _state.transport?.publisher.set(connectionSetupTime: connectionSetupTime)
     }
 
     // swiftlint:disable:next cyclomatic_complexity function_body_length

@@ -50,6 +50,7 @@ struct RoomUserDataProvenanceTests {
         room.dataChannel(
             MockDataChannelPair { _ in },
             didReceiveDataPacket: packet,
+            serialized: nil,
             encryptionType: .none,
             receiveGeneration: room.dataPacketReceiveGeneration,
             receivedAtContinuousTimeNanoseconds: RpcContinuousClock.nowNanoseconds()
@@ -102,6 +103,7 @@ struct RoomUserDataProvenanceTests {
         room.dataChannel(
             MockDataChannelPair { _ in },
             didReceiveDataPacket: packet,
+            serialized: nil,
             encryptionType: .none,
             receiveGeneration: oldGeneration,
             receivedAtContinuousTimeNanoseconds: RpcContinuousClock.nowNanoseconds()

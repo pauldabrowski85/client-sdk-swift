@@ -50,9 +50,9 @@ actor RpcClientManager: Loggable {
 
     private weak var room: Room?
 
-    private var pendingAcks: Set<String> = Set()
-    private var pendingResponses: [String: PendingRpcResponse] = [:]
-    private var ackWatchdogs: [String: AnyTaskCancellable] = [:]
+    private(set) var pendingAcks: Set<String> = Set()
+    private(set) var pendingResponses: [String: PendingRpcResponse] = [:]
+    private(set) var ackWatchdogs: [String: AnyTaskCancellable] = [:]
     private var responseDeadlineWatchdogs: [String: AnyTaskCancellable] = [:]
     private var clientClock = RpcClientClock.live
     private(set) var activePublicationTaskCount = 0
@@ -89,6 +89,8 @@ actor RpcClientManager: Loggable {
                     responseTimeout: TimeInterval = RpcClientManager.defaultResponseTimeout,
                     maxRoundTripLatency: TimeInterval = RpcClientManager.defaultMaxRoundTripLatency) async throws -> String
     {
+        // A call cancelled before it starts sends nothing, like the data stream methods.
+        try Task.checkCancellation()
         guard responseTimeout.isFinite,
               responseTimeout > 0,
               maxRoundTripLatency.isFinite,
@@ -214,6 +216,11 @@ actor RpcClientManager: Loggable {
             if let pending = removeAllPending(requestId) {
                 await pending.publicationController.cancelAndWaitForStreamCleanup()
             }
+            // A cancelled caller gets `CancellationError`, as from the data stream methods. The
+            // deadline still wins over a cancel that lands after it, as it does over every ending.
+            if clientClock.nowNanoseconds() < responseDeadlineContinuousTimeNanoseconds {
+                try Task.checkCancellation()
+            }
             throw terminalError
         }
 
@@ -221,9 +228,7 @@ actor RpcClientManager: Loggable {
             return try await completer.wait(timeout: 0)
         }
 
-        if let hook = afterPublish {
-            await hook(requestId)
-        }
+        await afterPublish?(requestId)
 
         // Ack watchdog: fail fast if no ack arrives within maxRoundTripLatency.
         // Stored as `AnyTaskCancellable` so the deferred cleanup cancels the sleep
@@ -242,6 +247,11 @@ actor RpcClientManager: Loggable {
                 : 0
             return try await completer.wait(timeout: remaining)
         } catch {
+            // A cancelled caller gets `CancellationError`, not the completer's `LiveKitError(.cancelled)`,
+            // unless the deadline had already passed.
+            if clientClock.nowNanoseconds() < responseDeadlineContinuousTimeNanoseconds {
+                try Task.checkCancellation()
+            }
             // AsyncCompleter signals its own `defaultTimeout` expiry with `LiveKitError(.timedOut)`.
             // That path means the caller's original `responseTimeout` deadline elapsed
             // without a response → `responseTimeout` (1502). The ack-watchdog path
@@ -324,15 +334,15 @@ actor RpcClientManager: Loggable {
     /// with the streamed payload — but only if `senderIdentity` matches the original
     /// destination of the call. A response from any other peer is ignored (and the
     /// pending entry is left in place so the legitimate sender can still resolve).
-    func handleIncomingResponseStream(reader: TextStreamReader, senderIdentity: Participant.Identity) async {
+    func handleIncomingResponseStream(reader: some TextStreamReading, senderIdentity: Participant.Identity) async {
         guard let requestId = reader.info.attributes[RpcStreamAttribute.requestId] else {
             await reader.cancel()
             log("[Rpc] Incoming v2 RPC response stream is missing request id attribute", .error)
             return
         }
 
-        // Validate the sender BEFORE reading the stream — matches JS and avoids
-        // burning cycles (or worse, hitting `readAll` side effects) on a spoofed
+        // Validate the request and the sender BEFORE reading the stream — matches JS and avoids
+        // burning cycles (or worse, hitting `readAll` side effects) on a late or spoofed
         // payload. After this check passes, both the success and read-failure
         // paths trust the sender and resume the pending call directly.
         guard var pending = validatedPending(
@@ -360,25 +370,28 @@ actor RpcClientManager: Loggable {
                 responseDeadlineContinuousTimeNanoseconds: pending.responseDeadlineContinuousTimeNanoseconds
             )
         } catch {
-            log("[Rpc] Failed to read v2 RPC response payload for \(requestId): \(error)", .error)
-            // Fail the pending call fast instead of letting it hang to responseTimeout.
-            if let pending = validatedPending(
+            // The call can end while the stream is read, for example when its task is cancelled.
+            guard let pending = validatedPending(
                 requestId: requestId,
                 senderIdentity: senderIdentity,
                 senderParticipantSid: reader.info.publisherParticipantSid,
                 dataPacketReceiveGeneration: reader.info.dataPacketReceiveGeneration
-            ) {
-                let rpcError: RpcError = if error is RpcResponseDeadlineExceeded {
-                    .builtIn(.responseTimeout)
-                } else if case StreamError.streamSizeExceeded = error {
-                    .builtIn(.responsePayloadTooLarge)
-                } else {
-                    RpcError(code: RpcError.BuiltInError.applicationError.code,
-                             message: "Error reading RPC response payload",
-                             data: "")
-                }
-                await completePending(requestId: requestId, pending: pending, result: .failure(rpcError))
+            ) else {
+                log("[Rpc] Failed to read v2 RPC response payload for \(requestId), which is no longer pending: \(error)")
+                return
             }
+            log("[Rpc] Failed to read v2 RPC response payload for \(requestId): \(error)", .error)
+            // Fail the pending call fast instead of letting it hang to responseTimeout.
+            let rpcError: RpcError = if error is RpcResponseDeadlineExceeded {
+                .builtIn(.responseTimeout)
+            } else if case StreamError.streamSizeExceeded = error {
+                .builtIn(.responsePayloadTooLarge)
+            } else {
+                RpcError(code: RpcError.BuiltInError.applicationError.code,
+                         message: "Error reading RPC response payload",
+                         data: "")
+            }
+            await completePending(requestId: requestId, pending: pending, result: .failure(rpcError))
             return
         }
 
@@ -527,7 +540,7 @@ actor RpcClientManager: Loggable {
     }
 
     private func readResponsePayload(
-        from reader: TextStreamReader,
+        from reader: some TextStreamReading,
         responseDeadlineContinuousTimeNanoseconds: UInt64
     ) async throws -> String {
         let clientClock = clientClock
@@ -659,7 +672,7 @@ actor RpcClientManager: Loggable {
             destinationIdentities: [destinationConnection.identity],
         )
         try requireCurrent(destinationConnection, in: room)
-        let writer = try await room.outgoingStreamManager.streamText(
+        let writer = try await room.dataStreams.streamText(
             options: options,
             admission: publicationGate.sendAdmission,
             onReservation: onReservation

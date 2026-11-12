@@ -1007,6 +1007,7 @@ private func withTransportFixture(
 ) async throws {
     let room = Room()
     let connection = ConnectionDependencies(
+        idle: room._state.stage.idle,
         room: room,
         roomOptions: room._state.roomOptions
     )
