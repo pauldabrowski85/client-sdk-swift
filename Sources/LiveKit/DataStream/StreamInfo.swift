@@ -16,6 +16,8 @@
 
 import Foundation
 
+internal import LiveKitFFI
+
 /// Information about a data stream.
 public protocol StreamInfo: Sendable {
     /// Unique identifier of the stream.
@@ -27,7 +29,8 @@ public protocol StreamInfo: Sendable {
     /// When the stream was created.
     var timestamp: Date { get }
 
-    /// Total expected size in bytes (UTF-8 for text), if known.
+    /// Total expected size in bytes (UTF-8 for text), if known. `nil` also when the sender declared
+    /// a size that `Int` cannot hold.
     var totalLength: Int? { get }
 
     /// Additional attributes as needed for your application.
@@ -74,6 +77,9 @@ public final class TextStreamInfo: NSObject, StreamInfo {
     /// pipeline, before buffering or handler scheduling. It advances through sleep.
     @nonobjc let receivedAtContinuousTimeNanoseconds: UInt64
 
+    /// The MIME type the sender declared for the text. `text/plain` unless the sender set another.
+    public let mimeType: String
+
     init(
         id: String,
         topic: String,
@@ -81,6 +87,7 @@ public final class TextStreamInfo: NSObject, StreamInfo {
         totalLength: Int?,
         attributes: [String: String],
         encryptionType: EncryptionType,
+        mimeType: String,
         operationType: OperationType,
         version: Int,
         replyToStreamID: String?,
@@ -96,6 +103,7 @@ public final class TextStreamInfo: NSObject, StreamInfo {
         self.totalLength = totalLength
         self.attributes = attributes
         self.encryptionType = encryptionType
+        self.mimeType = mimeType
         self.operationType = operationType
         self.version = version
         self.replyToStreamID = replyToStreamID
@@ -104,6 +112,68 @@ public final class TextStreamInfo: NSObject, StreamInfo {
         self.publisherParticipantSid = publisherParticipantSid
         self.dataPacketReceiveGeneration = dataPacketReceiveGeneration
         self.receivedAtContinuousTimeNanoseconds = receivedAtContinuousTimeNanoseconds
+    }
+
+    convenience init(_ ffi: LiveKitFFI.TextStreamInfo, encryptionType: EncryptionType) {
+        self.init(
+            id: ffi.id,
+            topic: ffi.topic,
+            timestamp: Date(timeIntervalSince1970: TimeInterval(ffi.timestampMs) / 1000),
+            totalLength: ffi.totalLength.flatMap { Int(exactly: $0) },
+            attributes: ffi.attributes,
+            encryptionType: encryptionType,
+            mimeType: ffi.mimeType,
+            operationType: OperationType(ffi.operationType),
+            version: Int(ffi.version),
+            replyToStreamID: ffi.replyToStreamId,
+            attachedStreamIDs: ffi.attachedStreamIds,
+            generated: ffi.generated,
+        )
+    }
+
+    /// The info of an incoming stream. The core describes the content; `source` holds what only
+    /// the data packet said: who sent it, on which transport, and when.
+    convenience init(_ ffi: LiveKitFFI.TextStreamInfo, source: IncomingStreamSource) {
+        self.init(
+            id: ffi.id,
+            topic: ffi.topic,
+            timestamp: Date(timeIntervalSince1970: TimeInterval(ffi.timestampMs) / 1000),
+            totalLength: ffi.totalLength.flatMap { Int(exactly: $0) },
+            attributes: source.attributes,
+            encryptionType: source.encryptionType,
+            mimeType: ffi.mimeType,
+            operationType: OperationType(ffi.operationType),
+            version: Int(ffi.version),
+            replyToStreamID: ffi.replyToStreamId,
+            attachedStreamIDs: ffi.attachedStreamIds,
+            generated: ffi.generated,
+            publisherParticipantSid: source.publisherParticipantSid,
+            dataPacketReceiveGeneration: source.dataPacketReceiveGeneration,
+            receivedAtContinuousTimeNanoseconds: source.receivedAtContinuousTimeNanoseconds,
+        )
+    }
+}
+
+extension TextStreamInfo.OperationType {
+    init(_ ffi: LiveKitFFI.OperationType) {
+        switch ffi {
+        case .create: self = .create
+        case .update: self = .update
+        case .delete: self = .delete
+        case .reaction: self = .reaction
+        // The FFI enum is resilient: an operation this SDK predates reads as a new message, the
+        // only reading that can't corrupt an existing one.
+        @unknown default: self = .create
+        }
+    }
+
+    var ffiValue: LiveKitFFI.OperationType {
+        switch self {
+        case .create: .create
+        case .update: .update
+        case .delete: .delete
+        case .reaction: .reaction
+        }
     }
 }
 
@@ -141,5 +211,32 @@ public final class ByteStreamInfo: NSObject, StreamInfo {
         self.attributes = attributes
         self.encryptionType = encryptionType
         self.name = name
+    }
+
+    convenience init(_ ffi: LiveKitFFI.ByteStreamInfo, encryptionType: EncryptionType) {
+        self.init(
+            id: ffi.id,
+            topic: ffi.topic,
+            timestamp: Date(timeIntervalSince1970: TimeInterval(ffi.timestampMs) / 1000),
+            totalLength: ffi.totalLength.flatMap { Int(exactly: $0) },
+            attributes: ffi.attributes,
+            encryptionType: encryptionType,
+            mimeType: ffi.mimeType,
+            name: ffi.name.isEmpty ? nil : ffi.name,
+        )
+    }
+
+    /// The info of an incoming stream, without the attribute admission stamped on its header.
+    convenience init(_ ffi: LiveKitFFI.ByteStreamInfo, source: IncomingStreamSource) {
+        self.init(
+            id: ffi.id,
+            topic: ffi.topic,
+            timestamp: Date(timeIntervalSince1970: TimeInterval(ffi.timestampMs) / 1000),
+            totalLength: ffi.totalLength.flatMap { Int(exactly: $0) },
+            attributes: source.attributes,
+            encryptionType: source.encryptionType,
+            mimeType: ffi.mimeType,
+            name: ffi.name.isEmpty ? nil : ffi.name,
+        )
     }
 }

@@ -204,7 +204,7 @@ struct PendingRpcResponse {
     let responseDeadlineContinuousTimeNanoseconds: UInt64
     let publicationGate: RpcPublicationGate
     let publicationController: RpcPublicationController
-    var responseStreamReader: TextStreamReader?
+    var responseStreamReader: (any TextStreamReading)?
 }
 
 private struct RpcPublicationTerminated: Error {}

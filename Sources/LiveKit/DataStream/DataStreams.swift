@@ -1,0 +1,597 @@
+/*
+ * Copyright 2026 LiveKit
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+import Foundation
+
+internal import LiveKitFFI
+
+// MARK: - DataStreams
+
+/// Owns the topic→handler registry and routes Room/participant calls to the connection's UniFFI
+/// data stream managers. Staged as ``IdleDependencies``, the room-scoped dependency tier, keeping
+/// the subsystem off the Room's surface.
+///
+/// Unlike ``DataTracks``, this subsystem is **Room-scoped, not session-scoped**: stream handlers
+/// (registered by the app, and by internal RPC/transcription wiring) must survive reconnects and be
+/// registrable before connect, so the registry lives here for the Room's lifetime. The FFI managers
+/// do not: see ``incoming``.
+///
+/// `@unchecked Sendable`: the only mutable state is the StateSync-guarded registry and the
+/// back-references ``attach(room:)`` fills in before the room can be shared; the managers and
+/// delegates are immutable after init. Not an actor — the UniFFI delegate callbacks are synchronous
+/// and can't `await`.
+final class DataStreams: NSObject, @unchecked Sendable, Loggable {
+    // Neither FFI manager is held here: both are owned by ``ConnectionDependencies`` and live
+    // exactly as long as one connection. The incoming one because its payload cap is fixed at
+    // construction (the FFI exposes no setter) from the options passed to `connect`; the outgoing
+    // one so that dropping it closes the writers opened on that session — their next chunk would
+    // otherwise reach the *next* session, whose receivers never saw the header. A full reconnect
+    // keeps the connection, so it swaps the outgoing manager explicitly.
+    //
+    // Before connect and after disconnect there is neither, which is what a stream needs anyway:
+    // a transport to travel on.
+    private var incoming: LiveKitFFI.IncomingDataStreamManager? {
+        room?._state.stage.connection?.incomingDataStreams
+    }
+
+    private func outgoing() throws -> Outgoing {
+        guard let outgoing = room?._state.stage.connection?.outgoingDataStreams.copy() else {
+            throw LiveKitError(.invalidState, message: "Room is not connected")
+        }
+        return outgoing
+    }
+
+    // Held weakly: the Room owns this coordinator, so the back-reference must not retain it. Used
+    // for the room-level encryption type stamped onto stream info, and for logging. Boxed so the
+    // admission's callbacks can reach the room without retaining this coordinator.
+    private final class RoomReference: @unchecked Sendable {
+        weak var room: Room?
+    }
+
+    private let roomReference = RoomReference()
+    private var room: Room? { roomReference.room }
+
+    /// Every incoming stream packet passes here before the core sees it.
+    let admission: IncomingStreamAdmission
+
+    override init() {
+        let roomReference = roomReference
+        admission = IncomingStreamAdmission(
+            core: { roomReference.room?._state.stage.connection?.incomingDataStreams },
+            onIngressOverflow: { roomReference.room?.incomingStreamIngressDidOverflow(receiveGeneration: $0) }
+        )
+        super.init()
+    }
+
+    // The Swift-side handler registry. The FFI reports every stream it opens
+    // (`onByteStreamOpened`/`onTextStreamOpened`), and admission hands it only streams on a
+    // registered topic; we route by `info.topic` to these handlers.
+    private struct ByteEntry {
+        let handler: ByteStreamHandler
+        let registration: IncomingStreamAdmission.Registration
+    }
+
+    private let byteStreamHandlers = StateSync<[String: ByteEntry]>([:])
+    // Handler and ordering policy in one entry: dispatch resolves both from a single read, so a
+    // stream can't open between them and take the unordered path on an ordered topic.
+    private struct TextEntry {
+        let handler: TextStreamHandler
+        let isOrdered: Bool
+        let registration: IncomingStreamAdmission.Registration
+    }
+
+    private let textStreamHandlers = StateSync<[String: TextEntry]>([:])
+
+    // Ordering is a wire *happens-before* relation: a stream that opened after another one closed
+    // must have its handler run after that one's. Streams that overlap on the wire are concurrent
+    // and must not delay each other — a live transcript arriving while an earlier message stream is
+    // still open has to be delivered immediately.
+    //
+    // So a newly opened stream waits on `finishing` — handlers whose stream has already closed but
+    // which haven't returned yet — and *not* on handlers of streams that are still open. `running`
+    // holds the latter until the FFI reports the close, at which point the entry moves across.
+    // Entries are removed when the handler returns, so neither map grows without bound.
+    //
+    // One lock for all of it: an open reads `finishing` and writes `running` + `openStreams`, a
+    // close moves an entry between the first two, and a completion clears all three — they have to
+    // agree.
+    private struct OrderedHandlers {
+        /// Which entry a close event should move, by the stream id the sender chose.
+        struct OpenStream {
+            let topic: String
+            let token: UInt64
+        }
+
+        // Keyed by a token unique to the handler, not by stream id: nothing stops a sender from
+        // reusing an id, and a successor must neither evict its predecessor's entry nor be evicted
+        // by the predecessor's completion.
+        var running: [String: [UInt64: Task<Void, Never>]] = [:]
+        var finishing: [String: [UInt64: Task<Void, Never>]] = [:]
+        var openStreams: [String: OpenStream] = [:]
+        private var nextToken: UInt64 = 0
+
+        mutating func makeToken() -> UInt64 {
+            defer { nextToken &+= 1 }
+            return nextToken
+        }
+
+        mutating func removeTopic(_ topic: String) {
+            running[topic] = nil
+            finishing[topic] = nil
+            openStreams = openStreams.filter { $0.value.topic != topic }
+        }
+    }
+
+    private let ordered = StateSync(OrderedHandlers())
+
+    /// Supplies the back-reference, in `Room.init`'s second phase.
+    ///
+    /// Split from `init` because this subsystem is staged inside `Room.State` — built in the first
+    /// phase, where `self` isn't available yet. Nothing can reach the room, and so nothing can reach
+    /// this reference, until its initializer returns.
+    func attach(room: Room) {
+        roomReference.room = room
+    }
+
+    /// Builds the connection-scoped incoming manager, wired back to this coordinator for stream
+    /// dispatch. Called by ``ConnectionDependencies`` — topic routing (incl. the `lk.rpc` guard) is
+    /// handled Swift-side here, so the manager itself carries no handler state.
+    ///
+    /// - Parameter maxPayloadByteLength: `nil` → the core's default cap. `DataStreamOptions`
+    ///   normalizes negative values to `nil`, so the conversion below can't trap.
+    static func makeIncomingManager(coordinator: DataStreams, maxPayloadByteLength: Int?) -> LiveKitFFI.IncomingDataStreamManager {
+        let delegate = IncomingDelegate()
+        delegate.coordinator = coordinator
+        return LiveKitFFI.IncomingDataStreamManager(
+            delegate: delegate,
+            maxPayloadByteLength: maxPayloadByteLength.map { UInt64($0) },
+        )
+    }
+
+    /// A connection's outgoing manager and the delegate it delivers through. Kept together so a full
+    /// reconnect can retire the delegate of the manager it replaces.
+    struct Outgoing: Sendable {
+        let manager: LiveKitFFI.OutgoingDataStreamManager
+        let delegate: OutgoingDelegate
+    }
+
+    /// Builds the connection-scoped outgoing manager. Called by ``ConnectionDependencies``; when it
+    /// is released the FFI cancels the task draining its packets, so writers left open on the
+    /// retired session fail their next write instead of emitting into the next one.
+    static func makeOutgoing(room: Room) -> Outgoing {
+        let delegate = OutgoingDelegate(room: room)
+        let manager = LiveKitFFI.OutgoingDataStreamManager(delegate: delegate, registry: Registry(room: room))
+        return Outgoing(manager: manager, delegate: delegate)
+    }
+
+    // Encryption type for *outgoing* stream info. Inbound infos carry the value admission recorded
+    // with the stream's header; there is no equivalent signal for a stream we're sending, so the
+    // room's data-channel setting is the accurate answer there.
+    private var currentEncryptionType: EncryptionType {
+        room?.e2eeManager?.dataChannelEncryptionType ?? .none
+    }
+
+    // MARK: - Handler registration
+
+    func registerByteStreamHandler(
+        for topic: String,
+        limits: IncomingStreamLimits = .default,
+        onStreamRejected: IncomingStreamRejectionHandler? = nil,
+        _ onNewStream: @escaping ByteStreamHandler
+    ) throws {
+        try byteStreamHandlers.mutate {
+            guard $0[topic] == nil else { throw StreamError.handlerAlreadyRegistered }
+            $0[topic] = ByteEntry(handler: onNewStream, registration: .init(limits: limits, onStreamRejected: onStreamRejected))
+        }
+    }
+
+    /// When `ordered` is true, successive streams on `topic` have their handlers run in wire order:
+    /// a handler for a stream that opened after another finishes only once the earlier handler
+    /// returns. Off by default — it would serialize consumers that want strict concurrency (e.g. RPC).
+    func registerTextStreamHandler(
+        for topic: String,
+        ordered: Bool = false,
+        limits: IncomingStreamLimits = .default,
+        onStreamRejected: IncomingStreamRejectionHandler? = nil,
+        _ onNewStream: @escaping TextStreamHandler
+    ) throws {
+        try textStreamHandlers.mutate {
+            guard $0[topic] == nil else { throw StreamError.handlerAlreadyRegistered }
+            $0[topic] = TextEntry(
+                handler: onNewStream,
+                isOrdered: ordered,
+                registration: .init(limits: limits, onStreamRejected: onStreamRejected)
+            )
+        }
+    }
+
+    /// SDK-internal: register `onNewStream` for `topic` if no handler is registered yet, otherwise
+    /// no-op. Used by idempotent wiring paths (e.g. RPC v2 setup runs on every connect) that don't
+    /// want the duplicate-registration throw from the public API.
+    @discardableResult
+    func registerTextStreamHandlerIfNeeded(
+        for topic: String,
+        limits: IncomingStreamLimits = .default,
+        onStreamRejected: IncomingStreamRejectionHandler? = nil,
+        _ onNewStream: @escaping TextStreamHandler
+    ) -> Bool {
+        textStreamHandlers.mutate {
+            guard $0[topic] == nil else { return false }
+            $0[topic] = TextEntry(
+                handler: onNewStream,
+                isOrdered: false,
+                registration: .init(limits: limits, onStreamRejected: onStreamRejected)
+            )
+            return true
+        }
+    }
+
+    func unregisterByteStreamHandler(for topic: String) {
+        byteStreamHandlers.mutate { $0[topic] = nil }
+    }
+
+    func unregisterTextStreamHandler(for topic: String) {
+        textStreamHandlers.mutate { $0[topic] = nil }
+        ordered.mutate { $0.removeTopic(topic) }
+    }
+
+    // MARK: - Sending
+
+    func sendText(_ text: String, options: StreamTextOptions) async throws -> TextStreamInfo {
+        var options = options.ffi
+        let id = options.id ?? UUID().uuidString
+        options.id = id
+        return try await TextStreamInfo(
+            calling(streamID: id) { [options] in try await $0.sendText(text: text, options: options) },
+            encryptionType: currentEncryptionType
+        )
+    }
+
+    /// Sends `text`, then each file in `attachments` as its own byte stream, the files at the same
+    /// time, as JS does. The text lists the files' stream IDs in its attached stream IDs; each file
+    /// goes on the text's topic, to its recipients, with its compression and sender. The first file
+    /// that fails ends the call and cancels the others.
+    func sendText(_ text: String, options: StreamTextOptions, attachments: [URL]) async throws -> TextStreamInfo {
+        let ids = attachments.map { _ in UUID().uuidString }
+        let info = try await sendText(text, options: options.attaching(ids))
+        try await withThrowingTaskGroup(of: Void.self) { group in
+            for (fileURL, id) in zip(attachments, ids) {
+                let fileOptions = StreamByteOptions(
+                    topic: options.topic,
+                    destinationIdentities: options.destinationIdentities,
+                    id: id,
+                    compress: options.compress,
+                    senderIdentity: options.senderIdentity,
+                )
+                group.addTask { _ = try await self.sendFile(fileURL, options: fileOptions) }
+            }
+            // Not `waitForAll()`, which waits for every file even after one has failed: the first
+            // error leaves the group, which cancels the other sends.
+            for try await _ in group {}
+        }
+        return info
+    }
+
+    func sendBytes(_ data: Data, options: StreamByteOptions) async throws -> ByteStreamInfo {
+        var options = options.ffi
+        let id = options.id ?? UUID().uuidString
+        options.id = id
+        return try await ByteStreamInfo(
+            calling(streamID: id) { [options] in try await $0.sendBytes(data: data, options: options) },
+            encryptionType: currentEncryptionType
+        )
+    }
+
+    func sendFile(_ fileURL: URL, options: StreamByteOptions) async throws -> ByteStreamInfo {
+        // The FFI reads the file's bytes but doesn't infer its metadata, so resolve name/MIME/size
+        // from disk here (matching the previous implementation) unless the caller set them.
+        guard let fileInfo = FileInfo(for: fileURL) else {
+            throw StreamError.fileInfoUnavailable
+        }
+        let id = options.id ?? UUID().uuidString
+        let ffiOptions = LiveKitFFI.StreamByteOptions(
+            topic: options.topic,
+            attributes: options.attributes,
+            destinationIdentities: options.destinationIdentities.map(\.stringValue),
+            id: id,
+            mimeType: options.mimeType ?? fileInfo.mimeType,
+            name: options.name ?? fileInfo.name,
+            totalLength: UInt64(fileInfo.size),
+            compress: options.compress,
+            senderIdentity: options.senderIdentity?.stringValue,
+        )
+        return try await ByteStreamInfo(
+            calling(streamID: id) { try await $0.sendFile(path: fileURL.path, options: ffiOptions) },
+            encryptionType: currentEncryptionType
+        )
+    }
+
+    /// - Parameters:
+    ///   - admission: Asked again for every packet of the stream, at the moment it is handed to
+    ///     the data channel.
+    ///   - onReservation: Called once the stream holds its ID and before its header is sent, with
+    ///     the means to stop it. Returning `false` stops it there.
+    func streamText(
+        options: StreamTextOptions,
+        admission: DataChannelSendAdmission? = nil,
+        onReservation: (@Sendable (OutgoingStreamCancellation) -> Bool)? = nil
+    ) async throws -> TextStreamWriter {
+        var options = options.ffi
+        let id = options.id ?? UUID().uuidString
+        options.id = id
+        let (writer, context) = try await opening(streamID: id, admission: admission, onReservation: onReservation) { [options] in
+            try await $0.streamText(options: options)
+        }
+        return TextStreamWriter(writer, encryptionType: currentEncryptionType, context: context)
+    }
+
+    func streamBytes(options: StreamByteOptions) async throws -> ByteStreamWriter {
+        var options = options.ffi
+        let id = options.id ?? UUID().uuidString
+        options.id = id
+        let (writer, context) = try await opening(streamID: id) { [options] in
+            try await $0.streamBytes(options: options)
+        }
+        return ByteStreamWriter(writer, encryptionType: currentEncryptionType, context: context)
+    }
+
+    // MARK: - Incoming packets
+
+    /// Feeds a received data-stream packet (already decrypted and deduped by `DataChannelPair`) to
+    /// the incoming manager. The core takes the wire form and decodes the header/chunk/trailer
+    /// itself, so `serialized` — the bytes the packet was decoded from — is reused when it still
+    /// describes the packet, and re-encoded only when decryption has rebuilt it.
+    ///
+    /// `encryptionType` is passed separately because decryption consumes the packet field that
+    /// carried it; the core compares it against the stream's header to reject a sender that mixes
+    /// encrypted and plaintext frames within one stream.
+    ///
+    /// The packet reaches the core only through ``admission``, which binds each stream to the
+    /// participant connection and receive generation that opened it.
+    ///
+    /// - Parameter receiveGeneration: The generation of the transport that delivered the packet.
+    ///   `nil` stands for the current one.
+    func handleIncoming(
+        _ dataPacket: Livekit_DataPacket,
+        serialized: Data?,
+        encryptionType: EncryptionType,
+        receiveGeneration: UInt64? = nil,
+        receivedAtContinuousTimeNanoseconds: UInt64 = RpcContinuousClock.nowNanoseconds()
+    ) {
+        guard let incoming else { return }
+        admission.receive(
+            dataPacket,
+            serialized: serialized,
+            encryptionType: encryptionType,
+            receiveGeneration: receiveGeneration,
+            receivedAtContinuousTimeNanoseconds: receivedAtContinuousTimeNanoseconds,
+            core: incoming
+        ) { [byteStreamHandlers, textStreamHandlers] header in
+            switch header.contentHeader {
+            case .textHeader: textStreamHandlers.read { $0[header.topic]?.registration }
+            case .byteHeader: byteStreamHandlers.read { $0[header.topic]?.registration }
+            default: nil
+            }
+        }
+    }
+
+    /// Number of incoming streams currently open. Restores the introspection v1 exposed on its
+    /// manager: it lets a caller wait for a stream's descriptor to actually register before driving
+    /// the abort paths, rather than inferring it from a handler having been dispatched.
+    func openStreamCount() async -> UInt64 {
+        guard let incoming else { return 0 }
+        return await incoming.openStreamCount()
+    }
+
+    // MARK: - Stream lifecycle
+
+    /// Fails all open incoming streams so their handlers return (e.g. on cleanup). A handler blocked
+    /// on a reader that will never finish would otherwise stall its topic's ordered queue. Handler
+    /// registrations survive, so streams arriving after a reconnect are still handled.
+    ///
+    /// The incoming manager survives: a full reconnect keeps the connection it belongs to, and a
+    /// disconnect releases it along with that connection — so the next connect always gets one
+    /// built from that connection's `maxPayloadByteLength`.
+    ///
+    /// - Parameter nextReceiveGeneration: The receive generation of the transport that replaces
+    ///   the current one. Packets the old transport still delivers are dropped from here on.
+    func reset(to nextReceiveGeneration: UInt64? = nil) {
+        admission.reset(to: nextReceiveGeneration)
+    }
+
+    /// Fails open incoming streams sent by one exact participant connection (it disconnected
+    /// mid-send), so their readers throw and their handlers return instead of hanging. Identity
+    /// alone does not select them: a replacement participant reuses it.
+    func closeStreams(
+        from identity: Participant.Identity,
+        participantSid: Participant.Sid,
+        dataPacketReceiveGeneration: UInt64
+    ) {
+        admission.closeStreams(
+            from: identity,
+            participantSid: participantSid,
+            dataPacketReceiveGeneration: dataPacketReceiveGeneration
+        )
+    }
+
+    // MARK: - Stream open dispatch (called from the incoming delegate)
+
+    func handleByteStreamOpened(_ ffiReader: LiveKitFFI.ByteStreamReader, identity: String) {
+        let ffiInfo = ffiReader.info()
+        // A stream admission no longer knows was reset before the core opened it.
+        guard let source = admission.claim(attributes: ffiInfo.attributes) else { return }
+        let info = ByteStreamInfo(ffiInfo, source: source)
+        guard let handler = byteStreamHandlers.copy()[info.topic]?.handler else {
+            logMissingHandler(topic: info.topic, id: info.id, identity: identity)
+            admission.cancel(source)
+            admission.handlerCompleted(source)
+            return
+        }
+        let reader = ByteStreamReader(
+            GatedByteStreamReader(ffiReader, source: source, admission: admission),
+            info: info,
+            trailer: source.trailer
+        )
+        let participantIdentity = source.identity
+        Task.detachedDiscarding { [admission] in
+            defer { admission.handlerCompleted(source) }
+            try await handler(reader, participantIdentity)
+        }
+    }
+
+    func handleTextStreamOpened(_ ffiReader: LiveKitFFI.TextStreamReader, identity: String) {
+        let ffiInfo = ffiReader.info()
+        // A stream admission no longer knows was reset before the core opened it.
+        guard let source = admission.claim(attributes: ffiInfo.attributes) else { return }
+        let info = TextStreamInfo(ffiInfo, source: source)
+        guard let entry = textStreamHandlers.copy()[info.topic] else {
+            logMissingHandler(topic: info.topic, id: info.id, identity: identity)
+            admission.cancel(source)
+            admission.handlerCompleted(source)
+            return
+        }
+        let handler = entry.handler
+        let reader = TextStreamReader(
+            GatedTextStreamReader(ffiReader, source: source, admission: admission),
+            info: info,
+            trailer: source.trailer,
+            cancelSource: { [admission] in admission.cancel(source) }
+        )
+        let participantIdentity = source.identity
+        let topic = info.topic
+        guard entry.isOrdered else {
+            Task.detachedDiscarding { [admission] in
+                defer { admission.handlerCompleted(source) }
+                try await handler(reader, participantIdentity)
+            }
+            return
+        }
+        // Ordered topic. Wait only on handlers whose streams have already closed: this stream opened
+        // after they ended, so it comes after them on the wire. Streams still open right now overlap
+        // with this one and must not gate it.
+        let streamID = info.id
+        ordered.mutate { state in
+            let token = state.makeToken()
+            let predecessors = Array(state.finishing[topic]?.values ?? [:].values)
+            state.openStreams[streamID] = .init(topic: topic, token: token)
+            state.running[topic, default: [:]][token] = Task.detached { [weak self] in
+                for predecessor in predecessors {
+                    await predecessor.value
+                }
+                do {
+                    try await handler(reader, participantIdentity)
+                } catch {
+                    self?.log("Ordered text stream handler for topic '\(topic)' threw: \(error)", .warning)
+                }
+                self?.admission.handlerCompleted(source)
+                self?.handlerCompleted(topic: topic, streamID: streamID, token: token)
+            }
+        }
+    }
+
+    /// The stream closed on the wire. Its handler may still be running, and until it returns it gates
+    /// streams that open from now on — so move it out of `runningHandlers` and into the set later
+    /// streams wait for.
+    func handleStreamClosed(streamID: String, identity _: String) {
+        ordered.mutate { state in
+            // Dropped here rather than on completion: the id is free again the moment the stream
+            // ends, and a sender that reuses it must register a fresh entry.
+            guard let entry = state.openStreams.removeValue(forKey: streamID) else { return }
+            guard let task = state.running[entry.topic]?.removeValue(forKey: entry.token) else { return }
+            state.finishing[entry.topic, default: [:]][entry.token] = task
+        }
+    }
+
+    /// Handler returned: it no longer gates anything, so drop it and stop tracking its stream.
+    private func handlerCompleted(topic: String, streamID: String, token: UInt64) {
+        ordered.mutate { state in
+            state.running[topic]?.removeValue(forKey: token)
+            state.finishing[topic]?.removeValue(forKey: token)
+            // Only if this handler is still the one that id maps to: a successor that reused the
+            // id owns the entry now.
+            if state.openStreams[streamID]?.token == token { state.openStreams[streamID] = nil }
+        }
+    }
+
+    private func logMissingHandler(topic: String, id: String, identity: String) {
+        log("Unable to find handler for incoming stream: \(id), topic: \(topic), opened by: \(identity)")
+    }
+
+    /// Runs a one-shot send on the connection's outgoing manager. See ``opening``.
+    private func calling<T: Sendable>(
+        streamID: String,
+        _ call: @escaping @Sendable (LiveKitFFI.OutgoingDataStreamManager) async throws -> T
+    ) async throws -> T {
+        let outgoing = try outgoing()
+        let (value, context) = try await opening(streamID: streamID, on: outgoing, call)
+        outgoing.delegate.contexts.close(streamID, context)
+        return value
+    }
+
+    /// Opens a stream on the connection's outgoing manager, with the send context its packets are
+    /// delivered with: the data channel's current send generation and the caller's admission. The
+    /// context stays until the stream's trailer is sent, a packet fails, or the stream is cancelled.
+    ///
+    /// A cancel ends the wait at once, since the UniFFI call ignores it, and cancels the context, so
+    /// what the abandoned call still emits is not sent. The context keeps the stream's ID until
+    /// that call is over: a stream that reused the ID sooner would lend the old packets its own
+    /// context. An FFI error becomes a ``StreamError``, or the error that stopped the packet when
+    /// a delivery failed.
+    private func opening<T: Sendable>(
+        streamID: String,
+        admission: DataChannelSendAdmission? = nil,
+        onReservation: (@Sendable (OutgoingStreamCancellation) -> Bool)? = nil,
+        on outgoing: Outgoing? = nil,
+        _ call: @escaping @Sendable (LiveKitFFI.OutgoingDataStreamManager) async throws -> T
+    ) async throws -> (T, OutgoingStreamSendContext) {
+        let outgoing = try outgoing ?? self.outgoing()
+        let contexts = outgoing.delegate.contexts
+        let context = OutgoingStreamSendContext(
+            sendGeneration: room?.publisherDataChannel.sendGeneration ?? 0,
+            admission: admission
+        )
+        try contexts.open(streamID, context)
+        let callEnded = StateSync(false)
+        // The canceller sets its flag and then reads the other's; so does the call. Whichever
+        // comes second releases the ID.
+        let cancel: @Sendable () -> Void = {
+            context.cancel()
+            if callEnded.copy() { contexts.close(streamID, context) }
+        }
+        if let onReservation {
+            guard onReservation(OutgoingStreamCancellation(action: cancel)) else {
+                contexts.close(streamID, context)
+                throw StreamError.terminated
+            }
+        }
+        do {
+            let value = try await abandoningOnCancel {
+                defer {
+                    callEnded.mutate { $0 = true }
+                    if context.isCancelled { contexts.close(streamID, context) }
+                }
+                return try await call(outgoing.manager)
+            }
+            return (value, context)
+        } catch {
+            cancel()
+            if let error = error as? LiveKitFFI.DataStreamError {
+                throw context.sendFailure(for: error)
+            }
+            throw error
+        }
+    }
+}

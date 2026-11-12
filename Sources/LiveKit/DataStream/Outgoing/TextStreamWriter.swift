@@ -16,42 +16,78 @@
 
 import Foundation
 
+internal import LiveKitFFI
+
 /// Asynchronously write to an open text stream.
+///
+/// - Important: Call and await ``close(reason:)`` when you are done. Releasing a writer without
+///   closing it does not send the end of the stream, so receivers keep waiting for it until you
+///   disconnect.
 @objcMembers
 public final class TextStreamWriter: NSObject, Sendable {
     /// Information about the outgoing text stream.
     public let info: TextStreamInfo
 
-    private let destination: StreamWriterDestination
+    private let writer: LiveKitFFI.TextStreamWriter
 
-    /// Whether or not the stream is still open.
+    /// What this stream's packets are sent with; it also keeps the cause of a failed delivery.
+    private let context: OutgoingStreamSendContext?
+
+    /// Whether or not the stream is still open. Reflects the FFI writer's state, so it becomes
+    /// `false` once the stream is closed locally or a send fails (e.g. the room disconnected).
     public var isOpen: Bool {
-        get async { await destination.isOpen }
+        get async { await writer.isOpen() }
     }
 
     /// Write text to the stream.
     ///
     /// - Parameter text: Text to be sent.
-    /// - Throws: Throws an error if the stream has been closed or text
-    ///   cannot be sent to remote participants.
+    /// - Throws: ``StreamError/alreadyClosed`` if the stream is closed, or
+    ///   ``StreamError/sendFailed`` or another ``StreamError`` if the text cannot be delivered, for
+    ///   example because the room disconnected. Then ``isOpen`` is `false`. `CancellationError` at
+    ///   once if the calling task is cancelled, but the write can still go out.
     ///
     public func write(_ text: String) async throws {
-        try await destination.write(text)
+        try checkNotCancelled()
+        do {
+            try await abandoningOnCancel { [writer] in try await writer.write(text: text) }
+        } catch let error as LiveKitFFI.DataStreamError {
+            throw context?.sendFailure(for: error) ?? StreamError(error)
+        }
     }
 
     /// Close the stream.
     ///
     /// - Parameter reason: A textual description of why the stream is being closed. Absense
     ///   of a reason indicates a normal closure.
-    /// - Throws: Throws an error if the stream has already been closed or closure
-    ///   cannot be communicated to remote participants.
+    /// - Throws: ``StreamError/alreadyClosed`` if the stream is already closed, or another
+    ///   ``StreamError`` if the end of the stream cannot be delivered. `CancellationError` at once
+    ///   if the calling task is cancelled, but the stream can still close.
     ///
     public func close(reason: String? = nil) async throws {
-        try await destination.close(reason: reason)
+        try checkNotCancelled()
+        do {
+            try await abandoningOnCancel { [writer] in
+                if let reason {
+                    try await writer.closeWithReason(reason: reason)
+                } else {
+                    try await writer.close()
+                }
+            }
+        } catch let error as LiveKitFFI.DataStreamError {
+            throw context?.sendFailure(for: error) ?? StreamError(error)
+        }
     }
 
-    init(info: TextStreamInfo, destination: StreamWriterDestination) {
-        self.info = info
-        self.destination = destination
+    init(_ writer: LiveKitFFI.TextStreamWriter, encryptionType: EncryptionType, context: OutgoingStreamSendContext? = nil) {
+        self.writer = writer
+        self.context = context
+        info = TextStreamInfo(writer.info(), encryptionType: encryptionType)
+    }
+
+    /// A cancelled stream gave its ID back. The core does not know, so what it would still send
+    /// could leave with the context of a later stream that took the ID.
+    private func checkNotCancelled() throws {
+        if context?.isCancelled == true { throw StreamError.terminated }
     }
 }

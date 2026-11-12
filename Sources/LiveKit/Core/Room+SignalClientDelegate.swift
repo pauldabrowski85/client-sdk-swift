@@ -136,7 +136,7 @@ extension Room: SignalClientDelegate {
 
     func signalClient(_: SignalClient, didReceiveRoomMoved response: Livekit_RoomMovedResponse) async {
         let receiveGeneration = incrementDataPacketReceiveGeneration()
-        await incomingStreamManager.reset(to: receiveGeneration)
+        dataStreams.reset(to: receiveGeneration)
         let moveError = LiveKitError(.cancelled, message: "Room moved; replacing transports")
         let wasConnected = _state.connectionState == .connected
         publisherDataChannel.reset(throwing: moveError)

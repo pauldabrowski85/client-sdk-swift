@@ -1,0 +1,1547 @@
+/*
+ * Copyright 2026 LiveKit
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ *     http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+// swiftlint:disable file_length
+
+import Foundation
+@testable import LiveKit
+import LiveKitFFI
+import Testing
+#if canImport(LiveKitTestSupport)
+import LiveKitTestSupport
+#endif
+
+@Suite(.tags(.dataStream))
+struct IncomingStreamAdmissionTests: @unchecked Sendable {
+    private var manager: IncomingStreamManager
+    private let chunkIndexes = StateSync<[String: UInt64]>([:])
+
+    private let topicName = "someTopic"
+    private let participant = Participant.Identity(from: "someName")
+
+    init() {
+        manager = IncomingStreamManager()
+    }
+
+    @Test func registerByteHandler() async throws {
+        try await manager.registerByteStreamHandler(for: topicName) { _, _ in }
+
+        await confirmation("Throws on duplicate registration") { confirm in
+            do {
+                try await manager.registerByteStreamHandler(for: topicName) { _, _ in }
+            } catch {
+                #expect(error as? StreamError == .handlerAlreadyRegistered)
+                confirm()
+            }
+        }
+
+        await manager.unregisterByteStreamHandler(for: topicName)
+    }
+
+    @Test func registerTextHandler() async throws {
+        try await manager.registerTextStreamHandler(for: topicName) { _, _ in }
+
+        await confirmation("Throws on duplicate registration") { confirm in
+            do {
+                try await manager.registerTextStreamHandler(for: topicName) { _, _ in }
+            } catch {
+                #expect(error as? StreamError == .handlerAlreadyRegistered)
+                confirm()
+            }
+        }
+
+        await manager.unregisterTextStreamHandler(for: topicName)
+    }
+
+    @Test func byteStream() async throws {
+        try await confirmation("Receives payload") { confirm in
+            let testChunks = [
+                Data(repeating: 0xAB, count: 128),
+                Data(repeating: 0xCD, count: 128),
+                Data(repeating: 0xEF, count: 256),
+                Data(repeating: 0x12, count: 32),
+            ]
+            let testPayload = testChunks.reduce(Data()) { $0 + $1 }
+
+            try await manager.registerByteStreamHandler(for: topicName) { reader, participant in
+                #expect(participant == self.participant)
+                let payload = try await reader.readAll()
+                #expect(payload == testPayload)
+                confirm()
+            }
+
+            await sendByteStream(chunks: testChunks)
+        }
+    }
+
+    @Test func textStream() async throws {
+        try await confirmation("Receives payload") { confirm in
+            let testChunks = [
+                String(repeating: "A", count: 128),
+                String(repeating: "B", count: 128),
+                String(repeating: "C", count: 256),
+                String(repeating: "D", count: 32),
+            ]
+            let testPayload = testChunks.reduce("") { $0 + $1 }
+
+            try await manager.registerTextStreamHandler(for: topicName) { reader, participant in
+                #expect(participant == self.participant)
+                let payload = try await reader.readAll()
+                #expect(payload == testPayload)
+                confirm()
+            }
+
+            await sendTextStream(chunks: testChunks)
+        }
+    }
+
+    @Test func nonTextData() async throws {
+        try await confirmation("Throws error on non-text data") { confirm in
+            let testPayload = Data(repeating: 0xAB, count: 128)
+
+            try await manager.registerTextStreamHandler(for: topicName) { reader, _ in
+                do {
+                    _ = try await reader.readAll()
+                } catch {
+                    // Since 2.19.0 the core decodes text, and names the fault.
+                    guard case .invalidUTF8 = error as? StreamError else {
+                        Issue.record("Expected .invalidUTF8, got \(error)")
+                        return
+                    }
+                    confirm()
+                }
+            }
+
+            await sendTextStream(rawPayload: testPayload, totalLength: UInt64(testPayload.count))
+        }
+    }
+
+    @Test func abnormalClosure() async throws {
+        try await confirmation("Throws error on abnormal closure") { confirm in
+            let closureReason = "test"
+
+            try await manager.registerByteStreamHandler(for: topicName) { reader, _ in
+                do {
+                    _ = try await reader.readAll()
+                } catch {
+                    #expect(error as? StreamError == .abnormalEnd(reason: closureReason))
+                    confirm()
+                }
+            }
+
+            let streamID = UUID().uuidString
+
+            let header = Livekit_DataStream.Header.with {
+                $0.streamID = streamID
+                $0.topic = topicName
+                $0.contentHeader = .byteHeader(Livekit_DataStream.ByteHeader())
+            }
+            manager.handle(.header(header, participant.stringValue, nil, 0, .none))
+
+            let trailer = Livekit_DataStream.Trailer.with {
+                $0.streamID = streamID
+                $0.reason = closureReason
+            }
+            manager.handle(.trailer(trailer, participant.stringValue, nil, 0, .none))
+
+            // Handler processes asynchronously — give it time to complete
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                Task {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    c.resume()
+                }
+            }
+        }
+    }
+
+    @Test func incomplete() async throws {
+        try await confirmation("Throws error on incomplete stream") { confirm in
+            let testPayload = Data(repeating: 0xAB, count: 128)
+
+            try await manager.registerByteStreamHandler(for: topicName) { reader, _ in
+                do {
+                    _ = try await reader.readAll()
+                } catch {
+                    #expect(error as? StreamError == .incomplete)
+                    confirm()
+                }
+            }
+
+            let streamID = UUID().uuidString
+
+            let header = Livekit_DataStream.Header.with {
+                $0.streamID = streamID
+                $0.topic = topicName
+                $0.contentHeader = .byteHeader(Livekit_DataStream.ByteHeader())
+                $0.totalLength = UInt64(testPayload.count + 10) // expect more bytes
+            }
+            manager.handle(.header(header, participant.stringValue, nil, 0, .none))
+
+            let chunk = Livekit_DataStream.Chunk.with {
+                $0.streamID = streamID
+                $0.chunkIndex = 0
+                $0.content = Data(testPayload)
+            }
+            manager.handle(.chunk(chunk, participant.stringValue, nil, 0, .none))
+
+            let trailer = Livekit_DataStream.Trailer.with {
+                $0.streamID = streamID
+                $0.reason = ""
+            }
+            manager.handle(.trailer(trailer, participant.stringValue, nil, 0, .none))
+
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                Task {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    c.resume()
+                }
+            }
+        }
+    }
+
+    @Test func encryptionTypeMismatch() async throws {
+        let manager = IncomingStreamManager()
+        let topic = "test-encryption-mismatch"
+
+        try await confirmation("Stream should receive error") { confirm in
+            try await manager.registerByteStreamHandler(for: topic) { reader, _ in
+                do {
+                    _ = try await reader.readAll()
+                } catch let error as StreamError {
+                    if case let .encryptionTypeMismatch(expected, received) = error {
+                        #expect(expected == .gcm)
+                        #expect(received == .none)
+                        confirm()
+                    } else {
+                        Issue.record("Expected encryptionTypeMismatch error, got \(error)")
+                    }
+                }
+            }
+
+            let header = Livekit_DataStream.Header.with {
+                $0.streamID = "test-stream-id"
+                $0.topic = topic
+                $0.mimeType = "application/octet-stream"
+                $0.timestamp = Int64(Date().timeIntervalSince1970 * 1000)
+                $0.contentHeader = .byteHeader(.with {
+                    $0.name = "test-file.bin"
+                })
+            }
+            manager.handle(.header(header, "test-participant", nil, 0, .gcm))
+
+            let chunk = Livekit_DataStream.Chunk.with {
+                $0.streamID = "test-stream-id"
+                $0.chunkIndex = 0
+                $0.content = Data("test data".utf8)
+            }
+            manager.handle(.chunk(chunk, "test-participant", nil, 0, .none))
+
+            await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+                Task {
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                    c.resume()
+                }
+            }
+        }
+    }
+
+    @Test func declaredTextLengthIsRejectedBeforeHandlerDispatch() async throws {
+        let rejected = StateSync<StreamError?>(nil)
+        try await manager.registerTextStreamHandler(
+            for: topicName,
+            limits: IncomingStreamLimits(
+                maxStreamBytes: 4,
+                maxConcurrentStreams: 2,
+                maxBufferedChunks: 2
+            ),
+            onStreamRejected: { rejection in rejected.mutate { $0 = rejection.error } }
+        ) { _, _ in
+            Issue.record("Oversized declared stream reached its handler")
+        }
+
+        let header = Livekit_DataStream.Header.with {
+            $0.streamID = "declared-oversize"
+            $0.topic = topicName
+            $0.totalLength = 5
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
+        manager.handle(.header(header, participant.stringValue, nil, 0, .none))
+        await waitForRejection(rejected)
+
+        #expect(rejected.copy() == .streamSizeExceeded(maximumBytes: 4))
+        #expect(await manager.openStreamCount == 0)
+    }
+
+    @Test func unrepresentableDeclaredLengthsRejectTextAndByteBeforeReaderCreation() async throws {
+        let rejections = StateSync<[StreamError]>([])
+        let byteTopic = "\(topicName)-byte"
+        try await manager.registerTextStreamHandler(
+            for: topicName,
+            onStreamRejected: { rejection in rejections.mutate { $0.append(rejection.error) } }
+        ) { _, _ in
+            Issue.record("Unrepresentable text stream reached its handler")
+        }
+        try await manager.registerByteStreamHandler(
+            for: byteTopic,
+            onStreamRejected: { rejection in rejections.mutate { $0.append(rejection.error) } }
+        ) { _, _ in
+            Issue.record("Unrepresentable byte stream reached its handler")
+        }
+
+        let textHeader = Livekit_DataStream.Header.with {
+            $0.streamID = "text-uint64-max"
+            $0.topic = topicName
+            $0.totalLength = UInt64.max
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
+        manager.handle(.header(textHeader, participant.stringValue, nil, 0, .none))
+
+        let byteHeader = Livekit_DataStream.Header.with {
+            $0.streamID = "byte-uint64-max"
+            $0.topic = byteTopic
+            $0.totalLength = UInt64.max
+            $0.contentHeader = .byteHeader(Livekit_DataStream.ByteHeader())
+        }
+        manager.handle(.header(byteHeader, participant.stringValue, nil, 0, .none))
+
+        let deadline = Date().addingTimeInterval(10)
+        while rejections.copy().count < 2, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(rejections.copy() == [.invalidDeclaredLength, .invalidDeclaredLength])
+        #expect(await manager.openStreamCount == 0)
+    }
+
+    @Test func suspendedHandlerFloodFailsAtBoundedChunkBuffer() async throws {
+        let handlerStarted = TestGate()
+        let releaseHandler = TestGate()
+        let rejected = StateSync<StreamError?>(nil)
+        let observedReaderError = StateSync<StreamError?>(nil)
+        try await manager.registerTextStreamHandler(
+            for: topicName,
+            limits: IncomingStreamLimits(
+                maxStreamBytes: 1_024,
+                maxConcurrentStreams: 2,
+                maxBufferedChunks: 2
+            ),
+            onStreamRejected: { rejection in rejected.mutate { $0 = rejection.error } }
+        ) { reader, _ in
+            await handlerStarted.open()
+            await releaseHandler.wait()
+            do {
+                _ = try await reader.readAll()
+            } catch let error as StreamError {
+                observedReaderError.mutate { $0 = error }
+            }
+        }
+
+        await sendTextHeader(streamID: "suspended")
+        await handlerStarted.wait()
+        for index in 0 ..< 3 {
+            await sendTextChunk(streamID: "suspended", content: "\(index)")
+        }
+        await waitForRejection(rejected)
+
+        #expect(rejected.copy() == .bufferOverflow)
+        #expect(await manager.openStreamCount == 0)
+        await releaseHandler.open()
+        await waitForRejection(observedReaderError)
+        #expect(observedReaderError.copy() == .bufferOverflow)
+        await waitForNoActiveHandlers()
+        #expect(await manager.activeHandlerCount == 0)
+    }
+
+    @Test func receivedBytesAreRejectedBeforeYieldingPastLimit() async throws {
+        let handlerStarted = TestGate()
+        let releaseHandler = TestGate()
+        let rejected = StateSync<StreamError?>(nil)
+        try await manager.registerTextStreamHandler(
+            for: topicName,
+            limits: IncomingStreamLimits(
+                maxStreamBytes: 4,
+                maxConcurrentStreams: 2,
+                maxBufferedChunks: 8
+            ),
+            onStreamRejected: { rejection in rejected.mutate { $0 = rejection.error } }
+        ) { _, _ in
+            await handlerStarted.open()
+            await releaseHandler.wait()
+        }
+
+        await sendTextHeader(streamID: "received-oversize")
+        await handlerStarted.wait()
+        await sendTextChunk(streamID: "received-oversize", content: "abc")
+        await sendTextChunk(streamID: "received-oversize", content: "de")
+        await waitForRejection(rejected)
+
+        #expect(rejected.copy() == .streamSizeExceeded(maximumBytes: 4))
+        #expect(await manager.openStreamCount == 0)
+        await releaseHandler.open()
+    }
+
+    @Test func differentParticipantCannotInjectChunkIntoAuthenticatedStream() async throws {
+        let publisherSid = Participant.Sid(from: "PA_authorized")
+        let rejected = StateSync<StreamError?>(nil)
+        let readerError = StateSync<StreamError?>(nil)
+        try await manager.registerTextStreamHandler(
+            for: topicName,
+            onStreamRejected: { rejection in rejected.mutate { $0 = rejection.error } }
+        ) { reader, _ in
+            do {
+                _ = try await reader.readAll()
+            } catch let error as StreamError {
+                readerError.mutate { $0 = error }
+            }
+        }
+
+        let header = Livekit_DataStream.Header.with {
+            $0.streamID = "authenticated-chunk"
+            $0.topic = topicName
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
+        manager.handle(.header(header, participant.stringValue, publisherSid, 0, .none))
+        await waitForOpenStreams(1)
+
+        let chunk = Livekit_DataStream.Chunk.with {
+            $0.streamID = header.streamID
+            $0.content = Data("forged".utf8)
+        }
+        manager.handle(.chunk(
+            chunk,
+            "other-participant",
+            Participant.Sid(from: "PA_other"),
+            0,
+            .none
+        ))
+
+        await waitForRejection(rejected)
+        await waitForRejection(readerError)
+        #expect(rejected.copy()?.isSenderMismatch == true)
+        #expect(readerError.copy()?.isSenderMismatch == true)
+        #expect(await manager.openStreamCount == 0)
+    }
+
+    @Test func differentParticipantCannotCloseAuthenticatedStreamWithTrailer() async throws {
+        let publisherSid = Participant.Sid(from: "PA_authorized")
+        let rejected = StateSync<StreamError?>(nil)
+        let readerError = StateSync<StreamError?>(nil)
+        try await manager.registerTextStreamHandler(
+            for: topicName,
+            onStreamRejected: { rejection in rejected.mutate { $0 = rejection.error } }
+        ) { reader, _ in
+            do {
+                _ = try await reader.readAll()
+            } catch let error as StreamError {
+                readerError.mutate { $0 = error }
+            }
+        }
+
+        let header = Livekit_DataStream.Header.with {
+            $0.streamID = "authenticated-trailer"
+            $0.topic = topicName
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
+        manager.handle(.header(header, participant.stringValue, publisherSid, 0, .none))
+        await waitForOpenStreams(1)
+
+        let trailer = Livekit_DataStream.Trailer.with {
+            $0.streamID = header.streamID
+        }
+        manager.handle(.trailer(
+            trailer,
+            "other-participant",
+            Participant.Sid(from: "PA_other"),
+            0,
+            .none
+        ))
+
+        await waitForRejection(rejected)
+        await waitForRejection(readerError)
+        #expect(rejected.copy()?.isSenderMismatch == true)
+        #expect(readerError.copy()?.isSenderMismatch == true)
+        #expect(await manager.openStreamCount == 0)
+    }
+
+    @Test func concurrentStreamAdmissionIsCappedBeforeCreatingAnotherReader() async throws {
+        let releaseHandlers = TestGate()
+        let rejected = StateSync<StreamError?>(nil)
+        try await manager.registerTextStreamHandler(
+            for: topicName,
+            limits: IncomingStreamLimits(
+                maxStreamBytes: 64,
+                maxConcurrentStreams: 2,
+                maxBufferedChunks: 2
+            ),
+            onStreamRejected: { rejection in rejected.mutate { $0 = rejection.error } }
+        ) { _, _ in
+            await releaseHandlers.wait()
+        }
+
+        await sendTextHeader(streamID: "open-1")
+        await sendTextHeader(streamID: "open-2")
+        await waitForOpenStreams(2)
+        await sendTextHeader(streamID: "rejected-3")
+        await waitForRejection(rejected)
+
+        #expect(rejected.copy() == .tooManyOpenStreams(maximum: 2))
+        #expect(await manager.openStreamCount == 2)
+        await releaseHandlers.open()
+        await manager.reset()
+    }
+
+    @Test func fastCloseFloodCannotOutrunHandlerAdmission() async throws {
+        let releaseHandlers = TestGate()
+        let handlerStarts = StateSync(0)
+        let rejections = StateSync<[IncomingStreamRejection]>([])
+        try await manager.registerTextStreamHandler(
+            for: topicName,
+            limits: IncomingStreamLimits(
+                maxStreamBytes: 64,
+                maxConcurrentStreams: 2,
+                maxBufferedChunks: 2
+            ),
+            onStreamRejected: { rejection in rejections.mutate { $0.append(rejection) } }
+        ) { _, _ in
+            handlerStarts.mutate { $0 += 1 }
+            await releaseHandlers.wait()
+        }
+
+        for index in 0 ..< 2 {
+            await sendTextHeader(streamID: "admitted-\(index)")
+            await sendTextTrailer(streamID: "admitted-\(index)")
+        }
+        let handlerDeadline = Date().addingTimeInterval(10)
+        while handlerStarts.copy() < 2, Date() < handlerDeadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        await waitForNoOpenStreams()
+        #expect(handlerStarts.copy() == 2)
+        #expect(await manager.activeHandlerCount == 2)
+
+        for index in 0 ..< 100 {
+            await sendTextHeader(streamID: "rejected-\(index)")
+            await sendTextTrailer(streamID: "rejected-\(index)")
+        }
+        let rejectionDeadline = Date().addingTimeInterval(10)
+        while rejections.copy().count < 100, Date() < rejectionDeadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        #expect(rejections.copy().count == 100)
+        #expect(rejections.copy().allSatisfy {
+            $0.error == .tooManyOpenStreams(maximum: 2) && !$0.handlerWasDispatched
+        })
+        #expect(handlerStarts.copy() == 2)
+        #expect(await manager.openStreamCount == 0)
+        #expect(await manager.activeHandlerCount == 2)
+
+        await releaseHandlers.open()
+        let completionDeadline = Date().addingTimeInterval(10)
+        while await manager.activeHandlerCount != 0, Date() < completionDeadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(await manager.activeHandlerCount == 0)
+    }
+
+    @Test func perConnectionStreamAdmissionIncludesHandlersAfterDescriptorClose() async throws {
+        let releaseHandlers = TestGate()
+        let rejections = StateSync<[IncomingStreamRejection]>([])
+        try await manager.registerTextStreamHandler(
+            for: RpcStreamTopic.request,
+            limits: RpcStreamLimits.incomingRequest,
+            onStreamRejected: { rejection in rejections.mutate { $0.append(rejection) } }
+        ) { _, _ in
+            await releaseHandlers.wait()
+        }
+
+        let callerA = Participant.Identity(from: "caller-a")
+        let callerASid = Participant.Sid(from: "PA_caller_a")
+        let callerB = Participant.Identity(from: "caller-b")
+        let callerBSid = Participant.Sid(from: "PA_caller_b")
+        let receiveGeneration: UInt64 = 7
+        await manager.reset(to: receiveGeneration)
+
+        for index in 0 ..< RpcInvocationLimits.maximumInFlightPerConnection {
+            sendTextHeader(
+                streamID: "caller-a-\(index)",
+                topic: RpcStreamTopic.request,
+                participant: callerA,
+                publisherParticipantSid: callerASid,
+                dataPacketReceiveGeneration: receiveGeneration
+            )
+        }
+        await waitForOpenStreams(RpcInvocationLimits.maximumInFlightPerConnection)
+        for index in 0 ..< RpcInvocationLimits.maximumInFlightPerConnection {
+            let trailer = Livekit_DataStream.Trailer.with {
+                $0.streamID = "caller-a-\(index)"
+            }
+            manager.handle(.trailer(
+                trailer,
+                callerA.stringValue,
+                callerASid,
+                receiveGeneration,
+                .none
+            ))
+        }
+        await waitForNoOpenStreams()
+        #expect(await manager.activeHandlerCount == RpcInvocationLimits.maximumInFlightPerConnection)
+
+        sendTextHeader(
+            streamID: "caller-a-over-cap",
+            topic: RpcStreamTopic.request,
+            participant: callerA,
+            publisherParticipantSid: callerASid,
+            dataPacketReceiveGeneration: receiveGeneration,
+            attributes: [RpcStreamAttribute.requestId: "request-over-cap"]
+        )
+        let rejectionDeadline = Date().addingTimeInterval(10)
+        while rejections.copy().isEmpty, Date() < rejectionDeadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        sendTextHeader(
+            streamID: "caller-b-admitted",
+            topic: RpcStreamTopic.request,
+            participant: callerB,
+            publisherParticipantSid: callerBSid,
+            dataPacketReceiveGeneration: receiveGeneration
+        )
+        await waitForOpenStreams(1)
+
+        let rejection = try #require(rejections.copy().first)
+        #expect(rejection.participantIdentity == callerA)
+        #expect(rejection.publisherParticipantSid == callerASid)
+        #expect(rejection.dataPacketReceiveGeneration == receiveGeneration)
+        #expect(rejection.attributes[RpcStreamAttribute.requestId] == "request-over-cap")
+        #expect(!rejection.handlerWasDispatched)
+        #expect(
+            rejection.error == .tooManyOpenStreams(
+                maximum: RpcInvocationLimits.maximumInFlightPerConnection
+            )
+        )
+        #expect(await manager.openStreamCount == 1)
+        #expect(await manager.activeHandlerCount == RpcInvocationLimits.maximumInFlightPerConnection + 1)
+        await releaseHandlers.open()
+        await manager.reset()
+    }
+
+    /// The core queues packets without a bound. Admission stops handing them over once the core
+    /// has fallen `ingressCapacity` packets behind, fails every stream and asks for recovery.
+    @Test func packetFloodTheCoreCannotKeepUpWithTripsBoundedIngress() async throws {
+        let core = StalledIncomingCore()
+        let overflowed = StateSync<UInt64?>(nil)
+        let admission = IncomingStreamAdmission(ingressCapacity: 16, core: { core }) { generation in
+            overflowed.mutate { $0 = generation }
+        }
+        let rejections = StateSync<[IncomingStreamRejection]>([])
+        let registration = IncomingStreamAdmission.Registration(limits: .default) { rejection in
+            rejections.mutate { $0.append(rejection) }
+        }
+
+        for index in 0 ..< 1000 {
+            feedHeader("flood-\(index)", to: admission, core: core, registration: registration)
+        }
+
+        #expect(admission.hasIngressOverflowed)
+        #expect(overflowed.copy() == 0)
+        #expect(core.packets.copy().count == 16)
+        #expect(core.aborts.copy() == 1)
+        #expect(admission.openStreamCount == 0)
+        // The sixteen streams handed to the core, and the header that found it full. After that
+        // nothing is admitted, so nothing more is reported.
+        let seen = rejections.copy()
+        #expect(seen.count == 17)
+        #expect(seen.allSatisfy { $0.error == .ingressBufferOverflow && !$0.handlerWasDispatched })
+    }
+
+    /// The next transport starts clean: an overflow belongs to the receive generation it happened in.
+    @Test func ingressOverflowDoesNotOutliveItsGeneration() async throws {
+        let core = StalledIncomingCore()
+        let admission = IncomingStreamAdmission(ingressCapacity: 4, core: { core }) { _ in }
+        let registration = IncomingStreamAdmission.Registration(limits: .default, onStreamRejected: nil)
+
+        for index in 0 ..< 8 {
+            feedHeader("old-overflow-\(index)", to: admission, core: core, registration: registration)
+        }
+        #expect(admission.hasIngressOverflowed)
+
+        admission.reset(to: 1)
+        #expect(!admission.hasIngressOverflowed)
+        feedHeader("new-generation", generation: 1, to: admission, core: core, registration: registration)
+        #expect(admission.openStreamCount == 1)
+
+        // What the old transport still delivers is dropped, and counts for nothing.
+        for index in 0 ..< 8 {
+            feedHeader("late-\(index)", generation: 0, to: admission, core: core, registration: registration)
+        }
+        #expect(admission.openStreamCount == 1)
+        #expect(!admission.hasIngressOverflowed)
+    }
+
+    /// A packet is admitted and handed to the core in one step. A reset that starts in between
+    /// waits, so the packet cannot reach the core after the reset that should have dropped it.
+    @Test func resetCannotInterleaveBetweenAdmissionAndHandingOver() async throws {
+        let core = StalledIncomingCore()
+        let handingOver = AsyncCompleter<Void>(label: "Handing over", defaultTimeout: 5)
+        let release = DispatchSemaphore(value: 0)
+        core.onFirstPacket = {
+            handingOver.resume(returning: ())
+            _ = release.wait(timeout: .now() + 5)
+        }
+        let admission = IncomingStreamAdmission(core: { core }) { _ in }
+        let registration = IncomingStreamAdmission.Registration(limits: .default, onStreamRejected: nil)
+
+        let staleHandle = Thread { [self] in
+            feedHeader("admitted-before-reset", to: admission, core: core, registration: registration)
+        }
+        staleHandle.start()
+        try await handingOver.wait()
+
+        let resetCompleted = StateSync(false)
+        let resetDone = AsyncCompleter<Void>(label: "Reset", defaultTimeout: 5)
+        let reset = Thread {
+            admission.reset(to: 1)
+            resetCompleted.mutate { $0 = true }
+            resetDone.resume(returning: ())
+        }
+        reset.start()
+        try await Task.sleep(nanoseconds: 100_000_000)
+        #expect(!resetCompleted.copy())
+
+        release.signal()
+        try await resetDone.wait()
+        // The header went to the core first, and the reset then aborted it there.
+        #expect(core.packets.copy().count == 1)
+        #expect(core.aborts.copy() == 1)
+        #expect(admission.openStreamCount == 0)
+
+        feedHeader("current-after-reset", generation: 1, to: admission, core: core, registration: registration)
+        #expect(admission.openStreamCount == 1)
+        #expect(!admission.hasIngressOverflowed)
+    }
+
+    /// A handler that returns without reading drops its reader. The stream it left open is
+    /// ended there and then, though its sender never sends another packet.
+    @Test func readerDroppedBeforeTheStreamEndsFreesItsSlot() async throws {
+        try await manager.registerTextStreamHandler(for: topicName, ordered: false) { _, _ in }
+
+        await sendTextHeader(streamID: "abandoned")
+
+        await waitForNoOpenStreams()
+        await waitForNoActiveHandlers()
+        #expect(await manager.openStreamCount == 0)
+        #expect(await manager.activeHandlerCount == 0)
+        await manager.unregisterTextStreamHandler(for: topicName)
+    }
+
+    /// A stream admitted to a core that is replaced before opening it is never handled. Its
+    /// registration is told, since no reader exists to throw the error.
+    @Test func streamLostWithItsCoreIsReportedAsRejected() {
+        let (first, second) = (StalledIncomingCore(), StalledIncomingCore())
+        let rejections = StateSync<[IncomingStreamRejection]>([])
+        let admission = IncomingStreamAdmission(core: { second }) { _ in }
+        let registration = IncomingStreamAdmission.Registration(limits: .default) { rejection in
+            rejections.mutate { $0.append(rejection) }
+        }
+
+        feedHeader("lost", to: admission, core: first, registration: registration)
+        feedHeader("next", to: admission, core: second, registration: registration)
+
+        #expect(rejections.copy().map(\.streamID) == ["lost"])
+        #expect(rejections.copy().first?.handlerWasDispatched == false)
+        #expect(rejections.copy().first?.error == .terminated)
+    }
+
+    /// A connection has its own core. A stream handed to the core of a connection that is gone
+    /// is never opened, so it must not keep a handler slot.
+    @Test func streamsHandedToAReplacedCoreHoldNoSlot() {
+        let (first, second) = (StalledIncomingCore(), StalledIncomingCore())
+        let admission = IncomingStreamAdmission(core: { second }) { _ in }
+        let registration = IncomingStreamAdmission.Registration(limits: .default, onStreamRejected: nil)
+
+        feedHeader("old", to: admission, core: first, registration: registration)
+        #expect(admission.openStreamCount == 1)
+        #expect(admission.activeHandlerCount == 1)
+
+        feedHeader("new", to: admission, core: second, registration: registration)
+        #expect(admission.openStreamCount == 1)
+        #expect(admission.activeHandlerCount == 1)
+        #expect(second.packets.copy().count == 1)
+    }
+
+    /// The core merges a trailer's attributes into the info it reports the stream with. A sender
+    /// must not reach the admission token that way.
+    @Test func trailerIsForwardedWithoutTheAdmissionToken() throws {
+        let core = StalledIncomingCore()
+        let admission = IncomingStreamAdmission(core: { core }) { _ in }
+        feedHeader("forged", to: admission, core: core, registration: .init(limits: .default, onStreamRejected: nil))
+
+        let trailer = Livekit_DataPacket.with {
+            $0.participantIdentity = participant.stringValue
+            $0.streamTrailer = Livekit_DataStream.Trailer.with {
+                $0.streamID = "forged"
+                $0.attributes = [IncomingStreamAdmission.tokenAttribute: "0", "kept": "yes"]
+            }
+        }
+        try admission.receive(
+            trailer,
+            serialized: trailer.serializedData(),
+            encryptionType: .none,
+            receiveGeneration: nil,
+            receivedAtContinuousTimeNanoseconds: 0,
+            core: core
+        ) { _ in nil }
+
+        let forwarded = try Livekit_DataPacket(serializedBytes: #require(core.packets.copy().last))
+        #expect(forwarded.streamTrailer.attributes == ["kept": "yes"])
+    }
+
+    /// The same, against the real core: a trailer that names a token right behind its header must
+    /// not keep the stream from its handler, or its slot from the topic.
+    @Test func streamWithAForgedTokenInItsTrailerStillReachesItsHandler() async throws {
+        let handled = StateSync(0)
+        try await manager.registerTextStreamHandler(for: topicName) { reader, _ in
+            _ = try? await reader.readAll()
+            handled.mutate { $0 += 1 }
+        }
+
+        let count = 32
+        for index in 0 ..< count {
+            await sendTextHeader(streamID: "forged-\(index)")
+            manager.handle(.trailer(
+                Livekit_DataStream.Trailer.with {
+                    $0.streamID = "forged-\(index)"
+                    $0.attributes = [IncomingStreamAdmission.tokenAttribute: "forged"]
+                },
+                participant.stringValue,
+                nil,
+                0,
+                .none
+            ))
+        }
+
+        let deadline = Date().addingTimeInterval(5)
+        while handled.copy() < count, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(handled.copy() == count)
+        await waitForNoActiveHandlers()
+        #expect(await manager.activeHandlerCount == 0)
+    }
+
+    /// Text that is not UTF-8 ends the core's reader, but the core keeps the stream open until
+    /// its next packet. The ID must not be free here while the core still holds it: the core
+    /// would drop the next header that uses it, and that stream would keep its slot unopened.
+    @Test func streamIDIsReusableAfterItsReaderFailed() async throws {
+        let outcomes = StateSync<[Result<String, Error>]>([])
+        try await manager.registerTextStreamHandler(for: topicName) { reader, _ in
+            do {
+                let text = try await reader.readAll()
+                outcomes.mutate { $0.append(.success(text)) }
+            } catch {
+                outcomes.mutate { $0.append(.failure(error)) }
+            }
+        }
+        let waitForOutcomes: (Int) async -> Void = { count in
+            let deadline = Date().addingTimeInterval(5)
+            while outcomes.copy().count < count, Date() < deadline {
+                try? await Task.sleep(nanoseconds: 10_000_000)
+            }
+        }
+
+        await sendTextHeader(streamID: "reused")
+        manager.handle(.chunk(
+            Livekit_DataStream.Chunk.with {
+                $0.streamID = "reused"
+                $0.chunkIndex = 0
+                $0.content = Data([0xFF, 0xFE])
+            },
+            participant.stringValue,
+            nil,
+            0,
+            .none
+        ))
+        await waitForOutcomes(1)
+        #expect(throws: StreamError.self) { try outcomes.copy().first?.get() }
+        await waitForNoOpenStreams()
+
+        await sendTextHeader(streamID: "reused")
+        await sendTextChunk(streamID: "reused", content: "second", index: 0)
+        await sendTextTrailer(streamID: "reused")
+        await waitForOutcomes(2)
+
+        #expect(try outcomes.copy().last?.get() == "second")
+        await waitForNoActiveHandlers()
+        #expect(await manager.activeHandlerCount == 0)
+    }
+
+    /// A header on a topic nobody handles is dropped where it arrives. It is never queued, so a
+    /// flood of them holds nothing and needs no recovery.
+    @Test func unknownTopicFloodIsDroppedWithoutQueueing() async {
+        let core = StalledIncomingCore()
+        let overflowed = StateSync(false)
+        let admission = IncomingStreamAdmission(ingressCapacity: 1, core: { core }) { _ in
+            overflowed.mutate { $0 = true }
+        }
+
+        for index in 0 ..< 1000 {
+            feedHeader("unknown-\(index)", topic: "unregistered-\(index)", to: admission, core: core, registration: nil)
+        }
+
+        #expect(!admission.hasIngressOverflowed)
+        #expect(!overflowed.copy())
+        #expect(core.packets.copy().isEmpty)
+        #expect(admission.openStreamCount == 0)
+        #expect(admission.failedTopicDiagnosticCount == 64)
+    }
+
+    @Test func unknownTopicDiagnosticRetentionIsBoundedAndClearedOnGenerationReset() async {
+        let manager = IncomingStreamManager()
+        for index in 0 ..< 128 {
+            let header = Livekit_DataStream.Header.with {
+                $0.streamID = "unknown-stream-\(index)"
+                $0.topic = "attacker-topic-\(index)"
+                $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+            }
+            manager.handle(.header(header, participant.stringValue, nil, 0, .none))
+        }
+
+        let deadline = Date().addingTimeInterval(10)
+        while await manager.failedTopicDiagnosticCount < 64, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(await manager.failedTopicDiagnosticCount == 64)
+
+        await manager.reset(to: 1)
+        #expect(await manager.failedTopicDiagnosticCount == 0)
+    }
+
+    @Test func sidLearnedFromLaterPacketDoesNotRejectAuthenticatedStream() async throws {
+        // The SFU fills participant_sid lazily: a header can arrive with no SID
+        // while later chunks carry the real one. That must read as "not yet
+        // known", not as a forgery.
+        let rejected = StateSync<StreamError?>(nil)
+        let payload = StateSync<String?>(nil)
+        try await manager.registerTextStreamHandler(
+            for: topicName,
+            onStreamRejected: { rejection in rejected.mutate { $0 = rejection.error } }
+        ) { reader, _ in
+            let text = try await reader.readAll()
+            payload.mutate { $0 = text }
+        }
+
+        await sendTextHeader(streamID: "late-sid")
+        await waitForOpenStreams(1)
+        await sendTextChunk(
+            streamID: "late-sid",
+            content: "hello",
+            publisherParticipantSid: Participant.Sid(from: "PA_learned")
+        )
+        await sendTextTrailer(
+            streamID: "late-sid",
+            publisherParticipantSid: Participant.Sid(from: "PA_learned")
+        )
+
+        let deadline = Date().addingTimeInterval(10)
+        while payload.copy() == nil, rejected.copy() == nil, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(rejected.copy() == nil)
+        #expect(payload.copy() == "hello")
+    }
+
+    @Test func learnedSidStillRejectsADifferentSid() async throws {
+        // Once a SID is observed for the stream it is locked in: a later
+        // packet claiming a different SID is still a forgery.
+        let rejected = StateSync<StreamError?>(nil)
+        let readerError = StateSync<StreamError?>(nil)
+        try await manager.registerTextStreamHandler(
+            for: topicName,
+            onStreamRejected: { rejection in rejected.mutate { $0 = rejection.error } }
+        ) { reader, _ in
+            do {
+                _ = try await reader.readAll()
+            } catch let error as StreamError {
+                readerError.mutate { $0 = error }
+            }
+        }
+
+        await sendTextHeader(streamID: "locked-sid")
+        await waitForOpenStreams(1)
+        await sendTextChunk(
+            streamID: "locked-sid",
+            content: "a",
+            publisherParticipantSid: Participant.Sid(from: "PA_learned")
+        )
+        await sendTextChunk(
+            streamID: "locked-sid",
+            content: "b",
+            publisherParticipantSid: Participant.Sid(from: "PA_forged")
+        )
+
+        await waitForRejection(rejected)
+        await waitForRejection(readerError)
+        #expect(rejected.copy()?.isSenderMismatch == true)
+        #expect(readerError.copy()?.isSenderMismatch == true)
+        #expect(await manager.openStreamCount == 0)
+    }
+
+    @Test func absentSidOnLaterPacketDoesNotRejectAuthenticatedStream() async throws {
+        // The reverse window: the header carried a SID but a later packet's
+        // is empty. Absent is "unknown", never a mismatch.
+        let rejected = StateSync<StreamError?>(nil)
+        let payload = StateSync<String?>(nil)
+        try await manager.registerTextStreamHandler(
+            for: topicName,
+            onStreamRejected: { rejection in rejected.mutate { $0 = rejection.error } }
+        ) { reader, _ in
+            let text = try await reader.readAll()
+            payload.mutate { $0 = text }
+        }
+
+        await sendTextHeader(
+            streamID: "absent-sid",
+            publisherParticipantSid: Participant.Sid(from: "PA_known")
+        )
+        await waitForOpenStreams(1)
+        await sendTextChunk(streamID: "absent-sid", content: "hello")
+        await sendTextTrailer(streamID: "absent-sid")
+
+        let deadline = Date().addingTimeInterval(10)
+        while payload.copy() == nil, rejected.copy() == nil, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(rejected.copy() == nil)
+        #expect(payload.copy() == "hello")
+    }
+
+    @Test func agentFragmentsMayContinueAUserAttributedStream() async throws {
+        // The live LiveKit Cloud transcription shape: the agent opens a stream
+        // attributed to the transcribed user's identity, and later fragments
+        // of the same stream carry the agent's own identity. The SID — the
+        // actual participant connection — is the same on every packet, and it
+        // alone decides.
+        let connectionSid = Participant.Sid(from: "PA_connection")
+        let rejected = StateSync<StreamError?>(nil)
+        let payload = StateSync<String?>(nil)
+        try await manager.registerTextStreamHandler(
+            for: topicName,
+            onStreamRejected: { rejection in rejected.mutate { $0 = rejection.error } }
+        ) { reader, _ in
+            let text = try await reader.readAll()
+            payload.mutate { $0 = text }
+        }
+
+        let header = Livekit_DataStream.Header.with {
+            $0.streamID = "user-attributed"
+            $0.topic = topicName
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
+        manager.handle(.header(header, "transcribed-user", connectionSid, 0, .none))
+        await waitForOpenStreams(1)
+
+        let chunk = Livekit_DataStream.Chunk.with {
+            $0.streamID = header.streamID
+            $0.content = Data("hello".utf8)
+        }
+        manager.handle(.chunk(chunk, "agent-worker", connectionSid, 0, .none))
+        let trailer = Livekit_DataStream.Trailer.with {
+            $0.streamID = header.streamID
+        }
+        manager.handle(.trailer(trailer, "agent-worker", connectionSid, 0, .none))
+
+        let deadline = Date().addingTimeInterval(10)
+        while payload.copy() == nil, rejected.copy() == nil, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        #expect(rejected.copy() == nil)
+        #expect(payload.copy() == "hello")
+    }
+
+    @Test func sameIdentityCannotContinueAStreamFromADifferentConnection() async throws {
+        // When both packets carry a SID, the SID decides even if the identity
+        // labels agree: a different connection is a different sender.
+        let rejected = StateSync<StreamError?>(nil)
+        let readerError = StateSync<StreamError?>(nil)
+        try await manager.registerTextStreamHandler(
+            for: topicName,
+            onStreamRejected: { rejection in rejected.mutate { $0 = rejection.error } }
+        ) { reader, _ in
+            do {
+                _ = try await reader.readAll()
+            } catch let error as StreamError {
+                readerError.mutate { $0 = error }
+            }
+        }
+
+        await sendTextHeader(
+            streamID: "sid-decides",
+            publisherParticipantSid: Participant.Sid(from: "PA_original")
+        )
+        await waitForOpenStreams(1)
+        await sendTextChunk(
+            streamID: "sid-decides",
+            content: "forged",
+            publisherParticipantSid: Participant.Sid(from: "PA_other")
+        )
+
+        await waitForRejection(rejected)
+        await waitForRejection(readerError)
+        #expect(rejected.copy()?.isSenderMismatch == true)
+        #expect(readerError.copy()?.isSenderMismatch == true)
+        #expect(await manager.openStreamCount == 0)
+    }
+
+    // MARK: - Helpers
+
+    private func sendByteStream(chunks: [Data]) async {
+        let streamID = UUID().uuidString
+
+        let header = Livekit_DataStream.Header.with {
+            $0.streamID = streamID
+            $0.topic = topicName
+            $0.contentHeader = .byteHeader(Livekit_DataStream.ByteHeader())
+        }
+        manager.handle(.header(header, participant.stringValue, nil, 0, .none))
+
+        for (index, chunkData) in chunks.enumerated() {
+            let chunk = Livekit_DataStream.Chunk.with {
+                $0.streamID = streamID
+                $0.chunkIndex = UInt64(index)
+                $0.content = chunkData
+            }
+            manager.handle(.chunk(chunk, participant.stringValue, nil, 0, .none))
+        }
+
+        let trailer = Livekit_DataStream.Trailer.with {
+            $0.streamID = streamID
+            $0.reason = ""
+        }
+        manager.handle(.trailer(trailer, participant.stringValue, nil, 0, .none))
+
+        // Handler processes asynchronously — give it time to complete
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            Task {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                c.resume()
+            }
+        }
+    }
+
+    private func sendTextStream(
+        chunks: [String]? = nil,
+        rawPayload: Data? = nil,
+        totalLength: UInt64? = nil,
+        streamID: String = UUID().uuidString,
+        dataPacketReceiveGeneration: UInt64 = 0,
+        settle: Bool = true
+    ) async {
+        let header = Livekit_DataStream.Header.with {
+            $0.streamID = streamID
+            $0.topic = topicName
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+            if let totalLength { $0.totalLength = totalLength }
+        }
+        manager.handle(.header(
+            header,
+            participant.stringValue,
+            nil,
+            dataPacketReceiveGeneration,
+            .none
+        ))
+
+        if let chunks {
+            for (index, chunkData) in chunks.enumerated() {
+                let chunk = Livekit_DataStream.Chunk.with {
+                    $0.streamID = streamID
+                    $0.chunkIndex = UInt64(index)
+                    $0.content = Data(chunkData.utf8)
+                }
+                manager.handle(.chunk(
+                    chunk,
+                    participant.stringValue,
+                    nil,
+                    dataPacketReceiveGeneration,
+                    .none
+                ))
+            }
+        } else if let rawPayload {
+            let chunk = Livekit_DataStream.Chunk.with {
+                $0.streamID = streamID
+                $0.chunkIndex = 0
+                $0.content = rawPayload
+            }
+            manager.handle(.chunk(
+                chunk,
+                participant.stringValue,
+                nil,
+                dataPacketReceiveGeneration,
+                .none
+            ))
+        }
+
+        let trailer = Livekit_DataStream.Trailer.with {
+            $0.streamID = streamID
+            $0.reason = ""
+        }
+        manager.handle(.trailer(
+            trailer,
+            participant.stringValue,
+            nil,
+            dataPacketReceiveGeneration,
+            .none
+        ))
+
+        guard settle else { return }
+        // Handler processes asynchronously — give it time to complete
+        await withCheckedContinuation { (c: CheckedContinuation<Void, Never>) in
+            Task {
+                try? await Task.sleep(nanoseconds: 100_000_000)
+                c.resume()
+            }
+        }
+    }
+}
+
+/// One-shot latch: `wait()` suspends until `open()`; waiters after `open()` pass through.
+/// A core that takes packets and never reports having processed them.
+private final class StalledIncomingCore: LiveKitFFI.IncomingDataStreamManagerProtocol, @unchecked Sendable {
+    let packets = StateSync<[Data]>([])
+    let aborts = StateSync(0)
+    var onFirstPacket: (() -> Void)?
+    private let never = AsyncCompleter<Void>(label: "Stalled core", defaultTimeout: 600)
+
+    func handlePacketReceived(packet: Data, encryptionType _: LiveKitFFI.EncryptionType) {
+        let isFirst = packets.mutate { packets -> Bool in
+            packets.append(packet)
+            return packets.count == 1
+        }
+        if isFirst { onFirstPacket?() }
+    }
+
+    func abortAllStreams() { aborts.mutate { $0 += 1 } }
+    func abortStreamsFrom(identity _: String) {}
+
+    func openStreamCount() async -> UInt64 {
+        try? await never.wait()
+        return 0
+    }
+}
+
+private actor TestGate {
+    private var isOpen = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func wait() async {
+        guard !isOpen else { return }
+        await withCheckedContinuation { waiters.append($0) }
+    }
+
+    func open() {
+        isOpen = true
+        let continuations = waiters
+        waiters = []
+        for continuation in continuations {
+            continuation.resume()
+        }
+    }
+}
+
+private struct ObservedStreamProvenance: Equatable {
+    let payload: String
+    let publisherParticipantSid: String?
+    let dataPacketReceiveGeneration: UInt64?
+}
+
+extension IncomingStreamAdmissionTests {
+    /// `handle(_:)` only enqueues onto the manager's event loop, so tests that
+    /// call cleanup APIs directly must first wait for the events to be processed.
+    private func feedHeader(
+        _ streamID: String,
+        topic: String? = nil,
+        generation: UInt64? = nil,
+        to admission: IncomingStreamAdmission,
+        core: any LiveKitFFI.IncomingDataStreamManagerProtocol,
+        registration: IncomingStreamAdmission.Registration?
+    ) {
+        let packet = Livekit_DataPacket.with {
+            $0.participantIdentity = participant.stringValue
+            $0.streamHeader = Livekit_DataStream.Header.with {
+                $0.streamID = streamID
+                $0.topic = topic ?? topicName
+                $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+            }
+        }
+        admission.receive(
+            packet,
+            serialized: nil,
+            encryptionType: .none,
+            receiveGeneration: generation,
+            receivedAtContinuousTimeNanoseconds: 0,
+            core: core
+        ) { _ in registration }
+    }
+
+    private func waitForOpenStreams(_ count: Int) async {
+        let deadline = Date().addingTimeInterval(10)
+        while await manager.openStreamCount < count, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    private func waitForNoOpenStreams() async {
+        let deadline = Date().addingTimeInterval(10)
+        while await manager.openStreamCount != 0, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    private func waitForNoActiveHandlers() async {
+        let deadline = Date().addingTimeInterval(10)
+        while await manager.activeHandlerCount != 0, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    private func waitForRejection(_ error: StateSync<StreamError?>) async {
+        let deadline = Date().addingTimeInterval(10)
+        while error.copy() == nil, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+    }
+
+    private func sendTextHeader(
+        streamID: String,
+        publisherParticipantSid: Participant.Sid? = nil,
+        dataPacketReceiveGeneration: UInt64 = 0
+    ) async {
+        let header = Livekit_DataStream.Header.with {
+            $0.streamID = streamID
+            $0.topic = topicName
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
+        manager.handle(.header(
+            header,
+            participant.stringValue,
+            publisherParticipantSid,
+            dataPacketReceiveGeneration,
+            .none
+        ))
+    }
+
+    private func sendTextHeader(
+        streamID: String,
+        topic: String,
+        participant: Participant.Identity,
+        publisherParticipantSid: Participant.Sid?,
+        dataPacketReceiveGeneration: UInt64,
+        attributes: [String: String] = [:]
+    ) {
+        let header = Livekit_DataStream.Header.with {
+            $0.streamID = streamID
+            $0.topic = topic
+            $0.attributes = attributes
+            $0.contentHeader = .textHeader(Livekit_DataStream.TextHeader())
+        }
+        manager.handle(.header(
+            header,
+            participant.stringValue,
+            publisherParticipantSid,
+            dataPacketReceiveGeneration,
+            .none
+        ))
+    }
+
+    private func sendTextChunk(
+        streamID: String,
+        content: String,
+        index: UInt64? = nil,
+        publisherParticipantSid: Participant.Sid? = nil,
+        dataPacketReceiveGeneration: UInt64 = 0
+    ) async {
+        // The core takes a stream's chunks in order of their index, and drops a repeated one.
+        let index = index ?? chunkIndexes.mutate { indexes -> UInt64 in
+            defer { indexes[streamID, default: 0] += 1 }
+            return indexes[streamID, default: 0]
+        }
+        let chunk = Livekit_DataStream.Chunk.with {
+            $0.streamID = streamID
+            $0.chunkIndex = index
+            $0.content = Data(content.utf8)
+        }
+        manager.handle(.chunk(
+            chunk,
+            participant.stringValue,
+            publisherParticipantSid,
+            dataPacketReceiveGeneration,
+            .none
+        ))
+    }
+
+    private func sendTextTrailer(
+        streamID: String,
+        publisherParticipantSid: Participant.Sid? = nil,
+        dataPacketReceiveGeneration: UInt64 = 0
+    ) async {
+        let trailer = Livekit_DataStream.Trailer.with {
+            $0.streamID = streamID
+        }
+        manager.handle(.trailer(
+            trailer,
+            participant.stringValue,
+            publisherParticipantSid,
+            dataPacketReceiveGeneration,
+            .none
+        ))
+    }
+
+    /// A closed stream whose handler is queued behind a predecessor retains the
+    /// generation stamped at header admission. A new stream can reuse the same
+    /// participant SID after reset without making the old handler look current.
+    @Test func delayedHandlerRetainsHeaderGenerationAcrossSameSidReconnect() async throws {
+        let firstHandlerStarted = TestGate()
+        let releaseFirstHandler = TestGate()
+        let replacementHandlerCompleted = TestGate()
+        let observations = StateSync<[ObservedStreamProvenance]>([])
+        let publisherSid = Participant.Sid(from: "PA_reused")
+
+        try await manager.registerTextStreamHandler(for: topicName, ordered: true) { reader, _ in
+            let payload = try await reader.readAll()
+            if payload == "first" {
+                await firstHandlerStarted.open()
+                await releaseFirstHandler.wait()
+                return
+            }
+            observations.mutate {
+                $0.append(ObservedStreamProvenance(
+                    payload: payload,
+                    publisherParticipantSid: reader.info.publisherParticipantSid?.stringValue,
+                    dataPacketReceiveGeneration: reader.info.dataPacketReceiveGeneration
+                ))
+            }
+            if payload == "replacement" { await replacementHandlerCompleted.open() }
+        }
+
+        await sendTextStream(chunks: ["first"], streamID: "first", settle: false)
+        await firstHandlerStarted.wait()
+
+        await sendTextHeader(
+            streamID: "old-queued",
+            publisherParticipantSid: publisherSid,
+            dataPacketReceiveGeneration: 0
+        )
+        await waitForOpenStreams(1)
+        await sendTextChunk(
+            streamID: "old-queued",
+            content: "old",
+            publisherParticipantSid: publisherSid,
+            dataPacketReceiveGeneration: 0
+        )
+        await sendTextTrailer(
+            streamID: "old-queued",
+            publisherParticipantSid: publisherSid,
+            dataPacketReceiveGeneration: 0
+        )
+        await waitForNoOpenStreams()
+
+        await manager.reset(to: 1)
+        await sendTextHeader(
+            streamID: "replacement",
+            publisherParticipantSid: publisherSid,
+            dataPacketReceiveGeneration: 1
+        )
+        await waitForOpenStreams(1)
+        await sendTextChunk(
+            streamID: "replacement",
+            content: "replacement",
+            publisherParticipantSid: publisherSid,
+            dataPacketReceiveGeneration: 1
+        )
+        await sendTextTrailer(
+            streamID: "replacement",
+            publisherParticipantSid: publisherSid,
+            dataPacketReceiveGeneration: 1
+        )
+
+        #expect(observations.copy().isEmpty)
+        await releaseFirstHandler.open()
+        await replacementHandlerCompleted.wait()
+
+        #expect(observations.copy() == [
+            ObservedStreamProvenance(
+                payload: "old",
+                publisherParticipantSid: publisherSid.stringValue,
+                dataPacketReceiveGeneration: 0
+            ),
+            ObservedStreamProvenance(
+                payload: "replacement",
+                publisherParticipantSid: publisherSid.stringValue,
+                dataPacketReceiveGeneration: 1
+            ),
+        ])
+        await manager.unregisterTextStreamHandler(for: topicName)
+    }
+
+    @Test func resetRejectsStaleHeaderChunkAndTrailerGenerations() async throws {
+        let received = StateSync<[String]>([])
+        await manager.reset(to: 1)
+
+        try await manager.registerTextStreamHandler(for: topicName) { reader, _ in
+            let payload = try await reader.readAll()
+            received.mutate { $0.append(payload) }
+        }
+
+        await sendTextStream(
+            chunks: ["stale-header"],
+            streamID: "stale-header",
+            dataPacketReceiveGeneration: 0,
+            settle: false
+        )
+        await sendTextHeader(
+            streamID: "current",
+            dataPacketReceiveGeneration: 1
+        )
+        await waitForOpenStreams(1)
+        await sendTextChunk(
+            streamID: "current",
+            content: "stale-chunk",
+            index: 0,
+            dataPacketReceiveGeneration: 0
+        )
+        await sendTextTrailer(
+            streamID: "current",
+            dataPacketReceiveGeneration: 0
+        )
+        await sendTextChunk(
+            streamID: "current",
+            content: "current",
+            index: 0,
+            dataPacketReceiveGeneration: 1
+        )
+        await sendTextTrailer(
+            streamID: "current",
+            dataPacketReceiveGeneration: 1
+        )
+
+        let deadline = Date().addingTimeInterval(10)
+        while received.copy().isEmpty, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+
+        #expect(received.copy() == ["current"])
+        await manager.unregisterTextStreamHandler(for: topicName)
+    }
+}

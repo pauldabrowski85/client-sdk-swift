@@ -47,7 +47,10 @@ public class MulticastDelegate<T: Sendable>: NSObject, @unchecked Sendable, Logg
     // MARK: - Private properties
 
     private struct State {
-        let delegates = NSHashTable<AnyObject>.weakObjects()
+        // By pointer, so the table never calls a delegate's `hash` or `isEqual`. A publication
+        // hashes its state behind its own lock. Called under this table's lock, that deadlocks
+        // against a thread that holds the publication's lock and notifies the track's delegates.
+        let delegates = NSHashTable<AnyObject>(options: [.weakMemory, .objectPointerPersonality])
     }
 
     private let _queue: DispatchQueue

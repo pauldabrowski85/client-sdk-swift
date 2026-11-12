@@ -21,10 +21,17 @@ internal import LiveKitWebRTC
 // MARK: - Internal delegate
 
 protocol DataChannelDelegate: AnyObject, Sendable {
-    /// The encryption type is captured before decryption rewrites the packet payload.
+    /// `encryptionType` is how the packet arrived on the wire. It rides alongside the packet
+    /// because decryption rewrites the payload oneof, which *clears* `encryptedPacket` — reading
+    /// the type off a decrypted packet reports every encrypted message as unencrypted.
+    ///
+    /// `serialized` is the bytes `dataPacket` was decoded from, for the consumers that need the
+    /// wire form again (the data stream core takes bytes). `nil` once decryption has rebuilt the
+    /// packet, since the received bytes no longer describe it — those callers re-encode.
     func dataChannel(
         _ dataChannelPair: DataChannelPair,
         didReceiveDataPacket dataPacket: Livekit_DataPacket,
+        serialized: Data?,
         encryptionType: EncryptionType,
         receiveGeneration: UInt64,
         receivedAtContinuousTimeNanoseconds: UInt64
@@ -350,6 +357,7 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
                 $0.dataChannel(
                     self,
                     didReceiveDataPacket: dataPacket,
+                    serialized: data,
                     encryptionType: .none,
                     receiveGeneration: ownership.receiveGeneration,
                     receivedAtContinuousTimeNanoseconds: receivedAtContinuousTimeNanoseconds
@@ -371,6 +379,7 @@ class DataChannelPair: NSObject, @unchecked Sendable, Loggable {
                 $0.dataChannel(
                     self,
                     didReceiveDataPacket: decrypted,
+                    serialized: nil,
                     encryptionType: encryptionType,
                     receiveGeneration: ownership.receiveGeneration,
                     receivedAtContinuousTimeNanoseconds: receivedAtContinuousTimeNanoseconds
